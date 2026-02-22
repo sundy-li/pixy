@@ -1,0 +1,14 @@
+[package]
+name = "pi-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+pi-agent-core = { path = "../pi-agent-core" }
+pi-ai = { path = "../pi-ai" }
+ratatui = "0.29"
+tokio = { version = "1.49", features = ["macros", "sync", "time"] }
+unicode-width = "0.2"
