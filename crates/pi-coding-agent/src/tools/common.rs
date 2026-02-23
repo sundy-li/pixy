@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pi_agent_core::AgentToolResult;
@@ -232,4 +233,102 @@ pub(super) fn format_timeout(seconds: f64) -> String {
     } else {
         format!("{seconds}")
     }
+}
+
+pub(super) fn line_change_counts(before: &str, after: &str) -> (usize, usize) {
+    let mut before_map = line_multiset(before);
+    let after_map = line_multiset(after);
+    let mut added = 0usize;
+    let mut removed = 0usize;
+
+    for (line, after_count) in after_map {
+        match before_map.remove(&line) {
+            Some(before_count) if after_count >= before_count => {
+                added = added.saturating_add(after_count - before_count);
+            }
+            Some(before_count) => {
+                removed = removed.saturating_add(before_count - after_count);
+            }
+            None => {
+                added = added.saturating_add(after_count);
+            }
+        }
+    }
+
+    for (_, before_count) in before_map {
+        removed = removed.saturating_add(before_count);
+    }
+
+    (added, removed)
+}
+
+pub(super) fn format_diff_stat_line(path: &str, before: &str, after: &str) -> String {
+    const PATH_WIDTH: usize = 48;
+    const BAR_WIDTH: usize = 20;
+
+    let (added, removed) = line_change_counts(before, after);
+    let changed = added.saturating_add(removed);
+    let bar = diff_stat_bar(added, removed, BAR_WIDTH);
+    let display_path = truncate_path_for_stat(path, PATH_WIDTH);
+
+    if bar.is_empty() {
+        format!("{display_path:<width$} | {changed:>4}", width = PATH_WIDTH)
+    } else {
+        format!(
+            "{display_path:<width$} | {changed:>4} {bar}",
+            width = PATH_WIDTH
+        )
+    }
+}
+
+fn line_multiset(content: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for line in content.lines() {
+        *counts.entry(line.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn diff_stat_bar(added: usize, removed: usize, width: usize) -> String {
+    let total = added.saturating_add(removed);
+    if total == 0 || width == 0 {
+        return String::new();
+    }
+
+    if removed == 0 {
+        return "+".repeat(width);
+    }
+    if added == 0 {
+        return "-".repeat(width);
+    }
+
+    let mut plus_width = (added.saturating_mul(width) + total / 2) / total;
+    if plus_width == 0 {
+        plus_width = 1;
+    } else if plus_width >= width {
+        plus_width = width.saturating_sub(1);
+    }
+    let minus_width = width.saturating_sub(plus_width);
+    format!("{}{}", "+".repeat(plus_width), "-".repeat(minus_width))
+}
+
+fn truncate_path_for_stat(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let suffix_chars = max_chars - 3;
+    let suffix = path
+        .chars()
+        .rev()
+        .take(suffix_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{suffix}")
 }

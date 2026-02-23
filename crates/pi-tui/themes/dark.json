@@ -11,11 +11,14 @@
     "helpBorder": null,
     "thinkingFg": "darkGray",
     "toolFg": "gray",
-    "workingFg": "black",
-    "workingBg": "white",
-    "toolDiffAdded": "yellow",
+    "workingFg": "#949699",
+    "workingBg": "#282c34",
+    "workingHighlightFg": "white",
+    "toolDiffAdded": "green",
     "toolDiffRemoved": "red",
     "filePathFg": "cyan",
-    "keyTokenFg": "lightYellow"
+    "keyTokenFg": "lightYellow",
+    "selectionBg": "white",
+    "selectionFg": "black"
   }
 }

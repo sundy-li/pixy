@@ -5,7 +5,10 @@ use std::sync::Arc;
 use pi_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
 use serde_json::{Value, json};
 
-use super::common::{first_changed_line, get_required_string, resolve_to_cwd, text_result};
+use super::common::{
+    first_changed_line, format_diff_stat_line, get_required_string, line_change_counts,
+    resolve_to_cwd, text_result,
+};
 
 pub fn create_edit_tool(cwd: impl AsRef<Path>) -> AgentTool {
     let cwd = cwd.as_ref().to_path_buf();
@@ -70,12 +73,16 @@ fn execute_edit_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String>
 
     fs::write(&absolute_path, updated.as_bytes())
         .map_err(|error| format!("Failed to write {path}: {error}"))?;
+    let (insertions, deletions) = line_change_counts(&content, &updated);
     Ok(text_result(
-        format!("Successfully replaced text in {path}."),
+        format_diff_stat_line(&path, &content, &updated),
         json!({
             "path": path,
             "firstChangedLine": first_changed_line(&content, &updated),
             "occurrences": 1,
+            "insertions": insertions,
+            "deletions": deletions,
+            "changedLines": insertions + deletions,
         }),
     ))
 }

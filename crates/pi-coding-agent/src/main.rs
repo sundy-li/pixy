@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use clap::{Args, Parser};
 use pi_ai::{
@@ -14,6 +14,10 @@ use pi_coding_agent::{
 };
 use pi_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+const DEFAULT_SYSTEM_PROMPT: &str = "You are pi, a pragmatic coding assistant working in the user's local workspace. For any concrete action (creating or editing files, running commands, inspecting logs, etc.), you MUST use the available tools directly. Do not ask the user to manually run commands, copy/paste scripts, or write files when you can do it yourself with tools. Use read/write/edit/bash tool calls first and execute promptly. Ask for confirmation only before clearly destructive or irreversible actions. After tool execution, report what changed and what you ran in concise, actionable language.";
 
 #[derive(Parser, Debug)]
 #[command(name = "pi", version, about = "pi-rs interactive CLI")]
@@ -46,7 +50,7 @@ struct ChatArgs {
     session_file: Option<PathBuf>,
     #[arg(
         long,
-        default_value = "You are pi, a pragmatic coding assistant. Keep responses concise and actionable."
+        default_value = DEFAULT_SYSTEM_PROMPT
     )]
     system_prompt: String,
     #[arg(long)]
@@ -65,11 +69,40 @@ struct ChatArgs {
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let cli = Cli::parse();
     if let Err(error) = run(cli.chat).await {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    static TRACE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let log_dir = PathBuf::from(home).join(".pi");
+    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "warning: failed to create log dir {}: {error}",
+            log_dir.display()
+        );
+        return;
+    }
+
+    let appender = tracing_appender::rolling::never(&log_dir, "pi.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    let _ = TRACE_GUARD.set(guard);
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(non_blocking),
+        )
+        .try_init();
 }
 
 async fn run(args: ChatArgs) -> Result<(), String> {
@@ -126,6 +159,14 @@ async fn run(args: ChatArgs) -> Result<(), String> {
             format_token_window(runtime.model.context_window)
         );
         let status_right = format!("{} • medium", runtime.model.id);
+        let enable_mouse_capture = std::env::var("PI_TUI_MOUSE_CAPTURE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false);
         let mut tui_options = TuiOptions {
             app_name: "pi".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -134,6 +175,8 @@ async fn run(args: ChatArgs) -> Result<(), String> {
             status_left,
             status_right,
             theme,
+            input_history_path: Some(agent_dir.join("input_history.jsonl")),
+            enable_mouse_capture,
             ..TuiOptions::default()
         };
         if let Some(keybindings) = load_tui_keybindings(&agent_dir) {

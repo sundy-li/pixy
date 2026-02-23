@@ -21,11 +21,43 @@ const TOOL_COMPACTION_TAIL_LINES: usize = 1;
 pub(crate) struct TranscriptLine {
     pub(crate) text: String,
     pub(crate) kind: TranscriptLineKind,
+    working_marquee: Option<WorkingMarquee>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkingMarquee {
+    message_char_start: usize,
+    message_char_len: usize,
+    highlight_start: usize,
+    highlight_len: usize,
 }
 
 impl TranscriptLine {
     pub(crate) fn new(text: String, kind: TranscriptLineKind) -> Self {
-        Self { text, kind }
+        Self {
+            text,
+            kind,
+            working_marquee: None,
+        }
+    }
+
+    pub(crate) fn new_working_with_marquee(
+        text: String,
+        message_char_start: usize,
+        message_char_len: usize,
+        highlight_start: usize,
+        highlight_len: usize,
+    ) -> Self {
+        Self {
+            text,
+            kind: TranscriptLineKind::Working,
+            working_marquee: Some(WorkingMarquee {
+                message_char_start,
+                message_char_len,
+                highlight_start,
+                highlight_len,
+            }),
+        }
     }
 
     pub(crate) fn to_line(&self, width: usize, theme: TuiTheme) -> Line<'static> {
@@ -44,12 +76,96 @@ impl TranscriptLine {
             return line_with_padding(vec![Span::styled(self.text.clone(), style)], width, style);
         }
 
+        if matches!(self.kind, TranscriptLineKind::Tool) {
+            if let Some(spans) = tool_diff_stat_spans(self.text.as_str(), base, theme) {
+                return line_with_padding(spans, width, base);
+            }
+        }
+
         if matches!(self.kind, TranscriptLineKind::Working) {
-            return line_with_padding(vec![Span::styled(self.text.clone(), base)], width, base);
+            let working_base = working_base_style(theme);
+            let working_highlight = working_highlight_style(theme);
+            if let Some(marquee) = &self.working_marquee {
+                let spans =
+                    working_marquee_spans(self.text.as_str(), marquee, working_base, working_highlight);
+                return line_with_padding(spans, width, working_base);
+            }
+            return line_with_padding(
+                vec![Span::styled(self.text.clone(), working_base)],
+                width,
+                working_base,
+            );
         }
 
         let spans = highlighted_spans(self.text.as_str(), base, theme);
         line_with_padding(spans, width, base)
+    }
+}
+
+fn working_base_style(theme: TuiTheme) -> Style {
+    theme.working_marquee_base_style()
+}
+
+fn working_highlight_style(theme: TuiTheme) -> Style {
+    theme.working_marquee_highlight_style()
+}
+
+fn working_marquee_spans(
+    text: &str,
+    marquee: &WorkingMarquee,
+    base: Style,
+    highlight: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chunk = String::new();
+    let mut current_is_highlighted = None::<bool>;
+
+    for (idx, ch) in text.chars().enumerate() {
+        let is_highlighted = is_marquee_highlighted(idx, marquee);
+        match current_is_highlighted {
+            None => {
+                chunk.push(ch);
+                current_is_highlighted = Some(is_highlighted);
+            }
+            Some(state) if state == is_highlighted => {
+                chunk.push(ch);
+            }
+            Some(state) => {
+                let style = if state { highlight } else { base };
+                spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                chunk.push(ch);
+                current_is_highlighted = Some(is_highlighted);
+            }
+        }
+    }
+
+    if let Some(state) = current_is_highlighted {
+        let style = if state { highlight } else { base };
+        spans.push(Span::styled(chunk, style));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+fn is_marquee_highlighted(idx: usize, marquee: &WorkingMarquee) -> bool {
+    if marquee.message_char_len == 0 || marquee.highlight_len == 0 {
+        return false;
+    }
+    if idx < marquee.message_char_start || idx >= marquee.message_char_start + marquee.message_char_len {
+        return false;
+    }
+
+    let local_idx = idx - marquee.message_char_start;
+    let start = marquee.highlight_start % marquee.message_char_len;
+    let window_len = marquee.highlight_len.min(marquee.message_char_len);
+    let end = start + window_len;
+    if end <= marquee.message_char_len {
+        local_idx >= start && local_idx < end
+    } else {
+        local_idx >= start || local_idx < (end % marquee.message_char_len)
     }
 }
 
@@ -65,6 +181,73 @@ fn line_with_padding(mut spans: Vec<Span<'static>>, width: usize, style: Style) 
         spans.push(Span::styled(" ".repeat(width - text_width), style));
     }
     Line::from(spans)
+}
+
+fn tool_diff_stat_spans(text: &str, base: Style, theme: TuiTheme) -> Option<Vec<Span<'static>>> {
+    if !looks_like_tool_diff_stat_line(text) {
+        return None;
+    }
+
+    let mut spans = Vec::new();
+    let mut buffer = String::new();
+    let mut current = SegmentKind::Normal;
+
+    for ch in text.chars() {
+        let next = if ch == '+' {
+            SegmentKind::Added
+        } else if ch == '-' {
+            SegmentKind::Removed
+        } else {
+            SegmentKind::Normal
+        };
+
+        if buffer.is_empty() {
+            current = next;
+            buffer.push(ch);
+            continue;
+        }
+
+        if next == current {
+            buffer.push(ch);
+            continue;
+        }
+
+        spans.push(Span::styled(
+            std::mem::take(&mut buffer),
+            segment_style(current, base, theme),
+        ));
+        buffer.push(ch);
+        current = next;
+    }
+
+    if !buffer.is_empty() {
+        spans.push(Span::styled(buffer, segment_style(current, base, theme)));
+    }
+
+    Some(spans)
+}
+
+fn looks_like_tool_diff_stat_line(text: &str) -> bool {
+    let Some((_, right)) = text.split_once('|') else {
+        return false;
+    };
+    let suffix = right.trim();
+    suffix.contains('+') || suffix.contains('-')
+}
+
+fn segment_style(segment: SegmentKind, base: Style, theme: TuiTheme) -> Style {
+    match segment {
+        SegmentKind::Normal => base,
+        SegmentKind::Added => base.fg(theme.tool_diff_added()),
+        SegmentKind::Removed => base.fg(theme.tool_diff_removed()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    Normal,
+    Added,
+    Removed,
 }
 
 fn highlighted_spans(text: &str, base: Style, theme: TuiTheme) -> Vec<Span<'static>> {
@@ -204,7 +387,14 @@ pub(crate) fn visible_transcript_lines(
 fn wrap_transcript_lines(lines: &[TranscriptLine], max_width: usize) -> Vec<TranscriptLine> {
     let mut wrapped = Vec::new();
     for line in lines {
-        for segment in wrap_text_by_display_width(&line.text, max_width) {
+        let segments = wrap_text_by_display_width(&line.text, max_width);
+        if segments.len() == 1 {
+            let mut single = line.clone();
+            single.text = segments[0].clone();
+            wrapped.push(single);
+            continue;
+        }
+        for segment in segments {
             wrapped.push(TranscriptLine::new(segment, line.kind.clone()));
         }
     }

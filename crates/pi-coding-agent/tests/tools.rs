@@ -24,7 +24,7 @@ async fn write_tool_creates_parent_dirs_and_read_tool_supports_offset_limit() {
     let read_tool = create_read_tool(dir.path());
 
     let content = "line-1\nline-2\nline-3\nline-4";
-    write_tool
+    let write_status = write_tool
         .execute
         .execute(
             "call-write".to_string(),
@@ -35,6 +35,10 @@ async fn write_tool_creates_parent_dirs_and_read_tool_supports_offset_limit() {
         )
         .await
         .expect("write should succeed");
+    let write_text = first_text(&write_status.content);
+    assert!(write_text.contains("nested/file.txt"));
+    assert!(write_text.contains('|'));
+    assert!(write_text.contains('+'));
 
     let result = read_tool
         .execute
@@ -59,7 +63,7 @@ async fn edit_tool_replaces_unique_match() {
     fs::write(dir.path().join("edit.txt"), "before OLD after").expect("seed file");
     let edit_tool = create_edit_tool(dir.path());
 
-    edit_tool
+    let edit_result = edit_tool
         .execute
         .execute(
             "call-edit".to_string(),
@@ -71,6 +75,11 @@ async fn edit_tool_replaces_unique_match() {
         )
         .await
         .expect("edit should succeed");
+    let edit_text = first_text(&edit_result.content);
+    assert!(edit_text.contains("edit.txt"));
+    assert!(edit_text.contains('|'));
+    assert!(edit_text.contains('+'));
+    assert!(edit_text.contains('-'));
 
     let updated = fs::read_to_string(dir.path().join("edit.txt")).expect("read edited file");
     assert_eq!(updated, "before NEW after");

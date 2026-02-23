@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::{TuiKeyBindings, TuiTheme};
 
 #[derive(Clone, Debug)]
@@ -11,6 +13,9 @@ pub struct TuiOptions {
     pub status_top: String,
     pub status_left: String,
     pub status_right: String,
+    pub input_history_path: Option<PathBuf>,
+    pub input_history_limit: usize,
+    pub enable_mouse_capture: bool,
 }
 
 impl Default for TuiOptions {
@@ -25,6 +30,9 @@ impl Default for TuiOptions {
             status_top: String::new(),
             status_left: String::new(),
             status_right: String::new(),
+            input_history_path: None,
+            input_history_limit: 256,
+            enable_mouse_capture: false,
         }
     }
 }

@@ -121,6 +121,28 @@ impl TuiTheme {
         base.fg(self.palette().colors.key_token_fg)
             .add_modifier(Modifier::BOLD)
     }
+
+    pub(crate) fn selection_colors(self) -> Option<(Color, Color)> {
+        let palette = self.palette();
+        match (palette.colors.selection_bg, palette.colors.selection_fg) {
+            (Some(bg), Some(fg)) => Some((bg, fg)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn working_marquee_base_style(self) -> Style {
+        let palette = self.palette();
+        Style::default()
+            .fg(palette.colors.working_fg)
+            .bg(palette.colors.working_bg)
+    }
+
+    pub(crate) fn working_marquee_highlight_style(self) -> Style {
+        let palette = self.palette();
+        Style::default()
+            .fg(palette.colors.working_highlight_fg)
+            .bg(palette.colors.working_bg)
+    }
 }
 
 impl Default for TuiTheme {
@@ -142,10 +164,13 @@ struct ThemeColors {
     tool_fg: Color,
     working_fg: Color,
     working_bg: Color,
+    working_highlight_fg: Color,
     tool_diff_added: Color,
     tool_diff_removed: Color,
     file_path_fg: Color,
     key_token_fg: Color,
+    selection_bg: Option<Color>,
+    selection_fg: Option<Color>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,43 +196,86 @@ impl ThemePalette {
             ));
         }
 
+        let selection_bg = colors
+            .selection_bg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid selectionBg: {error}"))
+            })
+            .transpose()?;
+        let selection_fg = colors
+            .selection_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid selectionFg: {error}"))
+            })
+            .transpose()?;
+        if selection_bg.is_some() ^ selection_fg.is_some() {
+            return Err("selectionBg and selectionFg must be configured together".to_string());
+        }
+
+        let transcript_fg =
+            parse_color(&colors.transcript_fg).map_err(|error| format!("invalid transcriptFg: {error}"))?;
+        let transcript_bg =
+            parse_color(&colors.transcript_bg).map_err(|error| format!("invalid transcriptBg: {error}"))?;
+        let input_block_bg =
+            parse_color(&colors.input_block_bg).map_err(|error| format!("invalid inputBlockBg: {error}"))?;
+        let input_border =
+            parse_color(&colors.input_border).map_err(|error| format!("invalid inputBorder: {error}"))?;
+        let footer_fg =
+            parse_color(&colors.footer_fg).map_err(|error| format!("invalid footerFg: {error}"))?;
+        let footer_bg =
+            parse_color(&colors.footer_bg).map_err(|error| format!("invalid footerBg: {error}"))?;
+        let help_border = colors
+            .help_border
+            .map(|value| parse_color(value.as_str()).map_err(|error| format!("invalid helpBorder: {error}")))
+            .transpose()?;
+        let thinking_fg =
+            parse_color(&colors.thinking_fg).map_err(|error| format!("invalid thinkingFg: {error}"))?;
+        let tool_fg =
+            parse_color(&colors.tool_fg).map_err(|error| format!("invalid toolFg: {error}"))?;
+        let working_fg =
+            parse_color(&colors.working_fg).map_err(|error| format!("invalid workingFg: {error}"))?;
+        let working_bg =
+            parse_color(&colors.working_bg).map_err(|error| format!("invalid workingBg: {error}"))?;
+        let working_highlight_fg = colors
+            .working_highlight_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid workingHighlightFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(transcript_fg);
+        let tool_diff_added = parse_color(&colors.tool_diff_added)
+            .map_err(|error| format!("invalid toolDiffAdded: {error}"))?;
+        let tool_diff_removed = parse_color(&colors.tool_diff_removed)
+            .map_err(|error| format!("invalid toolDiffRemoved: {error}"))?;
+        let file_path_fg = parse_color(&colors.file_path_fg)
+            .map_err(|error| format!("invalid filePathFg: {error}"))?;
+        let key_token_fg = parse_color(&colors.key_token_fg)
+            .map_err(|error| format!("invalid keyTokenFg: {error}"))?;
+
         Ok(Self {
             colors: ThemeColors {
-                transcript_fg: parse_color(&colors.transcript_fg)
-                    .map_err(|error| format!("invalid transcriptFg: {error}"))?,
-                transcript_bg: parse_color(&colors.transcript_bg)
-                    .map_err(|error| format!("invalid transcriptBg: {error}"))?,
-                input_block_bg: parse_color(&colors.input_block_bg)
-                    .map_err(|error| format!("invalid inputBlockBg: {error}"))?,
-                input_border: parse_color(&colors.input_border)
-                    .map_err(|error| format!("invalid inputBorder: {error}"))?,
-                footer_fg: parse_color(&colors.footer_fg)
-                    .map_err(|error| format!("invalid footerFg: {error}"))?,
-                footer_bg: parse_color(&colors.footer_bg)
-                    .map_err(|error| format!("invalid footerBg: {error}"))?,
-                help_border: colors
-                    .help_border
-                    .map(|value| {
-                        parse_color(value.as_str())
-                            .map_err(|error| format!("invalid helpBorder: {error}"))
-                    })
-                    .transpose()?,
-                thinking_fg: parse_color(&colors.thinking_fg)
-                    .map_err(|error| format!("invalid thinkingFg: {error}"))?,
-                tool_fg: parse_color(&colors.tool_fg)
-                    .map_err(|error| format!("invalid toolFg: {error}"))?,
-                working_fg: parse_color(&colors.working_fg)
-                    .map_err(|error| format!("invalid workingFg: {error}"))?,
-                working_bg: parse_color(&colors.working_bg)
-                    .map_err(|error| format!("invalid workingBg: {error}"))?,
-                tool_diff_added: parse_color(&colors.tool_diff_added)
-                    .map_err(|error| format!("invalid toolDiffAdded: {error}"))?,
-                tool_diff_removed: parse_color(&colors.tool_diff_removed)
-                    .map_err(|error| format!("invalid toolDiffRemoved: {error}"))?,
-                file_path_fg: parse_color(&colors.file_path_fg)
-                    .map_err(|error| format!("invalid filePathFg: {error}"))?,
-                key_token_fg: parse_color(&colors.key_token_fg)
-                    .map_err(|error| format!("invalid keyTokenFg: {error}"))?,
+                transcript_fg,
+                transcript_bg,
+                input_block_bg,
+                input_border,
+                footer_fg,
+                footer_bg,
+                help_border,
+                thinking_fg,
+                tool_fg,
+                working_fg,
+                working_bg,
+                working_highlight_fg,
+                tool_diff_added,
+                tool_diff_removed,
+                file_path_fg,
+                key_token_fg,
+                selection_bg,
+                selection_fg,
             },
             input_prompt,
         })
@@ -241,10 +309,15 @@ struct ThemeFileColors {
     tool_fg: String,
     working_fg: String,
     working_bg: String,
+    working_highlight_fg: Option<String>,
     tool_diff_added: String,
     tool_diff_removed: String,
     file_path_fg: String,
     key_token_fg: String,
+    #[serde(alias = "selection_bg")]
+    selection_bg: Option<String>,
+    #[serde(alias = "selection_fg")]
+    selection_fg: Option<String>,
 }
 
 fn default_input_prompt() -> String {
@@ -303,6 +376,15 @@ mod tests {
     fn built_in_themes_default_input_prompt_is_supported() {
         assert_eq!(TuiTheme::Dark.input_prompt(), "› ");
         assert_eq!(TuiTheme::Light.input_prompt(), "› ");
+    }
+
+    #[test]
+    fn built_in_dark_theme_includes_selection_colors() {
+        assert_eq!(
+            TuiTheme::Dark.selection_colors(),
+            Some((Color::White, Color::Black))
+        );
+        assert_eq!(TuiTheme::Light.selection_colors(), None);
     }
 
     #[test]
@@ -388,5 +470,92 @@ mod tests {
         "##;
         let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
         assert_eq!(palette.colors.input_block_bg, Color::Rgb(52, 53, 65));
+    }
+
+    #[test]
+    fn parse_theme_file_requires_selection_bg_and_fg_together() {
+        let raw = r##"
+        {
+          "name": "dark",
+          "colors": {
+            "transcriptFg": "white",
+            "transcriptBg": "black",
+            "inputBlockBg": "#343541",
+            "inputBorder": "green",
+            "footerFg": "darkGray",
+            "footerBg": "black",
+            "helpBorder": null,
+            "thinkingFg": "darkGray",
+            "toolFg": "gray",
+            "workingFg": "black",
+            "workingBg": "white",
+            "toolDiffAdded": "yellow",
+            "toolDiffRemoved": "red",
+            "filePathFg": "cyan",
+            "keyTokenFg": "lightYellow",
+            "selectionBg": "white"
+          }
+        }
+        "##;
+
+        let error = ThemePalette::from_json("dark", raw).expect_err("theme should fail");
+        assert!(error.contains("selectionBg and selectionFg"));
+    }
+
+    #[test]
+    fn parse_theme_file_defaults_working_highlight_to_transcript_fg() {
+        let raw = r##"
+        {
+          "name": "dark",
+          "colors": {
+            "transcriptFg": "white",
+            "transcriptBg": "black",
+            "inputBlockBg": "#343541",
+            "inputBorder": "green",
+            "footerFg": "darkGray",
+            "footerBg": "black",
+            "helpBorder": null,
+            "thinkingFg": "darkGray",
+            "toolFg": "gray",
+            "workingFg": "#949699",
+            "workingBg": "#282c34",
+            "toolDiffAdded": "yellow",
+            "toolDiffRemoved": "red",
+            "filePathFg": "cyan",
+            "keyTokenFg": "lightYellow"
+          }
+        }
+        "##;
+        let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
+        assert_eq!(palette.colors.working_highlight_fg, Color::White);
+    }
+
+    #[test]
+    fn parse_theme_file_accepts_configured_working_highlight_fg() {
+        let raw = r##"
+        {
+          "name": "dark",
+          "colors": {
+            "transcriptFg": "white",
+            "transcriptBg": "black",
+            "inputBlockBg": "#343541",
+            "inputBorder": "green",
+            "footerFg": "darkGray",
+            "footerBg": "black",
+            "helpBorder": null,
+            "thinkingFg": "darkGray",
+            "toolFg": "gray",
+            "workingFg": "#949699",
+            "workingBg": "#282c34",
+            "workingHighlightFg": "#123456",
+            "toolDiffAdded": "yellow",
+            "toolDiffRemoved": "red",
+            "filePathFg": "cyan",
+            "keyTokenFg": "lightYellow"
+          }
+        }
+        "##;
+        let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
+        assert_eq!(palette.colors.working_highlight_fg, Color::Rgb(18, 52, 86));
     }
 }

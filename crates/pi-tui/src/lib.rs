@@ -1,28 +1,30 @@
-use std::io;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::env;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::{execute, terminal};
 use futures_util::StreamExt;
 use pi_agent_core::AgentAbortController;
 use pi_ai::{Message, StopReason};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Color;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-#[cfg(test)]
-use ratatui::style::Color;
 
 pub mod backend;
 pub mod keybindings;
@@ -40,10 +42,79 @@ use transcript::{
     visible_transcript_lines, wrap_text_by_display_width,
 };
 
+#[derive(Clone, Debug)]
+struct InputHistoryStore {
+    path: PathBuf,
+    limit: usize,
+}
+
+impl InputHistoryStore {
+    fn new(path: PathBuf, limit: usize) -> Self {
+        Self {
+            path,
+            limit: limit.max(1),
+        }
+    }
+
+    fn load(&self) -> Result<Vec<String>, String> {
+        if !self.path.exists() {
+            return Ok(vec![]);
+        }
+
+        let raw = fs::read_to_string(&self.path)
+            .map_err(|error| format!("read {} failed: {error}", self.path.display()))?;
+
+        let mut history = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed =
+                serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_string());
+            if !parsed.is_empty() {
+                history.push(parsed);
+            }
+        }
+
+        if history.len() > self.limit {
+            let keep_start = history.len() - self.limit;
+            history = history.split_off(keep_start);
+        }
+        Ok(history)
+    }
+
+    fn persist(&self, history: &[String]) -> Result<(), String> {
+        let keep = if history.len() > self.limit {
+            &history[history.len() - self.limit..]
+        } else {
+            history
+        };
+        let mut encoded = String::new();
+        for entry in keep {
+            encoded.push_str(
+                serde_json::to_string(entry)
+                    .map_err(|error| format!("encode history failed: {error}"))?
+                    .as_str(),
+            );
+            encoded.push('\n');
+        }
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {} failed: {error}", parent.display()))?;
+        }
+        fs::write(&self.path, encoded)
+            .map_err(|error| format!("write {} failed: {error}", self.path.display()))?;
+        Ok(())
+    }
+}
+
 struct TuiApp {
     input: String,
     cursor_pos: usize,
     input_history: Vec<String>,
+    input_history_store: Option<InputHistoryStore>,
     history_nav_index: Option<usize>,
     history_stashed_input: Option<String>,
     transcript: Vec<TranscriptLine>,
@@ -55,6 +126,8 @@ struct TuiApp {
     is_working: bool,
     working_message: String,
     working_tick: usize,
+    working_started_at: Option<Instant>,
+    interrupt_hint_label: String,
     last_clear_key_at_ms: i64,
     queued_follow_ups: Vec<String>,
     transcript_scroll_from_bottom: usize,
@@ -69,6 +142,7 @@ impl TuiApp {
             input: String::new(),
             cursor_pos: 0,
             input_history: vec![],
+            input_history_store: None,
             history_nav_index: None,
             history_stashed_input: None,
             transcript: vec![],
@@ -80,6 +154,8 @@ impl TuiApp {
             is_working: false,
             working_message: String::new(),
             working_tick: 0,
+            working_started_at: None,
+            interrupt_hint_label: "esc".to_string(),
             last_clear_key_at_ms: 0,
             queued_follow_ups: vec![],
             transcript_scroll_from_bottom: 0,
@@ -93,6 +169,47 @@ impl TuiApp {
         self.status_top = top;
         self.status_left = left;
         self.status_right = right;
+    }
+
+    fn set_interrupt_hint_label(&mut self, label: String) {
+        if label.trim().is_empty() {
+            return;
+        }
+        self.interrupt_hint_label = label;
+    }
+
+    fn set_input_history_store(&mut self, store: Option<InputHistoryStore>) {
+        self.input_history_store = store;
+        if let Some(store) = &self.input_history_store {
+            match store.load() {
+                Ok(history) => {
+                    self.input_history = history;
+                    self.reset_input_history_navigation();
+                }
+                Err(error) => {
+                    self.status = format!("history load failed: {error}");
+                }
+            }
+        }
+    }
+
+    fn trim_input_history_to_store_limit(&mut self) {
+        let Some(limit) = self.input_history_store.as_ref().map(|store| store.limit) else {
+            return;
+        };
+        if self.input_history.len() > limit {
+            let overflow = self.input_history.len() - limit;
+            self.input_history.drain(..overflow);
+        }
+    }
+
+    fn persist_input_history(&mut self) {
+        let Some(store) = &self.input_history_store else {
+            return;
+        };
+        if let Err(error) = store.persist(&self.input_history) {
+            self.status = format!("history save failed: {error}");
+        }
     }
 
     fn maybe_update_status_right_from_backend_status(&mut self, status: &str) {
@@ -279,6 +396,7 @@ impl TuiApp {
         self.is_working = true;
         self.working_message = message;
         self.working_tick = 0;
+        self.working_started_at = Some(Instant::now());
     }
 
     fn bump_working_tick(&mut self) {
@@ -289,6 +407,43 @@ impl TuiApp {
         self.is_working = false;
         self.working_message.clear();
         self.working_tick = 0;
+        self.working_started_at = None;
+    }
+
+    fn working_elapsed_secs(&self) -> u64 {
+        self.working_started_at
+            .map(|started_at| started_at.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    fn working_elapsed_label(&self) -> String {
+        let total_secs = self.working_elapsed_secs();
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        let secs = total_secs % 60;
+        if hours > 0 {
+            format!("{hours}h {mins}m {secs}s")
+        } else if mins > 0 {
+            format!("{mins}m {secs}s")
+        } else {
+            format!("{secs}s")
+        }
+    }
+
+    fn with_working_suffix(&self, message: &str) -> String {
+        format!(
+            "{message} ({} • {} to interrupt)",
+            self.working_elapsed_label(),
+            self.interrupt_hint_label
+        )
+    }
+
+    fn status_for_render(&self) -> String {
+        if self.is_working {
+            self.with_working_suffix(self.status.as_str())
+        } else {
+            self.status.clone()
+        }
     }
 
     fn queue_follow_up(&mut self, input: String) {
@@ -339,6 +494,8 @@ impl TuiApp {
             return;
         }
         self.input_history.push(input.to_string());
+        self.trim_input_history_to_store_limit();
+        self.persist_input_history();
         self.reset_input_history_navigation();
     }
 
@@ -406,15 +563,31 @@ impl TuiApp {
         let frames = if is_tool_run_line(&self.working_message) {
             ["▱", "▰", "▱", "▱"]
         } else {
-            ["-", "\\", "|", "/"]
+            ["•", "◦", "•", "•"]
         };
         let spinner = frames[self.working_tick % frames.len()];
-        let text = if is_tool_run_line(&self.working_message) {
-            format!("{spinner} {}", self.working_message)
+        let prefix = format!("{spinner} ");
+
+        let suffix = format!(
+            " ({} • {} to interrupt)",
+            self.working_elapsed_label(),
+            self.interrupt_hint_label
+        );
+        let text = format!("{prefix}{}{}", self.working_message, suffix);
+        let message_char_len = self.working_message.chars().count();
+        let highlight_len = message_char_len.min(4);
+        let highlight_start = if message_char_len == 0 {
+            0
         } else {
-            format!("[{spinner}] {}", self.working_message)
+            self.working_tick % message_char_len
         };
-        Some(TranscriptLine::new(text, TranscriptLineKind::Working))
+        Some(TranscriptLine::new_working_with_marquee(
+            text,
+            prefix.chars().count(),
+            message_char_len,
+            highlight_start,
+            highlight_len,
+        ))
     }
 
     fn apply_stream_update(&mut self, update: StreamUpdate) {
@@ -476,8 +649,13 @@ impl TuiApp {
 
 pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Result<(), String> {
     enable_raw_mode().map_err(|error| format!("enable raw mode failed: {error}"))?;
-    execute!(io::stdout(), EnterAlternateScreen)
-        .map_err(|error| format!("enter alternate screen failed: {error}"))?;
+    if options.enable_mouse_capture {
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+            .map_err(|error| format!("enter alternate screen failed: {error}"))?;
+    } else {
+        execute!(io::stdout(), EnterAlternateScreen)
+            .map_err(|error| format!("enter alternate screen failed: {error}"))?;
+    }
 
     let keyboard_enhancement_enabled =
         if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -490,8 +668,10 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             false
         };
 
-    let _restore = TerminalRestore {
+    let mut _restore = TerminalRestore {
         keyboard_enhancement_enabled,
+        mouse_capture_enabled: options.enable_mouse_capture,
+        selection_colors_applied: false,
     };
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
@@ -499,12 +679,22 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
     terminal
         .clear()
         .map_err(|error| format!("clear terminal failed: {error}"))?;
+    _restore.selection_colors_applied = apply_selection_osc_colors(options.theme);
 
     let status = backend
         .session_file()
         .map(|path| format!("session: {}", path.display()))
         .unwrap_or_else(|| "session: (none)".to_string());
     let mut app = TuiApp::new(status, options.show_tool_results, options.initial_help);
+    app.set_interrupt_hint_label(primary_keybinding_label_lower(
+        &options.keybindings.interrupt,
+    ));
+    app.set_input_history_store(
+        options
+            .input_history_path
+            .as_ref()
+            .map(|path| InputHistoryStore::new(path.clone(), options.input_history_limit)),
+    );
     app.set_status_bar_meta(
         options.status_top.clone(),
         options.status_left.clone(),
@@ -513,10 +703,14 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
     app.push_lines(build_welcome_banner(&options));
 
     let mut events = EventStream::new();
+    let mut needs_redraw = true;
     loop {
-        terminal
-            .draw(|frame| render_ui(frame, &app, &options))
-            .map_err(|error| format!("draw UI failed: {error}"))?;
+        if needs_redraw {
+            terminal
+                .draw(|frame| render_ui(frame, &app, &options))
+                .map_err(|error| format!("draw UI failed: {error}"))?;
+            needs_redraw = false;
+        }
 
         let maybe_event = events.next().await;
         let Some(event_result) = maybe_event else {
@@ -524,193 +718,135 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
         };
         let event = event_result.map_err(|error| format!("read terminal event failed: {error}"))?;
 
-        if let Event::Key(key) = event {
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        if let Event::Mouse(mouse) = event {
+            needs_redraw = handle_mouse_history_event(&mut app, mouse);
+            continue;
+        }
+
+        if !matches!(event, Event::Key(_)) {
+            // Keep resize/focus redraw responsive without repainting on every mouse drag.
+            needs_redraw = true;
+            continue;
+        }
+
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        needs_redraw = true;
+
+        if matches_keybinding(&options.keybindings.quit, key) {
+            if !app.input.trim().is_empty() {
+                app.status = "input not empty; clear first".to_string();
+                continue;
+            }
+            return Ok(());
+        }
+        if matches_keybinding(&options.keybindings.interrupt, key) {
+            app.clear_input();
+            app.show_help = false;
+            app.status = "interrupted".to_string();
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.clear, key) {
+            if !app.input.is_empty() {
+                app.clear_input();
+                app.last_clear_key_at_ms = now_millis();
+                app.status = "input cleared".to_string();
                 continue;
             }
 
-            if matches_keybinding(&options.keybindings.quit, key) {
-                if !app.input.trim().is_empty() {
-                    app.status = "input not empty; clear first".to_string();
-                    continue;
-                }
+            let now = now_millis();
+            if now.saturating_sub(app.last_clear_key_at_ms) <= 500 {
                 return Ok(());
             }
-            if matches_keybinding(&options.keybindings.interrupt, key) {
-                app.clear_input();
-                app.show_help = false;
-                app.status = "interrupted".to_string();
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.clear, key) {
-                if !app.input.is_empty() {
-                    app.clear_input();
-                    app.last_clear_key_at_ms = now_millis();
-                    app.status = "input cleared".to_string();
-                    continue;
+            app.last_clear_key_at_ms = now;
+            app.status = "press clear again to exit".to_string();
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.show_help, key) {
+            app.show_help = !app.show_help;
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.show_session, key) {
+            app.status = backend
+                .session_file()
+                .map(|path| format!("session: {}", path.display()))
+                .unwrap_or_else(|| "session: (none)".to_string());
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.cycle_model_forward, key) {
+            app.status = match backend.cycle_model_forward() {
+                Ok(Some(status)) => {
+                    app.maybe_update_status_right_from_backend_status(&status);
+                    status
                 }
-
-                let now = now_millis();
-                if now.saturating_sub(app.last_clear_key_at_ms) <= 500 {
-                    return Ok(());
+                Ok(None) => "only one model available".to_string(),
+                Err(error) => format!("cycle model failed: {error}"),
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.cycle_model_backward, key) {
+            app.status = match backend.cycle_model_backward() {
+                Ok(Some(status)) => {
+                    app.maybe_update_status_right_from_backend_status(&status);
+                    status
                 }
-                app.last_clear_key_at_ms = now;
-                app.status = "press clear again to exit".to_string();
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.show_help, key) {
-                app.show_help = !app.show_help;
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.show_session, key) {
-                app.status = backend
-                    .session_file()
-                    .map(|path| format!("session: {}", path.display()))
-                    .unwrap_or_else(|| "session: (none)".to_string());
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.cycle_model_forward, key) {
-                app.status = match backend.cycle_model_forward() {
-                    Ok(Some(status)) => {
-                        app.maybe_update_status_right_from_backend_status(&status);
-                        status
-                    }
-                    Ok(None) => "only one model available".to_string(),
-                    Err(error) => format!("cycle model failed: {error}"),
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.cycle_model_backward, key) {
-                app.status = match backend.cycle_model_backward() {
-                    Ok(Some(status)) => {
-                        app.maybe_update_status_right_from_backend_status(&status);
-                        status
-                    }
-                    Ok(None) => "only one model available".to_string(),
-                    Err(error) => format!("cycle model failed: {error}"),
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.select_model, key) {
-                app.status = match backend.select_model() {
-                    Ok(Some(status)) => {
-                        app.maybe_update_status_right_from_backend_status(&status);
-                        status
-                    }
-                    Ok(None) => "no model selection candidates".to_string(),
-                    Err(error) => format!("select model failed: {error}"),
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.cycle_thinking_level, key) {
-                let enabled = app.toggle_thinking();
-                app.status = if enabled {
-                    "thinking visible".to_string()
-                } else {
-                    "thinking hidden".to_string()
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.expand_tools, key) {
-                let enabled = app.toggle_tool_results();
-                app.status = if enabled {
-                    "tool output visible".to_string()
-                } else {
-                    "tool output hidden".to_string()
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.toggle_thinking, key) {
-                let enabled = app.toggle_thinking();
-                app.status = if enabled {
-                    "thinking visible".to_string()
-                } else {
-                    "thinking hidden".to_string()
-                };
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.continue_run, key) {
-                if app.input.trim().is_empty() {
-                    handle_continue_streaming(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &mut events,
-                    )
-                    .await?;
-                    process_queued_follow_ups(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &mut events,
-                    )
-                    .await?;
-                } else {
-                    let submitted = app.take_input_trimmed();
-                    app.record_input_history(&submitted);
-                    app.scroll_transcript_to_latest();
-                    app.push_user_input_line(format_user_input_line(
-                        submitted.as_str(),
-                        options.theme.input_prompt(),
-                    ));
-                    run_prompt_streaming(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &submitted,
-                        &mut events,
-                    )
-                    .await?;
-                    process_queued_follow_ups(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &mut events,
-                    )
-                    .await?;
+                Ok(None) => "only one model available".to_string(),
+                Err(error) => format!("cycle model failed: {error}"),
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.select_model, key) {
+            app.status = match backend.select_model() {
+                Ok(Some(status)) => {
+                    app.maybe_update_status_right_from_backend_status(&status);
+                    status
                 }
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.newline, key) {
-                app.insert_char('\n');
-                continue;
-            }
-            if matches_keybinding(&options.keybindings.submit, key) {
+                Ok(None) => "no model selection candidates".to_string(),
+                Err(error) => format!("select model failed: {error}"),
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.cycle_thinking_level, key) {
+            let enabled = app.toggle_thinking();
+            app.status = if enabled {
+                "thinking visible".to_string()
+            } else {
+                "thinking hidden".to_string()
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.expand_tools, key) {
+            let enabled = app.toggle_tool_results();
+            app.status = if enabled {
+                "tool output visible".to_string()
+            } else {
+                "tool output hidden".to_string()
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.toggle_thinking, key) {
+            let enabled = app.toggle_thinking();
+            app.status = if enabled {
+                "thinking visible".to_string()
+            } else {
+                "thinking hidden".to_string()
+            };
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.continue_run, key) {
+            if app.input.trim().is_empty() {
+                handle_continue_streaming(backend, &mut terminal, &mut app, &options, &mut events)
+                    .await?;
+                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
+                    .await?;
+            } else {
                 let submitted = app.take_input_trimmed();
-                if submitted.is_empty() {
-                    continue;
-                }
                 app.record_input_history(&submitted);
                 app.scroll_transcript_to_latest();
-                if submitted == "/continue" {
-                    handle_continue_streaming(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &mut events,
-                    )
-                    .await?;
-                    process_queued_follow_ups(
-                        backend,
-                        &mut terminal,
-                        &mut app,
-                        &options,
-                        &mut events,
-                    )
-                    .await?;
-                    continue;
-                }
-                match handle_slash_command(&submitted, backend, &mut app).await {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) if error == "__EXIT__" => return Ok(()),
-                    Err(error) => return Err(error),
-                }
                 app.push_user_input_line(format_user_input_line(
                     submitted.as_str(),
                     options.theme.input_prompt(),
@@ -726,17 +862,58 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                 .await?;
                 process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
                     .await?;
+            }
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.newline, key) {
+            app.insert_char('\n');
+            continue;
+        }
+        if matches_keybinding(&options.keybindings.submit, key) {
+            let submitted = app.take_input_trimmed();
+            if submitted.is_empty() {
                 continue;
             }
-            if handle_input_history_key_event(&mut app, key) {
+            app.record_input_history(&submitted);
+            app.scroll_transcript_to_latest();
+            if submitted == "/continue" {
+                handle_continue_streaming(backend, &mut terminal, &mut app, &options, &mut events)
+                    .await?;
+                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
+                    .await?;
                 continue;
             }
-            if handle_transcript_scroll_key(&mut app, key) {
-                continue;
+            match handle_slash_command(&submitted, backend, &mut app).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) if error == "__EXIT__" => return Ok(()),
+                Err(error) => return Err(error),
             }
-            if handle_editor_key_event(&mut app, key) {
-                continue;
-            }
+            app.push_user_input_line(format_user_input_line(
+                submitted.as_str(),
+                options.theme.input_prompt(),
+            ));
+            run_prompt_streaming(
+                backend,
+                &mut terminal,
+                &mut app,
+                &options,
+                &submitted,
+                &mut events,
+            )
+            .await?;
+            process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
+                .await?;
+            continue;
+        }
+        if handle_input_history_key_event(&mut app, key) {
+            continue;
+        }
+        if handle_transcript_scroll_key(&mut app, key) {
+            continue;
+        }
+        if handle_editor_key_event(&mut app, key) {
+            continue;
         }
     }
 }
@@ -808,8 +985,44 @@ fn handle_editor_key_event(app: &mut TuiApp, key: KeyEvent) -> bool {
 
 fn handle_input_history_key_event(app: &mut TuiApp, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Up if key.modifiers == KeyModifiers::NONE => app.navigate_input_history_up(),
-        KeyCode::Down if key.modifiers == KeyModifiers::NONE => app.navigate_input_history_down(),
+        KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+            if !app.input.is_empty() && app.cursor_pos > 0 {
+                app.move_cursor_home();
+                true
+            } else {
+                app.navigate_input_history_up()
+            }
+        }
+        KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+            if !app.input.is_empty() && app.cursor_pos < app.input_char_count() {
+                app.move_cursor_end();
+                true
+            } else {
+                app.navigate_input_history_down()
+            }
+        }
+        _ => false,
+    }
+}
+
+fn handle_mouse_history_event(app: &mut TuiApp, mouse: MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.navigate_input_history_up() {
+                true
+            } else {
+                app.scroll_transcript_up(1);
+                true
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.navigate_input_history_down() {
+                true
+            } else {
+                app.scroll_transcript_down(1);
+                true
+            }
+        }
         _ => false,
     }
 }
@@ -884,9 +1097,25 @@ fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
         format!(" {} to queue follow-up", follow_up_label),
         " ctrl+a/e: move cursor, ctrl+w/u: delete backward".to_string(),
         format!(" {}: newline", newline_label),
-        " up/down: input history, pageup/pagedown: scroll messages".to_string(),
+        history_navigation_help_line(options.enable_mouse_capture).to_string(),
         String::new(),
     ]
+}
+
+fn history_navigation_help_line(enable_mouse_capture: bool) -> &'static str {
+    if enable_mouse_capture {
+        " up/down/mouse wheel: input history, pageup/pagedown: scroll messages"
+    } else {
+        " up/down: input history, pageup/pagedown: scroll messages"
+    }
+}
+
+fn history_navigation_help_panel_line(enable_mouse_capture: bool) -> &'static str {
+    if enable_mouse_capture {
+        "  Up/Down / mouse wheel input history, PageUp/PageDown scroll messages"
+    } else {
+        "  Up/Down input history, PageUp/PageDown scroll messages"
+    }
 }
 
 fn keybinding_label_lower(bindings: &[KeyBinding]) -> String {
@@ -899,6 +1128,14 @@ fn keybinding_label_lower(bindings: &[KeyBinding]) -> String {
         .map(format_keybinding_lower)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn primary_keybinding_label_lower(bindings: &[KeyBinding]) -> String {
+    bindings
+        .first()
+        .copied()
+        .map(format_keybinding_lower)
+        .unwrap_or_else(|| "interrupt".to_string())
 }
 
 fn format_user_input_line(input: &str, input_prompt: &str) -> String {
@@ -1193,6 +1430,13 @@ fn handle_streaming_event(
     abort_controller: &AgentAbortController,
     app: &mut TuiApp,
 ) -> StreamingEventOutcome {
+    if let Event::Mouse(mouse) = event {
+        return StreamingEventOutcome {
+            interrupted: false,
+            ui_changed: handle_mouse_history_event(app, mouse),
+        };
+    }
+
     let Event::Key(key) = event else {
         return StreamingEventOutcome::default();
     };
@@ -1396,7 +1640,9 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
                 "  {} insert newline",
                 keybinding_label(&options.keybindings.newline)
             )),
-            Line::from("  Up/Down input history, PageUp/PageDown scroll messages"),
+            Line::from(history_navigation_help_panel_line(
+                options.enable_mouse_capture,
+            )),
             Line::from(""),
             Line::from("Use interrupt or help key to close help."),
         ]))
@@ -1515,13 +1761,14 @@ fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str) -> u16 
 }
 
 fn render_status_bar_lines(app: &TuiApp, width: usize) -> Text<'static> {
+    let status = app.status_for_render();
     let mut top = if app.status_top.is_empty() {
-        app.status.clone()
+        status.clone()
     } else {
         app.status_top.clone()
     };
-    if !app.status_top.is_empty() && !app.status.is_empty() && app.status != "ok" {
-        top = format!("{top} | {}", app.status);
+    if !app.status_top.is_empty() && !status.is_empty() && status != "ok" {
+        top = format!("{top} | {status}");
     }
     let bottom =
         compose_left_right_status_line(app.status_left.as_str(), app.status_right.as_str(), width);
@@ -1624,8 +1871,230 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn apply_selection_osc_colors(theme: TuiTheme) -> bool {
+    let capabilities = detect_terminal_capabilities();
+    let Some(sequences) = selection_osc_set_sequences(theme, capabilities) else {
+        return false;
+    };
+    if sequences.is_empty() {
+        return false;
+    }
+    let mut stdout = io::stdout();
+    for sequence in sequences {
+        if stdout.write_all(sequence.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    let _ = stdout.flush();
+    true
+}
+
+fn reset_selection_osc_colors() {
+    let capabilities = detect_terminal_capabilities();
+    let mut stdout = io::stdout();
+    for sequence in selection_osc_reset_sequences(capabilities) {
+        let _ = stdout.write_all(sequence.as_bytes());
+    }
+    let _ = stdout.flush();
+}
+
+#[cfg(test)]
+fn selection_osc_set_sequence(theme: TuiTheme) -> Option<String> {
+    selection_osc_set_sequences(theme, TerminalCapabilities::default())?
+        .into_iter()
+        .next()
+}
+
+fn selection_osc_set_sequences(
+    theme: TuiTheme,
+    capabilities: TerminalCapabilities,
+) -> Option<Vec<String>> {
+    let (bg, fg) = theme.selection_colors()?;
+    let bg_hex = color_to_osc_hex(bg)?;
+    let fg_hex = color_to_osc_hex(fg)?;
+    let bg_rgb = color_to_osc_rgb(bg)?;
+    let fg_rgb = color_to_osc_rgb(fg)?;
+
+    let mut sequences = Vec::new();
+    push_osc_pair(&mut sequences, "17", bg_hex.as_str(), "19", fg_hex.as_str());
+    push_osc_pair(&mut sequences, "17", bg_rgb.as_str(), "19", fg_rgb.as_str());
+
+    if capabilities.iterm2 {
+        push_osc_pair(
+            &mut sequences,
+            "1337",
+            format!("SetColors=selbg={}", bg_hex.trim_start_matches('#')).as_str(),
+            "1337",
+            format!("SetColors=selfg={}", fg_hex.trim_start_matches('#')).as_str(),
+        );
+    }
+
+    if capabilities.kitty {
+        push_osc_single(
+            &mut sequences,
+            "21",
+            format!("selection_background={bg_hex};selection_foreground={fg_hex}").as_str(),
+        );
+    }
+
+    append_multiplexer_variants(&mut sequences, capabilities.multiplexer);
+
+    Some(sequences)
+}
+
+#[cfg(test)]
+fn selection_osc_reset_sequence() -> &'static str {
+    "\u{1b}]117;\u{7}\u{1b}]119;\u{7}"
+}
+
+fn selection_osc_reset_sequences(capabilities: TerminalCapabilities) -> Vec<String> {
+    let mut sequences = Vec::new();
+    push_osc_pair(&mut sequences, "117", "", "119", "");
+
+    if capabilities.iterm2 {
+        push_osc_pair(
+            &mut sequences,
+            "1337",
+            "SetColors=selbg=default",
+            "1337",
+            "SetColors=selfg=default",
+        );
+    }
+
+    if capabilities.kitty {
+        push_osc_single(
+            &mut sequences,
+            "21",
+            "selection_background;selection_foreground",
+        );
+    }
+
+    append_multiplexer_variants(&mut sequences, capabilities.multiplexer);
+    sequences
+}
+
+fn color_to_osc_hex(color: Color) -> Option<String> {
+    let (red, green, blue) = color_to_rgb_bytes(color)?;
+    Some(format!("#{red:02x}{green:02x}{blue:02x}"))
+}
+
+fn color_to_osc_rgb(color: Color) -> Option<String> {
+    let (red, green, blue) = color_to_rgb_bytes(color)?;
+    Some(format!("rgb:{red:02x}/{green:02x}/{blue:02x}"))
+}
+
+fn color_to_rgb_bytes(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Black => Some((0x00, 0x00, 0x00)),
+        Color::Red => Some((0xff, 0x00, 0x00)),
+        Color::Green => Some((0x00, 0xff, 0x00)),
+        Color::Yellow => Some((0xff, 0xff, 0x00)),
+        Color::Blue => Some((0x00, 0x00, 0xff)),
+        Color::Magenta => Some((0xff, 0x00, 0xff)),
+        Color::Cyan => Some((0x00, 0xff, 0xff)),
+        Color::Gray => Some((0xc0, 0xc0, 0xc0)),
+        Color::DarkGray => Some((0x80, 0x80, 0x80)),
+        Color::LightRed => Some((0xff, 0x55, 0x55)),
+        Color::LightGreen => Some((0x55, 0xff, 0x55)),
+        Color::LightYellow => Some((0xff, 0xff, 0x55)),
+        Color::LightBlue => Some((0x55, 0x55, 0xff)),
+        Color::LightMagenta => Some((0xff, 0x55, 0xff)),
+        Color::LightCyan => Some((0x55, 0xff, 0xff)),
+        Color::White => Some((0xff, 0xff, 0xff)),
+        Color::Rgb(red, green, blue) => Some((red, green, blue)),
+        Color::Reset | Color::Indexed(_) => None,
+    }
+}
+
+fn detect_terminal_capabilities() -> TerminalCapabilities {
+    let term_program = env::var("TERM_PROGRAM")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let term = env::var("TERM")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    TerminalCapabilities {
+        multiplexer: if env::var_os("TMUX").is_some() {
+            Some(TerminalMultiplexer::Tmux)
+        } else if env::var_os("STY").is_some() {
+            Some(TerminalMultiplexer::Screen)
+        } else {
+            None
+        },
+        iterm2: term_program.contains("iterm"),
+        kitty: env::var_os("KITTY_WINDOW_ID").is_some() || term.contains("kitty"),
+    }
+}
+
+fn wrap_osc_for_multiplexer(sequence: &str, multiplexer: TerminalMultiplexer) -> String {
+    match multiplexer {
+        TerminalMultiplexer::Tmux => {
+            let mut escaped = String::with_capacity(sequence.len() * 2);
+            for ch in sequence.chars() {
+                if ch == '\u{1b}' {
+                    escaped.push('\u{1b}');
+                }
+                escaped.push(ch);
+            }
+            format!("\u{1b}Ptmux;{escaped}\u{1b}\\")
+        }
+        TerminalMultiplexer::Screen => format!("\u{1b}P{sequence}\u{1b}\\"),
+    }
+}
+
+fn push_osc_single(sequences: &mut Vec<String>, code: &str, value: &str) {
+    for terminator in ["\u{7}", "\u{1b}\\"] {
+        sequences.push(format!("\u{1b}]{code};{value}{terminator}"));
+    }
+}
+
+fn push_osc_pair(
+    sequences: &mut Vec<String>,
+    first_code: &str,
+    first_value: &str,
+    second_code: &str,
+    second_value: &str,
+) {
+    for terminator in ["\u{7}", "\u{1b}\\"] {
+        sequences.push(format!(
+            "\u{1b}]{first_code};{first_value}{terminator}\u{1b}]{second_code};{second_value}{terminator}"
+        ));
+    }
+}
+
+fn append_multiplexer_variants(
+    sequences: &mut Vec<String>,
+    multiplexer: Option<TerminalMultiplexer>,
+) {
+    let Some(multiplexer) = multiplexer else {
+        return;
+    };
+    sequences.extend(
+        sequences
+            .clone()
+            .into_iter()
+            .map(|sequence| wrap_osc_for_multiplexer(sequence.as_str(), multiplexer)),
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalMultiplexer {
+    Tmux,
+    Screen,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalCapabilities {
+    multiplexer: Option<TerminalMultiplexer>,
+    iterm2: bool,
+    kitty: bool,
+}
+
 struct TerminalRestore {
     keyboard_enhancement_enabled: bool,
+    mouse_capture_enabled: bool,
+    selection_colors_applied: bool,
 }
 
 impl Drop for TerminalRestore {
@@ -1634,13 +2103,19 @@ impl Drop for TerminalRestore {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
         let _ = disable_raw_mode();
+        if self.selection_colors_applied {
+            reset_selection_osc_colors();
+        }
+        if self.mouse_capture_enabled {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use pi_agent_core::AgentAbortSignal;
@@ -1652,6 +2127,15 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn mouse_scroll_event(kind: crossterm::event::MouseEventKind) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     struct TestBackend {
@@ -1909,19 +2393,23 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ));
-        assert_eq!(app.input, "second");
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.cursor_pos, 0);
 
         assert!(handle_input_history_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ));
-        assert_eq!(app.input, "first");
+        assert_eq!(app.input, "second");
+        assert_eq!(app.cursor_pos, app.input_char_count());
 
+        app.move_cursor_home();
         assert!(handle_input_history_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ));
         assert_eq!(app.input, "second");
+        assert_eq!(app.cursor_pos, app.input_char_count());
 
         assert!(handle_input_history_key_event(
             &mut app,
@@ -1929,6 +2417,73 @@ mod tests {
         ));
         assert_eq!(app.input, "draft");
         assert_eq!(app.cursor_pos, app.input_char_count());
+    }
+
+    #[test]
+    fn mouse_scroll_navigates_input_history_like_up_down() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.record_input_history("first");
+        app.record_input_history("second");
+        app.input = "draft".to_string();
+        app.cursor_pos = app.input_char_count();
+
+        assert!(handle_mouse_history_event(
+            &mut app,
+            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollUp),
+        ));
+        assert_eq!(app.input, "second");
+
+        assert!(handle_mouse_history_event(
+            &mut app,
+            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollUp),
+        ));
+        assert_eq!(app.input, "first");
+
+        assert!(handle_mouse_history_event(
+            &mut app,
+            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollDown),
+        ));
+        assert_eq!(app.input, "second");
+
+        assert!(handle_mouse_history_event(
+            &mut app,
+            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollDown),
+        ));
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn input_history_is_persisted_and_restored_with_ring_buffer_limit() {
+        let history_file = std::env::temp_dir().join(format!(
+            "pi-tui-history-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = fs::remove_file(&history_file);
+
+        let store = InputHistoryStore::new(history_file.clone(), 3);
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.set_input_history_store(Some(store.clone()));
+        app.record_input_history("first");
+        app.record_input_history("second");
+        app.record_input_history("third");
+        app.record_input_history("fourth");
+
+        let persisted = fs::read_to_string(&history_file).expect("history file should exist");
+        assert_eq!(persisted.lines().count(), 3);
+
+        let mut restored = TuiApp::new("ready".to_string(), true, false);
+        restored.set_input_history_store(Some(store));
+        assert_eq!(
+            restored.input_history,
+            vec![
+                "second".to_string(),
+                "third".to_string(),
+                "fourth".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_file(&history_file);
     }
 
     #[test]
@@ -2064,6 +2619,117 @@ mod tests {
     }
 
     #[test]
+    fn working_line_includes_elapsed_and_interrupt_hint_when_running_tool() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.start_working("• Ran read".to_string());
+
+        let working = app
+            .working_line()
+            .expect("working line should be present while working");
+
+        assert!(working.text.contains("• Ran read"));
+        assert!(working.text.contains("s •"));
+        assert!(working.text.contains("to interrupt"));
+    }
+
+    #[test]
+    fn status_bar_shows_elapsed_and_interrupt_hint_while_working() {
+        let mut app = TuiApp::new("pi is working...".to_string(), true, false);
+        app.start_working("pi is working...".to_string());
+
+        let status = render_status_bar_lines(&app, 120);
+        let top = line_text(&status.lines[0]);
+
+        assert!(top.contains("pi is working..."));
+        assert!(top.contains("s •"));
+        assert!(top.contains("to interrupt"));
+    }
+
+    #[test]
+    fn working_line_formats_elapsed_time_as_minutes_and_seconds() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.start_working("Checking file git status flags".to_string());
+        app.working_started_at = Some(Instant::now() - Duration::from_secs(510));
+
+        let working = app
+            .working_line()
+            .expect("working line should be present while working");
+
+        assert!(working.text.contains("(8m 30s •"));
+    }
+
+    #[test]
+    fn working_line_marquee_highlights_four_chars_and_rotates() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.start_working("Checking file git status flags".to_string());
+        app.working_tick = 0;
+
+        let line0 = app
+            .working_line()
+            .expect("working line should be present")
+            .to_line(200, TuiTheme::Dark);
+        assert!(
+            line0.spans.iter().any(|span| {
+                span.content.contains("Chec")
+                    && span.style.fg == Some(Color::White)
+                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
+            }),
+            "tick=0 should highlight first 4 chars with white-on-black"
+        );
+        assert!(
+            line0.spans.iter().any(|span| {
+                span.style.fg == Some(Color::Rgb(148, 150, 153))
+                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
+            }),
+            "non-highlight text should use gray-on-black"
+        );
+
+        app.working_tick = 1;
+        let line1 = app
+            .working_line()
+            .expect("working line should be present")
+            .to_line(200, TuiTheme::Dark);
+        assert!(
+            line1.spans.iter().any(|span| {
+                span.content.contains("heck")
+                    && span.style.fg == Some(Color::White)
+                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
+            }),
+            "tick=1 should move highlight window forward by one char"
+        );
+    }
+
+    #[test]
+    fn working_line_marquee_uses_light_theme_colors() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.start_working("Checking file git status flags".to_string());
+
+        let line = app
+            .working_line()
+            .expect("working line should be present")
+            .to_line(200, TuiTheme::Light);
+
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Rgb(208, 208, 224))),
+            "light theme should use configured working background"
+        );
+        assert!(
+            line.spans.iter().any(|span| {
+                span.content.contains("Chec") && span.style.fg == Some(Color::Black)
+            }),
+            "highlight text should use light theme highlight color"
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Rgb(108, 108, 108))),
+            "non-highlight text should use light theme working text color"
+        );
+    }
+
+    #[test]
     fn visible_transcript_wraps_and_keeps_latest_at_bottom() {
         let lines = vec![
             TranscriptLine::new("old".to_string(), TranscriptLineKind::Normal),
@@ -2156,7 +2822,29 @@ mod tests {
         let added = TranscriptLine::new("+ new assertion".to_string(), TranscriptLineKind::Tool)
             .to_line(40, TuiTheme::Dark);
         assert_eq!(removed.spans[0].style.fg, Some(Color::Red));
-        assert_eq!(added.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(added.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn tool_diff_stat_line_colors_plus_and_minus_segments() {
+        let line = TranscriptLine::new(
+            "crates/pi-coding-agent/tests/tools.rs | 124 ++++++++++---------".to_string(),
+            TranscriptLineKind::Tool,
+        )
+        .to_line(80, TuiTheme::Dark);
+
+        let plus_span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('+'))
+            .expect("plus span");
+        let minus_span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('-'))
+            .expect("minus span");
+        assert_eq!(plus_span.style.fg, Some(Color::Green));
+        assert_eq!(minus_span.style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -2203,6 +2891,69 @@ mod tests {
         assert_eq!(TuiTheme::from_name("LIGHT"), Some(TuiTheme::Light));
         assert_eq!(TuiTheme::from_name(""), None);
         assert_eq!(TuiTheme::from_name("solarized"), None);
+    }
+
+    #[test]
+    fn dark_theme_selection_osc_sequence_is_white_bg_black_fg() {
+        assert_eq!(
+            selection_osc_set_sequence(TuiTheme::Dark),
+            Some("\u{1b}]17;#ffffff\u{7}\u{1b}]19;#000000\u{7}".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_osc_reset_sequence_resets_both_colors() {
+        assert_eq!(
+            selection_osc_reset_sequence(),
+            "\u{1b}]117;\u{7}\u{1b}]119;\u{7}"
+        );
+    }
+
+    #[test]
+    fn dark_theme_selection_osc_sequences_include_rgb_and_st_variants() {
+        let sequences =
+            selection_osc_set_sequences(TuiTheme::Dark, TerminalCapabilities::default())
+                .expect("dark theme should provide selection sequences");
+        assert!(
+            sequences
+                .iter()
+                .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{7}"))
+        );
+        assert!(
+            sequences
+                .iter()
+                .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{1b}\\"))
+        );
+    }
+
+    #[test]
+    fn selection_osc_sequences_are_wrapped_for_tmux() {
+        let sequences = selection_osc_set_sequences(
+            TuiTheme::Dark,
+            TerminalCapabilities {
+                multiplexer: Some(TerminalMultiplexer::Tmux),
+                ..TerminalCapabilities::default()
+            },
+        )
+        .expect("dark theme should provide selection sequences");
+        assert!(
+            sequences
+                .iter()
+                .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
+        );
+    }
+
+    #[test]
+    fn selection_osc_reset_sequences_are_wrapped_for_tmux() {
+        let sequences = selection_osc_reset_sequences(TerminalCapabilities {
+            multiplexer: Some(TerminalMultiplexer::Tmux),
+            ..TerminalCapabilities::default()
+        });
+        assert!(
+            sequences
+                .iter()
+                .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
+        );
     }
 
     #[test]

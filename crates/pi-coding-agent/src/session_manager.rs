@@ -252,7 +252,7 @@ impl SessionManager {
 
         let timestamp = now_millis().to_string();
         let session_id = format!("session-{timestamp}");
-        let session_file = session_dir.join(format!("{timestamp}_{session_id}.jsonl"));
+        let session_file = session_dir.join(format!("{session_id}.jsonl"));
         let header = SessionHeader {
             type_field: "session".to_string(),
             version: CURRENT_SESSION_VERSION,

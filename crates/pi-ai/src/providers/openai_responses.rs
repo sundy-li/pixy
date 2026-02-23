@@ -3,6 +3,7 @@ use std::env;
 
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
+use tracing::info;
 
 use crate::AssistantMessageEventStream;
 use crate::api_registry::StreamResult;
@@ -447,6 +448,23 @@ fn build_openai_responses_payload(
     }
     if let Some(tools) = &context.tools {
         payload["tools"] = convert_responses_tools(tools);
+    }
+
+    if let Ok(payload_json) = serde_json::to_string(&payload) {
+        info!(
+            target: "pi_ai::providers::openai_responses",
+            provider = %model.provider,
+            model = %model.id,
+            payload = %payload_json,
+            "build_openai_responses_payload"
+        );
+    } else {
+        info!(
+            target: "pi_ai::providers::openai_responses",
+            provider = %model.provider,
+            model = %model.id,
+            "build_openai_responses_payload"
+        );
     }
 
     payload

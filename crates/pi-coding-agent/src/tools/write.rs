@@ -5,7 +5,9 @@ use std::sync::Arc;
 use pi_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
 use serde_json::{Value, json};
 
-use super::common::{get_required_string, resolve_to_cwd, text_result};
+use super::common::{
+    format_diff_stat_line, get_required_string, line_change_counts, resolve_to_cwd, text_result,
+};
 
 pub fn create_write_tool(cwd: impl AsRef<Path>) -> AgentTool {
     let cwd = cwd.as_ref().to_path_buf();
@@ -42,6 +44,11 @@ fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String
     let path = get_required_string(&args, "path")?;
     let content = get_required_string(&args, "content")?;
     let absolute_path = resolve_to_cwd(cwd, &path);
+    let previous_content = match fs::read(&absolute_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => String::new(),
+    };
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create parent directories: {error}"))?;
@@ -49,11 +56,15 @@ fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String
 
     fs::write(&absolute_path, &content)
         .map_err(|error| format!("Failed to write {path}: {error}"))?;
+    let (insertions, deletions) = line_change_counts(&previous_content, &content);
     Ok(text_result(
-        format!("Successfully wrote {} bytes to {}", content.len(), path),
+        format_diff_stat_line(&path, &previous_content, &content),
         json!({
             "path": path,
             "bytes": content.len(),
+            "insertions": insertions,
+            "deletions": deletions,
+            "changedLines": insertions + deletions,
         }),
     ))
 }
