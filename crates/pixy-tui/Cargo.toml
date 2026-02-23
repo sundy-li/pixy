@@ -1,0 +1,16 @@
+[package]
+name = "pixy-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+pixy-agent-core = { path = "../pixy-agent-core" }
+pixy-ai = { path = "../pixy-ai" }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.49", features = ["macros", "sync", "time"] }
+unicode-width = "0.2"

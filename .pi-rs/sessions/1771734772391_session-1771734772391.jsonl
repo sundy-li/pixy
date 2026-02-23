@@ -1,3 +1,0 @@
-{"type":"session","version":3,"id":"session-1771734772391","timestamp":"1771734772391","cwd":"/data/work/pi-rs"}
-{"type":"message","id":"00000001","parentId":null,"timestamp":"1771734775468","message":{"role":"user","content":"hi","timestamp":1771734772391}}
-{"type":"message","id":"00000002","parentId":"00000001","timestamp":"1771734775468","message":{"role":"assistant","content":[],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-4-6","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":1771734772392}}

@@ -1,8 +1,8 @@
 dev-cli:
-	cargo run -p pi-coding-agent --bin pi
+	cargo run -p pixy-coding-agent --bin pixy
 
 cli:
-	cargo run -p pi-coding-agent --bin pi --release
+	cargo run -p pixy-coding-agent --bin pixy --release
 
 ut:
 	cargo t

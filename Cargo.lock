@@ -1160,17 +1160,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pi-agent-core"
+name = "pin-project-lite"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
+
+[[package]]
+name = "pin-utils"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pixy-agent-core"
 version = "0.1.0"
 dependencies = [
- "pi-ai",
+ "pixy-ai",
  "serde_json",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "pi-ai"
+name = "pixy-ai"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
@@ -1182,14 +1194,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "pi-coding-agent"
+name = "pixy-coding-agent"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "pi-agent-core",
- "pi-ai",
- "pi-tui",
+ "pixy-agent-core",
+ "pixy-ai",
+ "pixy-tui",
  "serde",
  "serde_json",
  "tempfile",
@@ -1200,31 +1212,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "pi-tui"
+name = "pixy-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
  "futures-util",
- "pi-agent-core",
- "pi-ai",
+ "pixy-agent-core",
+ "pixy-ai",
  "ratatui",
  "serde",
  "serde_json",
  "tokio",
  "unicode-width 0.2.0",
 ]
-
-[[package]]
-name = "pin-project-lite"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
-
-[[package]]
-name = "pin-utils"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "potential_utf"

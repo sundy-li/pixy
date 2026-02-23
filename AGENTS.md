@@ -1,13 +1,13 @@
-# AGENTS.md（pi-rs）
+# AGENTS.md（pixy-rs）
 
-适用范围：`/data/work/pi-rs`。
+适用范围：`/data/work/pixy-rs`。
 
 ## 目标
 
-在 Rust 中复刻 `pi-mono` 的核心能力，当前重点库：
-- `crates/pi-ai`
-- `crates/pi-agent-core`
-- `crates/pi-coding-agent`
+在 Rust 中复刻 `pixy-mono` 的核心能力，当前重点库：
+- `crates/pixy-ai`
+- `crates/pixy-agent-core`
+- `crates/pixy-coding-agent`
 
 ## 文档与任务管理
 
@@ -17,7 +17,7 @@
 
 ## 开发约定
 
-- 优先保持行为语义与 `pi-mono` 对齐，不追求序列化 bit-level 完全一致。
+- 优先保持行为语义与 `pixy-mono` 对齐，不追求序列化 bit-level 完全一致。
 - 小步迭代：先补测试，再实现，再回归测试。
 - 不移除看起来是“有意设计”的功能，除非明确确认。
 - 无用户明确要求时，不做提交（commit/push）。
