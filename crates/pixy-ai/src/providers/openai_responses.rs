@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::env;
+use std::io::{BufRead, BufReader, Read};
 
 use reqwest::blocking::Client;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tracing::info;
 
-use crate::AssistantMessageEventStream;
 use crate::api_registry::StreamResult;
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
@@ -13,6 +13,7 @@ use crate::types::{
     Message, Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent,
     UserContentBlock,
 };
+use crate::AssistantMessageEventStream;
 
 pub fn stream_openai_responses(
     model: Model,
@@ -58,13 +59,6 @@ pub fn stream_openai_responses(
             ));
         }
 
-        let body = response.text().map_err(|error| {
-            PiAiError::new(
-                PiAiErrorCode::ProviderTransport,
-                format!("OpenAI stream read failed: {error}"),
-            )
-        })?;
-
         stream.push(AssistantMessageEvent::Start {
             partial: output.clone(),
         });
@@ -73,310 +67,17 @@ pub fn stream_openai_responses(
         let mut tool_block_indices: HashMap<String, usize> = HashMap::new();
         let mut tool_arg_buffers: HashMap<String, String> = HashMap::new();
 
-        for data in parse_sse_data_events(&body) {
-            let event: Value = serde_json::from_str(&data).map_err(|error| {
-                PiAiError::new(
-                    PiAiErrorCode::ProviderProtocol,
-                    format!("Invalid OpenAI responses event JSON: {error}"),
-                )
-                .with_details(json!({ "event": data }))
-            })?;
-
-            let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-                continue;
-            };
-
-            match event_type {
-                "response.output_item.added" => {
-                    let Some(item) = event.get("item").and_then(Value::as_object) else {
-                        continue;
-                    };
-                    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    match item_type {
-                        "message" => {
-                            let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-                                continue;
-                            };
-                            let content_index = output.content.len();
-                            output.content.push(AssistantContentBlock::Text {
-                                text: String::new(),
-                                text_signature: None,
-                            });
-                            text_block_indices.insert(item_id.to_string(), content_index);
-                            stream.push(AssistantMessageEvent::TextStart {
-                                content_index,
-                                partial: output.clone(),
-                            });
-                        }
-                        "function_call" => {
-                            let item_id =
-                                item.get("id").and_then(Value::as_str).unwrap_or_default();
-                            let call_id = item
-                                .get("call_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            let tool_name =
-                                item.get("name").and_then(Value::as_str).unwrap_or_default();
-                            if call_id.is_empty() || tool_name.is_empty() {
-                                continue;
-                            }
-                            let tool_key = tool_item_key(call_id, item_id);
-                            let content_index = output.content.len();
-                            output.content.push(AssistantContentBlock::ToolCall {
-                                id: tool_call_compound_id(call_id, item_id),
-                                name: tool_name.to_string(),
-                                arguments: Value::Object(Map::new()),
-                                thought_signature: None,
-                            });
-
-                            let initial_arguments = item
-                                .get("arguments")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            tool_arg_buffers.insert(tool_key.clone(), initial_arguments.clone());
-                            if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
-                                output.content.get_mut(content_index)
-                            {
-                                if !initial_arguments.is_empty() {
-                                    *arguments = parse_partial_json(&initial_arguments);
-                                }
-                            }
-                            tool_block_indices.insert(tool_key, content_index);
-                            stream.push(AssistantMessageEvent::ToolcallStart {
-                                content_index,
-                                partial: output.clone(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                "response.output_text.delta" | "response.refusal.delta" => {
-                    let Some(item_id) = event.get("item_id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    if delta.is_empty() {
-                        continue;
-                    }
-                    let Some(content_index) = text_block_indices.get(item_id).copied() else {
-                        continue;
-                    };
-                    if let Some(AssistantContentBlock::Text { text, .. }) =
-                        output.content.get_mut(content_index)
-                    {
-                        text.push_str(delta);
-                    }
-                    stream.push(AssistantMessageEvent::TextDelta {
-                        content_index,
-                        delta: delta.to_string(),
-                        partial: output.clone(),
-                    });
-                }
-                "response.function_call_arguments.delta" => {
-                    let Some(tool_key) =
-                        resolve_tool_key_for_arg_event(&event, &tool_block_indices)
-                    else {
-                        continue;
-                    };
-                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(content_index) = tool_block_indices.get(&tool_key).copied() else {
-                        continue;
-                    };
-                    let buffer = tool_arg_buffers.entry(tool_key).or_default();
-                    buffer.push_str(delta);
-                    if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
-                        output.content.get_mut(content_index)
-                    {
-                        *arguments = parse_partial_json(buffer);
-                    }
-                    stream.push(AssistantMessageEvent::ToolcallDelta {
-                        content_index,
-                        delta: delta.to_string(),
-                        partial: output.clone(),
-                    });
-                }
-                "response.function_call_arguments.done" => {
-                    let Some(tool_key) =
-                        resolve_tool_key_for_arg_event(&event, &tool_block_indices)
-                    else {
-                        continue;
-                    };
-                    let Some(arguments) = event.get("arguments").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    if let Some(content_index) = tool_block_indices.get(&tool_key).copied() {
-                        tool_arg_buffers.insert(tool_key, arguments.to_string());
-                        if let Some(AssistantContentBlock::ToolCall {
-                            arguments: arg_json,
-                            ..
-                        }) = output.content.get_mut(content_index)
-                        {
-                            *arg_json = parse_partial_json(arguments);
-                        }
-                    }
-                }
-                "response.output_item.done" => {
-                    let Some(item) = event.get("item").and_then(Value::as_object) else {
-                        continue;
-                    };
-                    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    match item_type {
-                        "message" => {
-                            let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-                                continue;
-                            };
-                            let Some(content_index) = text_block_indices.remove(item_id) else {
-                                continue;
-                            };
-                            if let Some(AssistantContentBlock::Text {
-                                text,
-                                text_signature,
-                            }) = output.content.get_mut(content_index)
-                            {
-                                if text.is_empty() {
-                                    *text = item
-                                        .get("content")
-                                        .and_then(Value::as_array)
-                                        .map(|parts| {
-                                            parts
-                                                .iter()
-                                                .filter_map(|part| {
-                                                    let part_type = part
-                                                        .get("type")
-                                                        .and_then(Value::as_str)
-                                                        .unwrap_or_default();
-                                                    match part_type {
-                                                        "output_text" => {
-                                                            part.get("text").and_then(Value::as_str)
-                                                        }
-                                                        "refusal" => part
-                                                            .get("refusal")
-                                                            .and_then(Value::as_str),
-                                                        _ => None,
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("")
-                                        })
-                                        .unwrap_or_default();
-                                }
-                                *text_signature =
-                                    item.get("id").and_then(Value::as_str).map(str::to_string);
-                                let content = text.clone();
-                                stream.push(AssistantMessageEvent::TextEnd {
-                                    content_index,
-                                    content,
-                                    partial: output.clone(),
-                                });
-                            }
-                        }
-                        "function_call" => {
-                            let item_id =
-                                item.get("id").and_then(Value::as_str).unwrap_or_default();
-                            let call_id = item
-                                .get("call_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            if call_id.is_empty() {
-                                continue;
-                            }
-                            let tool_key = tool_item_key(call_id, item_id);
-                            let Some(content_index) = tool_block_indices.remove(&tool_key) else {
-                                continue;
-                            };
-                            let parsed_arguments =
-                                if let Some(buffer) = tool_arg_buffers.remove(&tool_key) {
-                                    parse_partial_json(&buffer)
-                                } else if let Some(arguments) =
-                                    item.get("arguments").and_then(Value::as_str)
-                                {
-                                    parse_partial_json(arguments)
-                                } else {
-                                    Value::Object(Map::new())
-                                };
-
-                            let mut tool_call_json = Value::Null;
-                            if let Some(AssistantContentBlock::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                                thought_signature,
-                            }) = output.content.get_mut(content_index)
-                            {
-                                *arguments = parsed_arguments.clone();
-                                tool_call_json = json!({
-                                    "type": "toolCall",
-                                    "id": id,
-                                    "name": name,
-                                    "arguments": parsed_arguments,
-                                    "thoughtSignature": thought_signature,
-                                });
-                            }
-                            stream.push(AssistantMessageEvent::ToolcallEnd {
-                                content_index,
-                                tool_call: tool_call_json,
-                                partial: output.clone(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                "response.completed" => {
-                    let Some(response_value) = event.get("response") else {
-                        continue;
-                    };
-                    if let Some(usage_value) = response_value.get("usage") {
-                        update_usage_from_openai_responses(&mut output.usage, usage_value);
-                    }
-                    let status = response_value
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("completed");
-                    output.stop_reason = map_responses_stop_reason(status);
-                    if output
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, AssistantContentBlock::ToolCall { .. }))
-                        && output.stop_reason == StopReason::Stop
-                    {
-                        output.stop_reason = StopReason::ToolUse;
-                    }
-                }
-                "error" => {
-                    let message = event
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            event
-                                .get("error")
-                                .and_then(Value::as_object)
-                                .and_then(|error| error.get("message"))
-                                .and_then(Value::as_str)
-                        })
-                        .unwrap_or("Unknown OpenAI responses error");
-                    return Err(PiAiError::new(
-                        PiAiErrorCode::ProviderProtocol,
-                        format!("OpenAI responses error: {message}"),
-                    ));
-                }
-                "response.failed" => {
-                    return Err(PiAiError::new(
-                        PiAiErrorCode::ProviderProtocol,
-                        "OpenAI responses failed",
-                    ));
-                }
-                _ => {}
-            }
-        }
+        let mut response = response;
+        process_sse_data_events(&mut response, |data| {
+            handle_openai_responses_event(
+                data,
+                &mut output,
+                &stream,
+                &mut text_block_indices,
+                &mut tool_block_indices,
+                &mut tool_arg_buffers,
+            )
+        })?;
 
         if output.content.is_empty() && output.stop_reason == StopReason::Stop {
             return Err(PiAiError::new(
@@ -422,6 +123,315 @@ pub fn stream_simple_openai_responses(
     stream_openai_responses(model, context, stream_options)
 }
 
+fn handle_openai_responses_event(
+    data: String,
+    output: &mut AssistantMessage,
+    stream: &AssistantMessageEventStream,
+    text_block_indices: &mut HashMap<String, usize>,
+    tool_block_indices: &mut HashMap<String, usize>,
+    tool_arg_buffers: &mut HashMap<String, String>,
+) -> Result<bool, PiAiError> {
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+
+    let event: Value = serde_json::from_str(&data).map_err(|error| {
+        PiAiError::new(
+            PiAiErrorCode::ProviderProtocol,
+            format!("Invalid OpenAI responses event JSON: {error}"),
+        )
+        .with_details(json!({ "event": data }))
+    })?;
+
+    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+
+    match event_type {
+        "response.output_item.added" => {
+            let Some(item) = event.get("item").and_then(Value::as_object) else {
+                return Ok(false);
+            };
+            let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            match item_type {
+                "message" => {
+                    let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                        return Ok(false);
+                    };
+                    let content_index = output.content.len();
+                    output.content.push(AssistantContentBlock::Text {
+                        text: String::new(),
+                        text_signature: None,
+                    });
+                    text_block_indices.insert(item_id.to_string(), content_index);
+                    stream.push(AssistantMessageEvent::TextStart {
+                        content_index,
+                        partial: output.clone(),
+                    });
+                }
+                "function_call" => {
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let tool_name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    if call_id.is_empty() || tool_name.is_empty() {
+                        return Ok(false);
+                    }
+                    let tool_key = tool_item_key(call_id, item_id);
+                    let content_index = output.content.len();
+                    output.content.push(AssistantContentBlock::ToolCall {
+                        id: tool_call_compound_id(call_id, item_id),
+                        name: tool_name.to_string(),
+                        arguments: Value::Object(Map::new()),
+                        thought_signature: None,
+                    });
+
+                    let initial_arguments = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    tool_arg_buffers.insert(tool_key.clone(), initial_arguments.clone());
+                    if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                        output.content.get_mut(content_index)
+                    {
+                        if !initial_arguments.is_empty() {
+                            *arguments = parse_partial_json(&initial_arguments);
+                        }
+                    }
+                    tool_block_indices.insert(tool_key, content_index);
+                    stream.push(AssistantMessageEvent::ToolcallStart {
+                        content_index,
+                        partial: output.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        "response.output_text.delta" | "response.refusal.delta" => {
+            let Some(item_id) = event.get("item_id").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            if delta.is_empty() {
+                return Ok(false);
+            }
+            let Some(content_index) = text_block_indices.get(item_id).copied() else {
+                return Ok(false);
+            };
+            if let Some(AssistantContentBlock::Text { text, .. }) =
+                output.content.get_mut(content_index)
+            {
+                text.push_str(delta);
+            }
+            stream.push(AssistantMessageEvent::TextDelta {
+                content_index,
+                delta: delta.to_string(),
+                partial: output.clone(),
+            });
+        }
+        "response.function_call_arguments.delta" => {
+            let Some(tool_key) = resolve_tool_key_for_arg_event(&event, tool_block_indices) else {
+                return Ok(false);
+            };
+            let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            let Some(content_index) = tool_block_indices.get(&tool_key).copied() else {
+                return Ok(false);
+            };
+            let buffer = tool_arg_buffers.entry(tool_key).or_default();
+            buffer.push_str(delta);
+            if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                output.content.get_mut(content_index)
+            {
+                *arguments = parse_partial_json(buffer);
+            }
+            stream.push(AssistantMessageEvent::ToolcallDelta {
+                content_index,
+                delta: delta.to_string(),
+                partial: output.clone(),
+            });
+        }
+        "response.function_call_arguments.done" => {
+            let Some(tool_key) = resolve_tool_key_for_arg_event(&event, tool_block_indices) else {
+                return Ok(false);
+            };
+            let Some(arguments) = event.get("arguments").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            if let Some(content_index) = tool_block_indices.get(&tool_key).copied() {
+                tool_arg_buffers.insert(tool_key, arguments.to_string());
+                if let Some(AssistantContentBlock::ToolCall {
+                    arguments: arg_json,
+                    ..
+                }) = output.content.get_mut(content_index)
+                {
+                    *arg_json = parse_partial_json(arguments);
+                }
+            }
+        }
+        "response.output_item.done" => {
+            let Some(item) = event.get("item").and_then(Value::as_object) else {
+                return Ok(false);
+            };
+            let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            match item_type {
+                "message" => {
+                    let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                        return Ok(false);
+                    };
+                    let Some(content_index) = text_block_indices.remove(item_id) else {
+                        return Ok(false);
+                    };
+                    if let Some(AssistantContentBlock::Text {
+                        text,
+                        text_signature,
+                    }) = output.content.get_mut(content_index)
+                    {
+                        if text.is_empty() {
+                            *text = item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|parts| {
+                                    parts
+                                        .iter()
+                                        .filter_map(|part| {
+                                            let part_type = part
+                                                .get("type")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default();
+                                            match part_type {
+                                                "output_text" => {
+                                                    part.get("text").and_then(Value::as_str)
+                                                }
+                                                "refusal" => {
+                                                    part.get("refusal").and_then(Value::as_str)
+                                                }
+                                                _ => None,
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                })
+                                .unwrap_or_default();
+                        }
+                        *text_signature =
+                            item.get("id").and_then(Value::as_str).map(str::to_string);
+                        let content = text.clone();
+                        stream.push(AssistantMessageEvent::TextEnd {
+                            content_index,
+                            content,
+                            partial: output.clone(),
+                        });
+                    }
+                }
+                "function_call" => {
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if call_id.is_empty() {
+                        return Ok(false);
+                    }
+                    let tool_key = tool_item_key(call_id, item_id);
+                    let Some(content_index) = tool_block_indices.remove(&tool_key) else {
+                        return Ok(false);
+                    };
+                    let parsed_arguments = if let Some(buffer) = tool_arg_buffers.remove(&tool_key)
+                    {
+                        parse_partial_json(&buffer)
+                    } else if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                        parse_partial_json(arguments)
+                    } else {
+                        Value::Object(Map::new())
+                    };
+
+                    let mut tool_call_json = Value::Null;
+                    if let Some(AssistantContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        thought_signature,
+                    }) = output.content.get_mut(content_index)
+                    {
+                        *arguments = parsed_arguments.clone();
+                        tool_call_json = json!({
+                            "type": "toolCall",
+                            "id": id,
+                            "name": name,
+                            "arguments": parsed_arguments,
+                            "thoughtSignature": thought_signature,
+                        });
+                    }
+                    stream.push(AssistantMessageEvent::ToolcallEnd {
+                        content_index,
+                        tool_call: tool_call_json,
+                        partial: output.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        "response.completed" => {
+            let Some(response_value) = event.get("response") else {
+                return Ok(false);
+            };
+            if let Some(usage_value) = response_value.get("usage") {
+                update_usage_from_openai_responses(&mut output.usage, usage_value);
+            }
+            let status = response_value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            output.stop_reason = map_responses_stop_reason(status);
+            if output
+                .content
+                .iter()
+                .any(|block| matches!(block, AssistantContentBlock::ToolCall { .. }))
+                && output.stop_reason == StopReason::Stop
+            {
+                output.stop_reason = StopReason::ToolUse;
+            }
+        }
+        "error" => {
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .get("error")
+                        .and_then(Value::as_object)
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("Unknown OpenAI responses error");
+            return Err(PiAiError::new(
+                PiAiErrorCode::ProviderProtocol,
+                format!("OpenAI responses error: {message}"),
+            ));
+        }
+        "response.failed" => {
+            return Err(PiAiError::new(
+                PiAiErrorCode::ProviderProtocol,
+                "OpenAI responses failed",
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
 fn build_openai_responses_payload(
     model: &Model,
     context: &Context,
@@ -450,22 +460,13 @@ fn build_openai_responses_payload(
         payload["tools"] = convert_responses_tools(tools);
     }
 
-    if let Ok(payload_json) = serde_json::to_string(&payload) {
-        info!(
-            target: "pixy_ai::providers::openai_responses",
-            provider = %model.provider,
-            model = %model.id,
-            payload = %payload_json,
-            "build_openai_responses_payload"
-        );
-    } else {
-        info!(
-            target: "pixy_ai::providers::openai_responses",
-            provider = %model.provider,
-            model = %model.id,
-            "build_openai_responses_payload"
-        );
-    }
+    info!(
+        target: "pixy_ai::providers::openai_responses",
+        provider = %model.provider,
+        model = %model.id,
+        payload = %payload,
+        "build_openai_responses_payload"
+    );
 
     payload
 }
@@ -705,19 +706,50 @@ fn resolve_api_key(provider: &str, options: Option<&StreamOptions>) -> Result<St
     ))
 }
 
-fn parse_sse_data_events(body: &str) -> Vec<String> {
-    let normalized = body.replace("\r\n", "\n");
-    normalized
-        .split("\n\n")
-        .filter_map(|event| {
-            let data = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() { None } else { Some(data) }
-        })
-        .collect()
+fn process_sse_data_events<R, F>(reader: &mut R, mut on_data: F) -> Result<(), PiAiError>
+where
+    R: Read,
+    F: FnMut(String) -> Result<bool, PiAiError>,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut data_lines: Vec<String> = Vec::new();
+
+    let mut emit_event = |lines: &mut Vec<String>| -> Result<bool, PiAiError> {
+        if lines.is_empty() {
+            return Ok(false);
+        }
+        let data = lines.join("\n");
+        lines.clear();
+        on_data(data)
+    };
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).map_err(|error| {
+            PiAiError::new(
+                PiAiErrorCode::ProviderTransport,
+                format!("OpenAI stream read failed: {error}"),
+            )
+        })?;
+
+        if bytes_read == 0 {
+            let _ = emit_event(&mut data_lines)?;
+            return Ok(());
+        }
+
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed.is_empty() {
+            if emit_event(&mut data_lines)? {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
 }
 
 fn map_responses_stop_reason(status: &str) -> StopReason {
@@ -813,4 +845,110 @@ fn now_millis() -> i64 {
 
 fn is_provider_http_404(error: &PiAiError) -> bool {
     error.code == PiAiErrorCode::ProviderHttp && error.message.contains("HTTP 404")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Read};
+
+    #[test]
+    fn process_sse_data_events_stops_reading_after_done_event() {
+        struct FailAfterDoneReader {
+            chunks: Vec<&'static [u8]>,
+            cursor: usize,
+        }
+
+        impl Read for FailAfterDoneReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.cursor >= self.chunks.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "reader should not be polled after [DONE]",
+                    ));
+                }
+
+                let chunk = self.chunks[self.cursor];
+                self.cursor += 1;
+                if chunk.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk larger than read buffer",
+                    ));
+                }
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut reader = FailAfterDoneReader {
+            chunks: vec![b"data: first\n\n", b"data: [DONE]\n\n"],
+            cursor: 0,
+        };
+        let mut events = Vec::new();
+
+        let result = process_sse_data_events(&mut reader, |data| {
+            let is_done = data == "[DONE]";
+            events.push(data);
+            Ok(is_done)
+        });
+
+        assert!(result.is_ok(), "unexpected parse error: {result:?}");
+        assert_eq!(events, vec!["first".to_string(), "[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn process_sse_data_events_handles_split_chunks() {
+        struct ChunkedReader {
+            chunks: Vec<&'static [u8]>,
+            cursor: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.cursor >= self.chunks.len() {
+                    return Ok(0);
+                }
+
+                let chunk = self.chunks[self.cursor];
+                self.cursor += 1;
+                if chunk.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk larger than read buffer",
+                    ));
+                }
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut reader = ChunkedReader {
+            chunks: vec![
+                b"data: {\"type\":\"response.completed\",\"response\":",
+                b"{\"status\":\"completed\"}}\n",
+                b"\n",
+                b"data: [DONE]\n",
+                b"\n",
+            ],
+            cursor: 0,
+        };
+        let mut events = Vec::new();
+
+        let result = process_sse_data_events(&mut reader, |data| {
+            let is_done = data == "[DONE]";
+            events.push(data);
+            Ok(is_done)
+        });
+
+        assert!(result.is_ok(), "unexpected parse error: {result:?}");
+        assert_eq!(
+            events,
+            vec![
+                "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}"
+                    .to_string(),
+                "[DONE]".to_string()
+            ]
+        );
+    }
 }

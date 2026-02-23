@@ -47,6 +47,12 @@ pub struct Model {
     #[serde(rename = "baseUrl")]
     pub base_url: String,
     pub reasoning: bool,
+    #[serde(
+        rename = "reasoningEffort",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub reasoning_effort: Option<ThinkingLevel>,
     pub input: Vec<String>,
     pub cost: Cost,
     #[serde(rename = "contextWindow")]

@@ -10,7 +10,8 @@ use pixy_ai::{
     ToolResultContentBlock,
 };
 use pixy_coding_agent::{
-    AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, SessionManager, create_coding_tools,
+    AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, LoadSkillsOptions, SessionManager,
+    Skill, create_coding_tools, load_skills,
 };
 use pixy_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
@@ -57,6 +58,10 @@ struct ChatArgs {
     continue_first: bool,
     #[arg(long, default_value_t = false)]
     no_tools: bool,
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    no_skills: bool,
     #[arg(long, default_value_t = false)]
     hide_tool_results: bool,
     #[arg(long, default_value_t = false)]
@@ -119,13 +124,14 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         .unwrap_or_else(default_agent_dir);
     let local_config = load_agent_local_config(&agent_dir)?;
     let runtime = resolve_runtime_config(&args, &local_config)?;
+    let discovered_skills = load_runtime_skills(&args, &local_config, &cwd, &agent_dir);
 
     let session_dir = args
         .session_dir
         .as_ref()
         .map(|path| resolve_path(&cwd, path))
         .unwrap_or_else(|| default_agent_dir().join("sessions"));
-    let mut session = create_session(&args, &runtime, &cwd, &session_dir)?;
+    let mut session = create_session(&args, &runtime, &cwd, &session_dir, &discovered_skills)?;
     let use_tui = args.prompt.is_none() && !args.no_tui;
 
     if !use_tui {
@@ -235,6 +241,7 @@ fn create_session(
     runtime: &ResolvedRuntimeConfig,
     cwd: &Path,
     session_dir: &Path,
+    skills: &[Skill],
 ) -> Result<AgentSession, String> {
     let session_manager = if let Some(session_file) = &args.session_file {
         let resolved = resolve_path(cwd, session_file);
@@ -265,13 +272,35 @@ fn create_session(
 
     let config = AgentSessionConfig {
         model: runtime.model.clone(),
-        system_prompt: build_system_prompt(args.system_prompt.as_deref(), cwd, &tools),
+        system_prompt: build_system_prompt(args.system_prompt.as_deref(), cwd, &tools, skills),
         stream_fn,
         tools,
     };
     let mut session = AgentSession::new(session_manager, config);
     session.set_model_catalog(runtime.model_catalog.clone());
     Ok(session)
+}
+
+fn load_runtime_skills(
+    args: &ChatArgs,
+    local: &AgentLocalConfig,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Vec<Skill> {
+    let mut options = LoadSkillsOptions::new(cwd.to_path_buf(), agent_dir.to_path_buf());
+    options.include_defaults = !args.no_skills;
+    options.skill_paths = local.settings.skills.clone();
+    options.skill_paths.extend(args.skills.clone());
+
+    let result = load_skills(options);
+    for diagnostic in &result.diagnostics {
+        eprintln!(
+            "warning: skill {}: {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        );
+    }
+    result.skills
 }
 
 async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Result<(), String> {
@@ -671,6 +700,8 @@ struct AgentSettingsFile {
     default_model: Option<String>,
     theme: Option<String>,
     #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
     env: HashMap<String, String>,
 }
 
@@ -697,6 +728,10 @@ struct ProviderModelConfig {
     api: Option<String>,
     #[serde(rename = "baseUrl")]
     base_url: Option<String>,
+    #[serde(rename = "reasoning", default)]
+    reasoning: Option<bool>,
+    #[serde(rename = "reasoningEffort", default)]
+    reasoning_effort: Option<pixy_ai::ThinkingLevel>,
     #[serde(rename = "contextWindow")]
     context_window: Option<u32>,
     #[serde(rename = "maxTokens")]
@@ -813,7 +848,10 @@ fn resolve_runtime_config(
         api,
         provider,
         base_url,
-        reasoning: false,
+        reasoning: selected_model_cfg
+            .and_then(|cfg| cfg.reasoning)
+            .unwrap_or(false),
+        reasoning_effort: selected_model_cfg.and_then(|cfg| cfg.reasoning_effort.clone()),
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,
@@ -893,7 +931,8 @@ fn model_from_config(
         api,
         provider: provider.to_string(),
         base_url,
-        reasoning: false,
+        reasoning: config.reasoning.unwrap_or(false),
+        reasoning_effort: config.reasoning_effort.clone(),
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,
@@ -1052,8 +1091,34 @@ fn resolve_config_value(value: &str, env_map: &HashMap<String, String>) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use tempfile::tempdir;
+
+    fn test_chat_args() -> ChatArgs {
+        ChatArgs {
+            api: None,
+            provider: None,
+            model: None,
+            base_url: None,
+            context_window: None,
+            max_tokens: None,
+            agent_dir: None,
+            cwd: None,
+            session_dir: None,
+            session_file: None,
+            system_prompt: Some("test".to_string()),
+            prompt: None,
+            continue_first: false,
+            no_tools: false,
+            skills: vec![],
+            no_skills: false,
+            hide_tool_results: false,
+            no_tui: false,
+            theme: None,
+        }
+    }
 
     #[test]
     fn resolves_default_provider_model_from_settings_and_models() {
@@ -1072,6 +1137,8 @@ mod tests {
             prompt: None,
             continue_first: false,
             no_tools: false,
+            skills: vec![],
+            no_skills: false,
             hide_tool_results: false,
             no_tui: false,
             theme: None,
@@ -1082,6 +1149,7 @@ mod tests {
                 default_provider: Some("anthropic".to_string()),
                 default_model: Some("claude-opus-4-6".to_string()),
                 theme: None,
+                skills: vec![],
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                     "token-from-settings".to_string(),
@@ -1126,6 +1194,8 @@ mod tests {
             prompt: None,
             continue_first: false,
             no_tools: false,
+            skills: vec![],
+            no_skills: false,
             hide_tool_results: false,
             no_tui: false,
             theme: None,
@@ -1136,6 +1206,7 @@ mod tests {
                 default_provider: Some("anthropic".to_string()),
                 default_model: Some("claude-opus-4-6".to_string()),
                 theme: None,
+                skills: vec![],
                 env: HashMap::new(),
             },
             models: ModelsFile::default(),
@@ -1165,6 +1236,8 @@ mod tests {
             prompt: None,
             continue_first: false,
             no_tools: false,
+            skills: vec![],
+            no_skills: false,
             hide_tool_results: false,
             no_tui: false,
             theme: None,
@@ -1175,6 +1248,7 @@ mod tests {
                 default_provider: None,
                 default_model: None,
                 theme: None,
+                skills: vec![],
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                     "anthropic-token".to_string(),
@@ -1205,6 +1279,8 @@ mod tests {
             prompt: None,
             continue_first: false,
             no_tools: false,
+            skills: vec![],
+            no_skills: false,
             hide_tool_results: false,
             no_tui: false,
             theme: None,
@@ -1224,6 +1300,8 @@ mod tests {
                                 id: "gpt-4.1".to_string(),
                                 api: None,
                                 base_url: None,
+                                reasoning: None,
+                                reasoning_effort: None,
                                 context_window: None,
                                 max_tokens: None,
                             },
@@ -1231,6 +1309,8 @@ mod tests {
                                 id: "gpt-4.1-mini".to_string(),
                                 api: None,
                                 base_url: None,
+                                reasoning: None,
+                                reasoning_effort: None,
                                 context_window: None,
                                 max_tokens: None,
                             },
@@ -1420,6 +1500,8 @@ mod tests {
             prompt: None,
             continue_first: false,
             no_tools: false,
+            skills: vec![],
+            no_skills: false,
             hide_tool_results: false,
             no_tui: false,
             theme: None,
@@ -1443,6 +1525,115 @@ mod tests {
         assert_eq!(
             default_agent_dir(),
             PathBuf::from("/tmp/pixy-home/.pixy/agent")
+        );
+    }
+
+    #[test]
+    fn load_runtime_skills_merges_settings_and_cli_paths() {
+        let dir = tempdir().expect("temp dir");
+        let settings_skill = dir.path().join("settings-skill");
+        let cli_skill = dir.path().join("cli-skill");
+        std::fs::create_dir_all(&settings_skill).expect("create settings skill dir");
+        std::fs::create_dir_all(&cli_skill).expect("create cli skill dir");
+        std::fs::write(
+            settings_skill.join("SKILL.md"),
+            r#"---
+name: settings-skill
+description: from settings
+---
+"#,
+        )
+        .expect("write settings skill");
+        std::fs::write(
+            cli_skill.join("SKILL.md"),
+            r#"---
+name: cli-skill
+description: from cli
+---
+"#,
+        )
+        .expect("write cli skill");
+
+        let mut args = test_chat_args();
+        args.no_skills = true;
+        args.skills = vec!["cli-skill".to_string()];
+
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                skills: vec!["settings-skill".to_string()],
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile::default(),
+        };
+        let skills =
+            load_runtime_skills(&args, &local, dir.path(), &dir.path().join(".pixy/agent"));
+        let names = skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("settings-skill"));
+        assert!(names.contains("cli-skill"));
+    }
+
+    #[test]
+    fn load_runtime_skills_honors_no_skills_for_default_discovery() {
+        let dir = tempdir().expect("temp dir");
+        let agent_dir = dir.path().join(".pixy/agent");
+        let default_skill = agent_dir.join("skills").join("default-skill");
+        std::fs::create_dir_all(&default_skill).expect("create default skill dir");
+        std::fs::write(
+            default_skill.join("SKILL.md"),
+            r#"---
+name: default-skill
+description: default discovered skill
+---
+"#,
+        )
+        .expect("write default skill");
+
+        let mut args = test_chat_args();
+        args.no_skills = true;
+
+        let local = AgentLocalConfig::default();
+        let skills = load_runtime_skills(&args, &local, dir.path(), &agent_dir);
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_config_reads_reasoning_and_effort_from_model_config() {
+        let mut args = test_chat_args();
+        args.provider = Some("openai".to_string());
+        args.model = Some("gpt-4.1".to_string());
+
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile::default(),
+            models: ModelsFile {
+                providers: HashMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        api: Some("openai-completions".to_string()),
+                        base_url: Some("https://api.openai.com/v1".to_string()),
+                        api_key: None,
+                        models: vec![ProviderModelConfig {
+                            id: "gpt-4.1".to_string(),
+                            api: None,
+                            base_url: None,
+                            reasoning: Some(true),
+                            reasoning_effort: Some(pixy_ai::ThinkingLevel::High),
+                            context_window: None,
+                            max_tokens: None,
+                        }],
+                    },
+                )]),
+            },
+        };
+
+        let resolved =
+            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+        assert!(resolved.model.reasoning);
+        assert_eq!(
+            resolved.model.reasoning_effort,
+            Some(pixy_ai::ThinkingLevel::High)
         );
     }
 }

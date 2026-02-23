@@ -43,6 +43,7 @@ fn sample_model(api: &str, provider: &str, base_url: String) -> Model {
         provider: provider.to_string(),
         base_url,
         reasoning: true,
+        reasoning_effort: None,
         input: vec!["text".to_string(), "image".to_string()],
         cost: Cost {
             input: 0.0,

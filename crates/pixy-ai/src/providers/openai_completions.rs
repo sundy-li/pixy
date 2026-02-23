@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::env;
+use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
+use tracing::info;
 
 use crate::api_registry::{ApiProvider, StreamResult};
 use crate::error::{PiAiError, PiAiErrorCode};
@@ -58,6 +60,8 @@ pub fn stream_openai_completions(
     let endpoint = join_url(&model.base_url, "chat/completions");
     let client = Client::new();
 
+    info!("OpenAI completions payload: {}", payload);
+
     let execution = (|| -> Result<(), PiAiError> {
         let response = client
             .post(endpoint)
@@ -83,13 +87,6 @@ pub fn stream_openai_completions(
             ));
         }
 
-        let body = response.text().map_err(|error| {
-            PiAiError::new(
-                PiAiErrorCode::ProviderTransport,
-                format!("OpenAI stream read failed: {error}"),
-            )
-        })?;
-
         stream.push(AssistantMessageEvent::Start {
             partial: output.clone(),
         });
@@ -97,10 +94,11 @@ pub fn stream_openai_completions(
         let mut text_block_index: Option<usize> = None;
         let mut tool_arg_buffers: HashMap<usize, String> = HashMap::new();
         let mut tool_block_indices: HashMap<usize, usize> = HashMap::new();
-
-        for data in parse_sse_data_events(&body) {
+        let mut response = response;
+        process_sse_data_events(&mut response, |data| {
+            info!("OpenAI completions data: {}", data);
             if data == "[DONE]" {
-                break;
+                return Ok(true);
             }
 
             let chunk: Value = serde_json::from_str(&data).map_err(|error| {
@@ -137,35 +135,34 @@ pub fn stream_openai_completions(
                 .and_then(|delta| delta.get("content"))
                 .and_then(Value::as_str)
             {
-                if content_delta.is_empty() {
-                    continue;
-                }
+                if !content_delta.is_empty() {
+                    let idx = if let Some(idx) = text_block_index {
+                        idx
+                    } else {
+                        let new_index = output.content.len();
+                        output.content.push(AssistantContentBlock::Text {
+                            text: String::new(),
+                            text_signature: None,
+                        });
+                        stream.push(AssistantMessageEvent::TextStart {
+                            content_index: new_index,
+                            partial: output.clone(),
+                        });
+                        text_block_index = Some(new_index);
+                        new_index
+                    };
 
-                let idx = if let Some(idx) = text_block_index {
-                    idx
-                } else {
-                    let new_index = output.content.len();
-                    output.content.push(AssistantContentBlock::Text {
-                        text: String::new(),
-                        text_signature: None,
-                    });
-                    stream.push(AssistantMessageEvent::TextStart {
-                        content_index: new_index,
+                    if let Some(AssistantContentBlock::Text { text, .. }) =
+                        output.content.get_mut(idx)
+                    {
+                        text.push_str(content_delta);
+                    }
+                    stream.push(AssistantMessageEvent::TextDelta {
+                        content_index: idx,
+                        delta: content_delta.to_string(),
                         partial: output.clone(),
                     });
-                    text_block_index = Some(new_index);
-                    new_index
-                };
-
-                if let Some(AssistantContentBlock::Text { text, .. }) = output.content.get_mut(idx)
-                {
-                    text.push_str(content_delta);
                 }
-                stream.push(AssistantMessageEvent::TextDelta {
-                    content_index: idx,
-                    delta: content_delta.to_string(),
-                    partial: output.clone(),
-                });
             }
 
             if let Some(tool_calls) = choice
@@ -251,7 +248,9 @@ pub fn stream_openai_completions(
                     }
                 }
             }
-        }
+
+            Ok(false)
+        })?;
 
         if let Some(text_idx) = text_block_index.take() {
             let text = extract_text_block(&output.content, text_idx);
@@ -328,25 +327,10 @@ pub fn stream_simple_openai_completions(
     context: Context,
     options: Option<SimpleStreamOptions>,
 ) -> StreamResult<AssistantMessageEventStream> {
-    let merged = options.map(|simple| {
-        let mut stream = simple.stream;
-        if simple.reasoning.is_some() && model.reasoning {
-            let effort = match simple.reasoning {
-                Some(crate::types::ThinkingLevel::Minimal) => "minimal",
-                Some(crate::types::ThinkingLevel::Low) => "low",
-                Some(crate::types::ThinkingLevel::Medium) => "medium",
-                Some(crate::types::ThinkingLevel::High) => "high",
-                Some(crate::types::ThinkingLevel::Xhigh) => "xhigh",
-                None => "medium",
-            };
-            let mut headers = stream.headers.unwrap_or_default();
-            headers.insert("x-pi-reasoning-effort".to_string(), effort.to_string());
-            stream.headers = Some(headers);
-        }
-        stream
-    });
-
-    stream_openai_completions(model, context, merged)
+    let mut model = model;
+    apply_simple_reasoning_to_model(&mut model, options.as_ref());
+    let stream_options = options.map(|simple| simple.stream);
+    stream_openai_completions(model, context, stream_options)
 }
 
 fn build_openai_payload(
@@ -369,8 +353,37 @@ fn build_openai_payload(
     if let Some(tools) = &context.tools {
         payload["tools"] = convert_tools(tools);
     }
+    if model.reasoning {
+        if let Some(effort) = model.reasoning_effort.as_ref() {
+            payload["reasoning_effort"] = json!(thinking_level_to_effort(model, effort));
+        }
+    }
 
     payload
+}
+
+fn apply_simple_reasoning_to_model(model: &mut Model, options: Option<&SimpleStreamOptions>) {
+    if !model.reasoning {
+        return;
+    }
+    if let Some(reasoning) = options.and_then(|simple| simple.reasoning.clone()) {
+        model.reasoning_effort = Some(reasoning);
+    }
+}
+
+fn thinking_level_to_effort(model: &Model, level: &crate::types::ThinkingLevel) -> &'static str {
+    let is_openai = model.name.to_lowercase().contains("openai");
+    if !is_openai && level == &crate::types::ThinkingLevel::Xhigh {
+        return "high";
+    }
+
+    match level {
+        crate::types::ThinkingLevel::Minimal => "minimal",
+        crate::types::ThinkingLevel::Low => "low",
+        crate::types::ThinkingLevel::Medium => "medium",
+        crate::types::ThinkingLevel::High => "high",
+        crate::types::ThinkingLevel::Xhigh => "xhigh",
+    }
 }
 
 fn convert_messages(context: &Context) -> Vec<Value> {
@@ -524,19 +537,50 @@ fn resolve_api_key(provider: &str, options: Option<&StreamOptions>) -> Result<St
     ))
 }
 
-fn parse_sse_data_events(body: &str) -> Vec<String> {
-    let normalized = body.replace("\r\n", "\n");
-    normalized
-        .split("\n\n")
-        .filter_map(|event| {
-            let data = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() { None } else { Some(data) }
-        })
-        .collect()
+fn process_sse_data_events<R, F>(reader: &mut R, mut on_data: F) -> Result<(), PiAiError>
+where
+    R: Read,
+    F: FnMut(String) -> Result<bool, PiAiError>,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut data_lines: Vec<String> = Vec::new();
+
+    let mut emit_event = |lines: &mut Vec<String>| -> Result<bool, PiAiError> {
+        if lines.is_empty() {
+            return Ok(false);
+        }
+        let data = lines.join("\n");
+        lines.clear();
+        on_data(data)
+    };
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).map_err(|error| {
+            PiAiError::new(
+                PiAiErrorCode::ProviderTransport,
+                format!("OpenAI stream read failed: {error}"),
+            )
+        })?;
+
+        if bytes_read == 0 {
+            let _ = emit_event(&mut data_lines)?;
+            return Ok(());
+        }
+
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed.is_empty() {
+            if emit_event(&mut data_lines)? {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
 }
 
 fn map_openai_stop_reason(reason: &str) -> StopReason {
@@ -635,4 +679,164 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ThinkingLevel;
+    use std::io::{self, Read};
+
+    fn sample_model() -> Model {
+        Model {
+            id: "gpt-o".to_string(),
+            name: "gpt-o".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning: true,
+            reasoning_effort: Some(ThinkingLevel::High),
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+        }
+    }
+
+    fn sample_context() -> Context {
+        Context {
+            system_prompt: Some("You are helpful.".to_string()),
+            messages: vec![Message::User {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: 0,
+            }],
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn openai_payload_includes_reasoning_effort_when_model_config_sets_it() {
+        let model = sample_model();
+        let context = sample_context();
+
+        let payload = build_openai_payload(&model, &context, None);
+        assert_eq!(payload["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn simple_options_reasoning_overrides_model_reasoning_effort() {
+        let mut model = sample_model();
+        let options = SimpleStreamOptions {
+            stream: StreamOptions::default(),
+            reasoning: Some(ThinkingLevel::Low),
+        };
+
+        apply_simple_reasoning_to_model(&mut model, Some(&options));
+        assert_eq!(model.reasoning_effort, Some(ThinkingLevel::Low));
+    }
+
+    #[test]
+    fn process_sse_data_events_stops_reading_after_done_event() {
+        struct FailAfterDoneReader {
+            chunks: Vec<&'static [u8]>,
+            cursor: usize,
+        }
+
+        impl Read for FailAfterDoneReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.cursor >= self.chunks.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "reader should not be polled after [DONE]",
+                    ));
+                }
+
+                let chunk = self.chunks[self.cursor];
+                self.cursor += 1;
+                if chunk.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk larger than read buffer",
+                    ));
+                }
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut reader = FailAfterDoneReader {
+            chunks: vec![b"data: first\n\n", b"data: [DONE]\n\n"],
+            cursor: 0,
+        };
+        let mut events = Vec::new();
+
+        let result = process_sse_data_events(&mut reader, |data| {
+            let is_done = data == "[DONE]";
+            events.push(data);
+            Ok(is_done)
+        });
+
+        assert!(result.is_ok(), "unexpected parse error: {result:?}");
+        assert_eq!(events, vec!["first".to_string(), "[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn process_sse_data_events_handles_split_chunks() {
+        struct ChunkedReader {
+            chunks: Vec<&'static [u8]>,
+            cursor: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.cursor >= self.chunks.len() {
+                    return Ok(0);
+                }
+
+                let chunk = self.chunks[self.cursor];
+                self.cursor += 1;
+                if chunk.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk larger than read buffer",
+                    ));
+                }
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut reader = ChunkedReader {
+            chunks: vec![
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel",
+                b"lo\"}}]}\n",
+                b"\n",
+                b"data: [DONE]\n",
+                b"\n",
+            ],
+            cursor: 0,
+        };
+
+        let mut events = Vec::new();
+        let result = process_sse_data_events(&mut reader, |data| {
+            let is_done = data == "[DONE]";
+            events.push(data);
+            Ok(is_done)
+        });
+
+        assert!(result.is_ok(), "unexpected parse error: {result:?}");
+        assert_eq!(
+            events,
+            vec![
+                "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}".to_string(),
+                "[DONE]".to_string()
+            ]
+        );
+    }
 }

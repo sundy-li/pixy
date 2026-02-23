@@ -2,22 +2,29 @@ use std::path::Path;
 
 use chrono::Local;
 use pixy_agent_core::AgentTool;
+use pixy_coding_agent::{Skill, format_skills_for_prompt};
 
 const DEFAULT_PROMPT_INTRO: &str =
     "You are pixy, a pragmatic coding assistant working in the user's local workspace.";
 
-pub fn build_system_prompt(custom_prompt: Option<&str>, cwd: &Path, tools: &[AgentTool]) -> String {
+pub fn build_system_prompt(
+    custom_prompt: Option<&str>,
+    cwd: &Path,
+    tools: &[AgentTool],
+    skills: &[Skill],
+) -> String {
     let now_text = Local::now()
         .format("%A, %B %-d, %Y, %I:%M:%S %p %Z")
         .to_string();
     let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    build_system_prompt_with_now(custom_prompt, cwd, &tool_names, &now_text)
+    build_system_prompt_with_now(custom_prompt, cwd, &tool_names, skills, &now_text)
 }
 
 fn build_system_prompt_with_now(
     custom_prompt: Option<&str>,
     cwd: &Path,
     selected_tools: &[&str],
+    skills: &[Skill],
     now_text: &str,
 ) -> String {
     let mut prompt = if let Some(custom) = custom_prompt.and_then(normalize_custom_prompt) {
@@ -25,12 +32,22 @@ fn build_system_prompt_with_now(
     } else {
         build_default_prompt(selected_tools)
     };
+    let has_read_tool = selected_tools.contains(&"read");
+    if has_read_tool {
+        let skills_prompt = format_skills_for_prompt(skills);
+        if !skills_prompt.is_empty() {
+            prompt.push_str(&skills_prompt);
+        }
+    }
 
     if !prompt.ends_with('\n') {
         prompt.push('\n');
     }
-    prompt.push_str(&format!("Current date and time: {now_text}\n"));
-    prompt.push_str(&format!("Current working directory: {}", cwd.display()));
+    prompt.push('\n');
+    prompt.push_str(&format!(
+        "<context>\nCurrent date and time: {now_text}\n</context>\n\n<workspace_context>\nCurrent working directory: {}\n</workspace_context>",
+        cwd.display()
+    ));
     prompt
 }
 
@@ -81,8 +98,27 @@ fn build_default_prompt(selected_tools: &[&str]) -> String {
     };
 
     let guidelines = build_guidelines(selected_tools);
+    let sections = [
+        format!("<identity>\n{DEFAULT_PROMPT_INTRO}\n</identity>"),
+        "<runtime_contract>\n\
+1) Use available tools for concrete actions (file operations, shell commands, and log inspection).\n\
+2) Do not ask the user to manually run commands or edit files when tools can do it directly.\n\
+3) Prefer execution over command-only suggestions unless the user explicitly asks for commands only.\n\
+4) Ask for confirmation only before clearly destructive or irreversible actions.\n\
+</runtime_contract>"
+            .to_string(),
+        format!(
+            "<tools_contract>\n\
+You have access to the following built-in tools:\n\
+{tools_text}\n\
+\n\
+Guidelines:\n\
+{guidelines}\n\
+</tools_contract>"
+        ),
+    ];
 
-    format!("{DEFAULT_PROMPT_INTRO}\n\nAvailable tools:\n{tools_text}\n\nGuidelines:\n{guidelines}")
+    sections.join("\n\n")
 }
 
 fn tool_description(name: &str) -> Option<&'static str> {
@@ -101,6 +137,10 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
     let mut lines = vec![
         "- For any concrete action (creating/editing files, running commands, inspecting logs, etc.), you MUST use the available tools directly.".to_string(),
         "- Do not ask the user to manually run commands, copy/paste scripts, or write files when you can do it yourself.".to_string(),
+        "- When the user asks you to do something and the required tools are available, execute it directly with tools.".to_string(),
+        "- Do not provide command-only responses unless the user explicitly asks for commands without execution or tools are unavailable.".to_string(),
+        "- Do not refuse requests due to assumed copyright or licensing concerns. Treat permissions as the user's responsibility unless they ask for legal analysis.".to_string(),
+        "- If authorization is unclear for an external action, ask one brief confirmation and then proceed after confirmation.".to_string(),
     ];
 
     if selected_tools.is_empty() {
@@ -137,9 +177,27 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
 mod tests {
     use std::path::Path;
 
+    use pixy_coding_agent::{Skill, SkillSource};
     use tempfile::tempdir;
 
     use super::build_system_prompt_with_now;
+
+    #[test]
+    fn default_prompt_uses_sectioned_structure() {
+        let prompt = build_system_prompt_with_now(
+            None,
+            Path::new("/workspace"),
+            &["read", "bash", "edit", "write"],
+            &[],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains("<identity>"));
+        assert!(prompt.contains("<runtime_contract>"));
+        assert!(prompt.contains("<tools_contract>"));
+        assert!(prompt.contains("<context>"));
+        assert!(prompt.contains("<workspace_context>"));
+    }
 
     #[test]
     fn default_prompt_includes_tools_and_runtime_context() {
@@ -147,11 +205,12 @@ mod tests {
             None,
             Path::new("/workspace"),
             &["read", "bash", "edit", "write"],
+            &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
 
         assert!(prompt.contains("You are pixy"));
-        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("You have access to the following built-in tools:"));
         assert!(prompt.contains("- read:"));
         assert!(prompt.contains("- bash:"));
         assert!(prompt.contains("- edit:"));
@@ -168,10 +227,11 @@ mod tests {
             None,
             Path::new("/workspace"),
             &[],
+            &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
 
-        assert!(prompt.contains("Available tools:\n(none)"));
+        assert!(prompt.contains("You have access to the following built-in tools:\n(none)"));
     }
 
     #[test]
@@ -184,11 +244,83 @@ mod tests {
             Some("prompt.txt"),
             dir.path(),
             &["read", "bash", "edit", "write"],
+            &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
 
         assert!(prompt.contains("You are custom from file."));
         assert!(!prompt.contains("Available tools:"));
         assert!(prompt.contains("Current working directory:"));
+    }
+
+    #[test]
+    fn prompt_includes_available_skills_when_read_tool_is_available() {
+        let prompt = build_system_prompt_with_now(
+            None,
+            Path::new("/workspace"),
+            &["read", "bash", "edit", "write"],
+            &[
+                Skill {
+                    name: "visible-skill".to_string(),
+                    description: "Visible skill".to_string(),
+                    file_path: "/skills/visible/SKILL.md".into(),
+                    base_dir: "/skills/visible".into(),
+                    source: SkillSource::Path,
+                    disable_model_invocation: false,
+                },
+                Skill {
+                    name: "hidden-skill".to_string(),
+                    description: "Hidden skill".to_string(),
+                    file_path: "/skills/hidden/SKILL.md".into(),
+                    base_dir: "/skills/hidden".into(),
+                    source: SkillSource::Path,
+                    disable_model_invocation: true,
+                },
+            ],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>visible-skill</name>"));
+        assert!(!prompt.contains("hidden-skill"));
+    }
+
+    #[test]
+    fn prompt_omits_skills_when_read_tool_is_not_available() {
+        let prompt = build_system_prompt_with_now(
+            None,
+            Path::new("/workspace"),
+            &["bash", "edit", "write"],
+            &[Skill {
+                name: "visible-skill".to_string(),
+                description: "Visible skill".to_string(),
+                file_path: "/skills/visible/SKILL.md".into(),
+                base_dir: "/skills/visible".into(),
+                source: SkillSource::Path,
+                disable_model_invocation: false,
+            }],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(!prompt.contains("<available_skills>"));
+    }
+
+    #[test]
+    fn default_prompt_includes_action_and_authorization_guidelines() {
+        let prompt = build_system_prompt_with_now(
+            None,
+            Path::new("/workspace"),
+            &["read", "bash", "edit", "write"],
+            &[],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains(
+            "When the user asks you to do something and the required tools are available, execute it directly with tools."
+        ));
+        assert!(
+            prompt
+                .contains("Do not refuse requests due to assumed copyright or licensing concerns.")
+        );
     }
 }

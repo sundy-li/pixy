@@ -86,8 +86,12 @@ impl TranscriptLine {
             let working_base = working_base_style(theme);
             let working_highlight = working_highlight_style(theme);
             if let Some(marquee) = &self.working_marquee {
-                let spans =
-                    working_marquee_spans(self.text.as_str(), marquee, working_base, working_highlight);
+                let spans = working_marquee_spans(
+                    self.text.as_str(),
+                    marquee,
+                    working_base,
+                    working_highlight,
+                );
                 return line_with_padding(spans, width, working_base);
             }
             return line_with_padding(
@@ -154,7 +158,9 @@ fn is_marquee_highlighted(idx: usize, marquee: &WorkingMarquee) -> bool {
     if marquee.message_char_len == 0 || marquee.highlight_len == 0 {
         return false;
     }
-    if idx < marquee.message_char_start || idx >= marquee.message_char_start + marquee.message_char_len {
+    if idx < marquee.message_char_start
+        || idx >= marquee.message_char_start + marquee.message_char_len
+    {
         return false;
     }
 

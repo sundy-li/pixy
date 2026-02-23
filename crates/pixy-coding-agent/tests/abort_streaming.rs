@@ -7,7 +7,9 @@ use pixy_ai::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
     Context, Cost, DoneReason, Message, Model, StopReason, Usage,
 };
-use pixy_coding_agent::{AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, SessionManager};
+use pixy_coding_agent::{
+    AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, SessionManager,
+};
 use tempfile::tempdir;
 
 fn sample_usage() -> Usage {
@@ -35,6 +37,7 @@ fn sample_model() -> Model {
         provider: "test".to_string(),
         base_url: "http://localhost".to_string(),
         reasoning: false,
+        reasoning_effort: None,
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,

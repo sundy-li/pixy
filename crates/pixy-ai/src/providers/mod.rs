@@ -12,7 +12,7 @@ mod openai_compat;
 mod openai_completions;
 mod openai_responses;
 
-const BUILTIN_SOURCE_ID: &str = "pi-ai-builtins";
+const BUILTIN_SOURCE_ID: &str = "pixy-ai-builtins";
 
 fn register_builtin_provider(provider: ApiProviderRef) {
     register_api_provider(provider, Some(BUILTIN_SOURCE_ID.to_string()));

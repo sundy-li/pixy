@@ -42,6 +42,9 @@ use transcript::{
     visible_transcript_lines, wrap_text_by_display_width,
 };
 
+const FORCE_EXIT_SIGNAL: &str = "__FORCE_EXIT__";
+const FORCE_EXIT_STATUS: &str = "force exiting...";
+
 #[derive(Clone, Debug)]
 struct InputHistoryStore {
     path: PathBuf,
@@ -738,10 +741,6 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
         needs_redraw = true;
 
         if matches_keybinding(&options.keybindings.quit, key) {
-            if !app.input.trim().is_empty() {
-                app.status = "input not empty; clear first".to_string();
-                continue;
-            }
             return Ok(());
         }
         if matches_keybinding(&options.keybindings.interrupt, key) {
@@ -839,10 +838,34 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
         }
         if matches_keybinding(&options.keybindings.continue_run, key) {
             if app.input.trim().is_empty() {
-                handle_continue_streaming(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await?;
-                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await?;
+                if let Err(error) = handle_continue_streaming(
+                    backend,
+                    &mut terminal,
+                    &mut app,
+                    &options,
+                    &mut events,
+                )
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                if let Err(error) = process_queued_follow_ups(
+                    backend,
+                    &mut terminal,
+                    &mut app,
+                    &options,
+                    &mut events,
+                )
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             } else {
                 let submitted = app.take_input_trimmed();
                 app.record_input_history(&submitted);
@@ -851,7 +874,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     submitted.as_str(),
                     options.theme.input_prompt(),
                 ));
-                run_prompt_streaming(
+                if let Err(error) = run_prompt_streaming(
                     backend,
                     &mut terminal,
                     &mut app,
@@ -859,9 +882,27 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     &submitted,
                     &mut events,
                 )
-                .await?;
-                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await?;
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                if let Err(error) = process_queued_follow_ups(
+                    backend,
+                    &mut terminal,
+                    &mut app,
+                    &options,
+                    &mut events,
+                )
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
             continue;
         }
@@ -877,10 +918,34 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             app.record_input_history(&submitted);
             app.scroll_transcript_to_latest();
             if submitted == "/continue" {
-                handle_continue_streaming(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await?;
-                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await?;
+                if let Err(error) = handle_continue_streaming(
+                    backend,
+                    &mut terminal,
+                    &mut app,
+                    &options,
+                    &mut events,
+                )
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                if let Err(error) = process_queued_follow_ups(
+                    backend,
+                    &mut terminal,
+                    &mut app,
+                    &options,
+                    &mut events,
+                )
+                .await
+                {
+                    if is_force_exit_signal(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 continue;
             }
             match handle_slash_command(&submitted, backend, &mut app).await {
@@ -893,7 +958,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                 submitted.as_str(),
                 options.theme.input_prompt(),
             ));
-            run_prompt_streaming(
+            if let Err(error) = run_prompt_streaming(
                 backend,
                 &mut terminal,
                 &mut app,
@@ -901,9 +966,22 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                 &submitted,
                 &mut events,
             )
-            .await?;
-            process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
-                .await?;
+            .await
+            {
+                if is_force_exit_signal(&error) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if let Err(error) =
+                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
+                    .await
+            {
+                if is_force_exit_signal(&error) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
             continue;
         }
         if handle_input_history_key_event(&mut app, key) {
@@ -1087,7 +1165,7 @@ fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
         format!(" {} to interrupt", interrupt_label),
         format!(" {} to clear", clear_label),
         format!(" {} twice to exit", clear_label),
-        format!(" {} to exit (empty)", quit_label),
+        format!(" {} to force exit", quit_label),
         format!(" {} to cycle thinking level", cycle_thinking_label),
         format!(" {}/{} to cycle models", cycle_model_fwd, cycle_model_bwd),
         format!(" {} to select model", select_model_label),
@@ -1252,12 +1330,16 @@ async fn run_prompt_streaming<B: TuiBackend>(
                     let event = event_result.map_err(|error| format!("read terminal event failed: {error}"))?;
                     let outcome = handle_streaming_event(
                         event,
+                        &options.keybindings.quit,
                         &options.keybindings.interrupt,
                         &options.keybindings.continue_run,
                         &options.keybindings.newline,
                         &abort_controller,
                         app,
                     );
+                    if outcome.force_exit {
+                        return Err(FORCE_EXIT_SIGNAL.to_string());
+                    }
                     if outcome.interrupted {
                         interrupt_requested = true;
                     }
@@ -1341,12 +1423,16 @@ async fn handle_continue_streaming<B: TuiBackend>(
                     let event = event_result.map_err(|error| format!("read terminal event failed: {error}"))?;
                     let outcome = handle_streaming_event(
                         event,
+                        &options.keybindings.quit,
                         &options.keybindings.interrupt,
                         &options.keybindings.continue_run,
                         &options.keybindings.newline,
                         &abort_controller,
                         app,
                     );
+                    if outcome.force_exit {
+                        return Err(FORCE_EXIT_SIGNAL.to_string());
+                    }
                     if outcome.interrupted {
                         interrupt_requested = true;
                     }
@@ -1420,10 +1506,12 @@ async fn process_queued_follow_ups<B: TuiBackend>(
 struct StreamingEventOutcome {
     interrupted: bool,
     ui_changed: bool,
+    force_exit: bool,
 }
 
 fn handle_streaming_event(
     event: Event,
+    quit_bindings: &[KeyBinding],
     interrupt_bindings: &[KeyBinding],
     follow_up_bindings: &[KeyBinding],
     newline_bindings: &[KeyBinding],
@@ -1434,6 +1522,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: handle_mouse_history_event(app, mouse),
+            force_exit: false,
         };
     }
 
@@ -1442,6 +1531,15 @@ fn handle_streaming_event(
     };
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return StreamingEventOutcome::default();
+    }
+
+    if matches_keybinding(quit_bindings, key) {
+        app.status = FORCE_EXIT_STATUS.to_string();
+        return StreamingEventOutcome {
+            interrupted: false,
+            ui_changed: true,
+            force_exit: true,
+        };
     }
 
     if matches_keybinding(interrupt_bindings, key) {
@@ -1455,6 +1553,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: true,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1471,6 +1570,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1479,6 +1579,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1486,6 +1587,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1493,6 +1595,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1500,6 +1603,7 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: true,
+            force_exit: false,
         };
     }
 
@@ -1516,6 +1620,10 @@ fn has_aborted_assistant(messages: &[Message]) -> bool {
             }
         )
     })
+}
+
+fn is_force_exit_signal(error: &str) -> bool {
+    error == FORCE_EXIT_SIGNAL
 }
 
 fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
@@ -1626,7 +1734,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
                 keybinding_label(&options.keybindings.show_help)
             )),
             Line::from(format!(
-                "  {:<14} quit",
+                "  {:<14} force quit",
                 keybinding_label(&options.keybindings.quit)
             )),
             Line::from(""),
@@ -3085,6 +3193,10 @@ mod tests {
     fn streaming_follow_up_key_queues_input_and_clears_editor() {
         let mut app = TuiApp::new("ready".to_string(), true, false);
         app.input = "next question".to_string();
+        let quit = vec![KeyBinding {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+        }];
         let interrupt = vec![KeyBinding {
             code: KeyCode::Esc,
             modifiers: KeyModifiers::NONE,
@@ -3097,6 +3209,7 @@ mod tests {
 
         let outcome = handle_streaming_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            &quit,
             &interrupt,
             &follow_up,
             &[],
@@ -3106,6 +3219,7 @@ mod tests {
 
         assert!(!outcome.interrupted);
         assert!(outcome.ui_changed);
+        assert!(!outcome.force_exit);
         assert!(app.input.is_empty());
         assert_eq!(app.input_history, vec!["next question".to_string()]);
         assert_eq!(app.queued_follow_up_count(), 1);
@@ -3115,6 +3229,10 @@ mod tests {
     #[test]
     fn streaming_follow_up_key_does_not_queue_empty_input() {
         let mut app = TuiApp::new("ready".to_string(), true, false);
+        let quit = vec![KeyBinding {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+        }];
         let interrupt = vec![KeyBinding {
             code: KeyCode::Esc,
             modifiers: KeyModifiers::NONE,
@@ -3127,6 +3245,7 @@ mod tests {
 
         let outcome = handle_streaming_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            &quit,
             &interrupt,
             &follow_up,
             &[],
@@ -3136,7 +3255,50 @@ mod tests {
 
         assert!(!outcome.interrupted);
         assert!(!outcome.ui_changed);
+        assert!(!outcome.force_exit);
         assert_eq!(app.queued_follow_up_count(), 0);
         assert_eq!(app.status, "ready");
+    }
+
+    #[test]
+    fn streaming_ctrl_d_sets_force_exit_status() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        let quit = vec![KeyBinding {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+        }];
+        let interrupt = vec![KeyBinding {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        }];
+        let follow_up = vec![KeyBinding {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::ALT,
+        }];
+        let abort_controller = AgentAbortController::new();
+
+        let outcome = handle_streaming_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            &quit,
+            &interrupt,
+            &follow_up,
+            &[],
+            &abort_controller,
+            &mut app,
+        );
+
+        assert!(!outcome.interrupted);
+        assert!(outcome.ui_changed);
+        assert!(outcome.force_exit);
+        assert_eq!(app.status, FORCE_EXIT_STATUS);
+    }
+
+    #[test]
+    fn welcome_banner_mentions_force_exit_for_quit_key() {
+        let lines = build_welcome_banner(&TuiOptions::default());
+        assert!(
+            lines.iter().any(|line| line.contains("to force exit")),
+            "welcome banner should explicitly advertise force-exit behavior"
+        );
     }
 }

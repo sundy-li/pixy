@@ -214,30 +214,32 @@ impl ThemePalette {
             return Err("selectionBg and selectionFg must be configured together".to_string());
         }
 
-        let transcript_fg =
-            parse_color(&colors.transcript_fg).map_err(|error| format!("invalid transcriptFg: {error}"))?;
-        let transcript_bg =
-            parse_color(&colors.transcript_bg).map_err(|error| format!("invalid transcriptBg: {error}"))?;
-        let input_block_bg =
-            parse_color(&colors.input_block_bg).map_err(|error| format!("invalid inputBlockBg: {error}"))?;
-        let input_border =
-            parse_color(&colors.input_border).map_err(|error| format!("invalid inputBorder: {error}"))?;
+        let transcript_fg = parse_color(&colors.transcript_fg)
+            .map_err(|error| format!("invalid transcriptFg: {error}"))?;
+        let transcript_bg = parse_color(&colors.transcript_bg)
+            .map_err(|error| format!("invalid transcriptBg: {error}"))?;
+        let input_block_bg = parse_color(&colors.input_block_bg)
+            .map_err(|error| format!("invalid inputBlockBg: {error}"))?;
+        let input_border = parse_color(&colors.input_border)
+            .map_err(|error| format!("invalid inputBorder: {error}"))?;
         let footer_fg =
             parse_color(&colors.footer_fg).map_err(|error| format!("invalid footerFg: {error}"))?;
         let footer_bg =
             parse_color(&colors.footer_bg).map_err(|error| format!("invalid footerBg: {error}"))?;
         let help_border = colors
             .help_border
-            .map(|value| parse_color(value.as_str()).map_err(|error| format!("invalid helpBorder: {error}")))
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid helpBorder: {error}"))
+            })
             .transpose()?;
-        let thinking_fg =
-            parse_color(&colors.thinking_fg).map_err(|error| format!("invalid thinkingFg: {error}"))?;
+        let thinking_fg = parse_color(&colors.thinking_fg)
+            .map_err(|error| format!("invalid thinkingFg: {error}"))?;
         let tool_fg =
             parse_color(&colors.tool_fg).map_err(|error| format!("invalid toolFg: {error}"))?;
-        let working_fg =
-            parse_color(&colors.working_fg).map_err(|error| format!("invalid workingFg: {error}"))?;
-        let working_bg =
-            parse_color(&colors.working_bg).map_err(|error| format!("invalid workingBg: {error}"))?;
+        let working_fg = parse_color(&colors.working_fg)
+            .map_err(|error| format!("invalid workingFg: {error}"))?;
+        let working_bg = parse_color(&colors.working_bg)
+            .map_err(|error| format!("invalid workingBg: {error}"))?;
         let working_highlight_fg = colors
             .working_highlight_fg
             .as_ref()

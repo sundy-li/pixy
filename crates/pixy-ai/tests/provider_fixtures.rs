@@ -55,6 +55,7 @@ fn sample_model(api: &str, base_url: String) -> Model {
         },
         base_url,
         reasoning: true,
+        reasoning_effort: None,
         input: vec!["text".to_string(), "image".to_string()],
         cost: Cost {
             input: 0.0,
@@ -90,9 +91,23 @@ fn sample_context() -> Context {
 }
 
 fn fixture_path(name: &str) -> PathBuf {
+    let fixture_relative = PathBuf::from("docs/fixtures/m1-provider").join(name);
+
+    // Prefer runtime lookup from current working directory upward.
+    // This avoids brittle compile-time absolute paths after workspace moves/renames.
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            let candidate = ancestor.join(&fixture_relative);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    // Fallback to compile-time manifest-dir based location.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/fixtures/m1-provider")
-        .join(name)
+        .join("../../")
+        .join(&fixture_relative)
 }
 
 fn read_fixture(name: &str) -> Fixture {

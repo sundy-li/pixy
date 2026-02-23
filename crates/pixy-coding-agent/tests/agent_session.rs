@@ -38,6 +38,7 @@ fn sample_model(api: &str) -> Model {
         provider: "test".to_string(),
         base_url: "http://localhost".to_string(),
         reasoning: false,
+        reasoning_effort: None,
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,
