@@ -14,10 +14,11 @@ use pi_coding_agent::{
 };
 use pi_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
+use system_prompt::build_system_prompt;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are pi, a pragmatic coding assistant working in the user's local workspace. For any concrete action (creating or editing files, running commands, inspecting logs, etc.), you MUST use the available tools directly. Do not ask the user to manually run commands, copy/paste scripts, or write files when you can do it yourself with tools. Use read/write/edit/bash tool calls first and execute promptly. Ask for confirmation only before clearly destructive or irreversible actions. After tool execution, report what changed and what you ran in concise, actionable language.";
+mod system_prompt;
 
 #[derive(Parser, Debug)]
 #[command(name = "pi", version, about = "pi-rs interactive CLI")]
@@ -48,11 +49,8 @@ struct ChatArgs {
     session_dir: Option<PathBuf>,
     #[arg(long)]
     session_file: Option<PathBuf>,
-    #[arg(
-        long,
-        default_value = DEFAULT_SYSTEM_PROMPT
-    )]
-    system_prompt: String,
+    #[arg(long)]
+    system_prompt: Option<String>,
     #[arg(long)]
     prompt: Option<String>,
     #[arg(long, default_value_t = false)]
@@ -267,7 +265,7 @@ fn create_session(
 
     let config = AgentSessionConfig {
         model: runtime.model.clone(),
-        system_prompt: args.system_prompt.clone(),
+        system_prompt: build_system_prompt(args.system_prompt.as_deref(), cwd, &tools),
         stream_fn,
         tools,
     };
@@ -1070,7 +1068,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             session_file: None,
-            system_prompt: "test".to_string(),
+            system_prompt: Some("test".to_string()),
             prompt: None,
             continue_first: false,
             no_tools: false,
@@ -1124,7 +1122,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             session_file: None,
-            system_prompt: "test".to_string(),
+            system_prompt: Some("test".to_string()),
             prompt: None,
             continue_first: false,
             no_tools: false,
@@ -1163,7 +1161,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             session_file: None,
-            system_prompt: "test".to_string(),
+            system_prompt: Some("test".to_string()),
             prompt: None,
             continue_first: false,
             no_tools: false,
@@ -1203,7 +1201,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             session_file: None,
-            system_prompt: "test".to_string(),
+            system_prompt: Some("test".to_string()),
             prompt: None,
             continue_first: false,
             no_tools: false,
@@ -1418,7 +1416,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             session_file: None,
-            system_prompt: "test".to_string(),
+            system_prompt: Some("test".to_string()),
             prompt: None,
             continue_first: false,
             no_tools: false,
