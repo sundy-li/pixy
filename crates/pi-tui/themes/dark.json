@@ -1,0 +1,21 @@
+{
+  "name": "dark",
+  "inputPrompt": "› ",
+  "colors": {
+    "transcriptFg": "white",
+    "transcriptBg": "black",
+    "inputBlockBg": "#343541",
+    "inputBorder": "green",
+    "footerFg": "darkGray",
+    "footerBg": "black",
+    "helpBorder": null,
+    "thinkingFg": "darkGray",
+    "toolFg": "gray",
+    "workingFg": "black",
+    "workingBg": "white",
+    "toolDiffAdded": "yellow",
+    "toolDiffRemoved": "red",
+    "filePathFg": "cyan",
+    "keyTokenFg": "lightYellow"
+  }
+}

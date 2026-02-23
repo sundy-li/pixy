@@ -10,6 +10,7 @@ mod google_generative_ai;
 mod google_vertex;
 mod openai_compat;
 mod openai_completions;
+mod openai_responses;
 
 const BUILTIN_SOURCE_ID: &str = "pi-ai-builtins";
 

@@ -1,7 +1,4 @@
-use std::future::Future;
 use std::io;
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -13,223 +10,35 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
-use pi_agent_core::{AgentAbortController, AgentAbortSignal};
-use pi_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
+use pi_agent_core::AgentAbortController;
+use pi_ai::{Message, StopReason};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Message>, String>> + 'a>>;
+#[cfg(test)]
+use ratatui::style::Color;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StreamUpdate {
-    AssistantTextDelta(String),
-    AssistantLine(String),
-    ToolLine(String),
-}
+pub mod backend;
+pub mod keybindings;
+pub mod options;
+pub mod theme;
+mod transcript;
 
-pub trait TuiBackend {
-    fn prompt<'a>(&'a mut self, input: &'a str) -> BackendFuture<'a>;
-    fn continue_run<'a>(&'a mut self) -> BackendFuture<'a>;
-    fn prompt_stream<'a>(
-        &'a mut self,
-        input: &'a str,
-        abort_signal: Option<AgentAbortSignal>,
-        on_update: &'a mut dyn FnMut(StreamUpdate),
-    ) -> BackendFuture<'a>;
-    fn continue_run_stream<'a>(
-        &'a mut self,
-        abort_signal: Option<AgentAbortSignal>,
-        on_update: &'a mut dyn FnMut(StreamUpdate),
-    ) -> BackendFuture<'a>;
-    fn cycle_model_forward(&mut self) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-    fn cycle_model_backward(&mut self) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-    fn select_model(&mut self) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-    fn resume_session(&mut self, _session_ref: Option<&str>) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-    fn session_file(&self) -> Option<PathBuf>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyBinding {
-    pub code: KeyCode,
-    pub modifiers: KeyModifiers,
-}
-
-impl KeyBinding {
-    fn matches(self, key: KeyEvent) -> bool {
-        key.code == self.code && key.modifiers == self.modifiers
-    }
-}
-
-pub fn parse_key_id(key_id: &str) -> Option<KeyBinding> {
-    let trimmed = key_id.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut modifiers = KeyModifiers::NONE;
-    let mut key_name = None;
-    for segment in trimmed.split('+').filter(|part| !part.is_empty()) {
-        match segment {
-            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
-            "shift" => modifiers |= KeyModifiers::SHIFT,
-            "alt" => modifiers |= KeyModifiers::ALT,
-            "meta" | "cmd" | "super" => modifiers |= KeyModifiers::SUPER,
-            other => key_name = Some(other),
-        }
-    }
-
-    let code = match key_name.unwrap_or_default() {
-        "enter" => KeyCode::Enter,
-        "escape" | "esc" => KeyCode::Esc,
-        "tab" => KeyCode::Tab,
-        "backspace" => KeyCode::Backspace,
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "space" => KeyCode::Char(' '),
-        name if name.starts_with('f') => {
-            let number = name[1..].parse::<u8>().ok()?;
-            KeyCode::F(number)
-        }
-        name if name.len() == 1 => {
-            let ch = name.chars().next()?;
-            KeyCode::Char(ch)
-        }
-        _ => return None,
-    };
-
-    Some(KeyBinding { code, modifiers })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TuiKeyBindings {
-    pub submit: Vec<KeyBinding>,
-    pub newline: Vec<KeyBinding>,
-    pub clear: Vec<KeyBinding>,
-    pub continue_run: Vec<KeyBinding>,
-    pub show_help: Vec<KeyBinding>,
-    pub show_session: Vec<KeyBinding>,
-    pub quit: Vec<KeyBinding>,
-    pub interrupt: Vec<KeyBinding>,
-    pub cycle_thinking_level: Vec<KeyBinding>,
-    pub cycle_model_forward: Vec<KeyBinding>,
-    pub cycle_model_backward: Vec<KeyBinding>,
-    pub select_model: Vec<KeyBinding>,
-    pub expand_tools: Vec<KeyBinding>,
-    pub toggle_thinking: Vec<KeyBinding>,
-}
-
-impl Default for TuiKeyBindings {
-    fn default() -> Self {
-        Self {
-            submit: vec![KeyBinding {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-            }],
-            newline: vec![
-                KeyBinding {
-                    code: KeyCode::Enter,
-                    modifiers: KeyModifiers::SHIFT,
-                },
-                KeyBinding {
-                    code: KeyCode::Char('j'),
-                    modifiers: KeyModifiers::CONTROL,
-                },
-            ],
-            clear: vec![KeyBinding {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            continue_run: vec![KeyBinding {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::ALT,
-            }],
-            show_help: vec![KeyBinding {
-                code: KeyCode::F(1),
-                modifiers: KeyModifiers::NONE,
-            }],
-            show_session: vec![KeyBinding {
-                code: KeyCode::Char('s'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            quit: vec![KeyBinding {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            interrupt: vec![KeyBinding {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-            }],
-            cycle_thinking_level: vec![KeyBinding {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::SHIFT,
-            }],
-            cycle_model_forward: vec![KeyBinding {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            cycle_model_backward: vec![KeyBinding {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            }],
-            select_model: vec![KeyBinding {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            expand_tools: vec![KeyBinding {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            toggle_thinking: vec![KeyBinding {
-                code: KeyCode::Char('t'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiOptions {
-    pub app_name: String,
-    pub version: String,
-    pub show_tool_results: bool,
-    pub keybindings: TuiKeyBindings,
-    pub initial_help: bool,
-    pub status_top: String,
-    pub status_left: String,
-    pub status_right: String,
-}
-
-impl Default for TuiOptions {
-    fn default() -> Self {
-        Self {
-            app_name: "pi".to_string(),
-            version: String::new(),
-            show_tool_results: true,
-            keybindings: TuiKeyBindings::default(),
-            initial_help: false,
-            status_top: String::new(),
-            status_left: String::new(),
-            status_right: String::new(),
-        }
-    }
-}
+pub use backend::{BackendFuture, StreamUpdate, TuiBackend};
+pub use keybindings::{KeyBinding, TuiKeyBindings, parse_key_id};
+pub use options::TuiOptions;
+pub use theme::TuiTheme;
+use transcript::{
+    TranscriptLine, TranscriptLineKind, is_thinking_line, is_tool_run_line,
+    normalize_tool_line_for_display, parse_tool_name, render_messages, split_tool_output_lines,
+    visible_transcript_lines, wrap_text_by_display_width,
+};
 
 struct TuiApp {
     input: String,
@@ -437,6 +246,19 @@ impl TuiApp {
                 .into_iter()
                 .map(|line| TranscriptLine::new(line, TranscriptLineKind::Normal)),
         );
+    }
+
+    fn push_user_input_line(&mut self, line: String) {
+        self.transcript.push(TranscriptLine::new(
+            String::new(),
+            TranscriptLineKind::UserInput,
+        ));
+        self.transcript
+            .push(TranscriptLine::new(line, TranscriptLineKind::UserInput));
+        self.transcript.push(TranscriptLine::new(
+            String::new(),
+            TranscriptLineKind::UserInput,
+        ));
     }
 
     fn push_transcript_lines(&mut self, lines: impl IntoIterator<Item = TranscriptLine>) {
@@ -652,166 +474,6 @@ impl TuiApp {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TranscriptLineKind {
-    Normal,
-    Thinking,
-    Tool,
-    Working,
-}
-
-const TOOL_COMPACTION_HEAD_LINES: usize = 2;
-const TOOL_COMPACTION_TAIL_LINES: usize = 1;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TranscriptLine {
-    text: String,
-    kind: TranscriptLineKind,
-}
-
-impl TranscriptLine {
-    fn new(text: String, kind: TranscriptLineKind) -> Self {
-        Self { text, kind }
-    }
-
-    fn to_line(&self, width: usize) -> Line<'static> {
-        let base = match self.kind {
-            TranscriptLineKind::Normal => Style::default(),
-            TranscriptLineKind::Thinking => Style::default().fg(Color::DarkGray),
-            TranscriptLineKind::Tool => Style::default().fg(Color::Gray),
-            TranscriptLineKind::Working => Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        };
-
-        let is_tool_diff_removed = matches!(self.kind, TranscriptLineKind::Tool)
-            && self.text.trim_start().starts_with('-');
-        let is_tool_diff_added = matches!(self.kind, TranscriptLineKind::Tool)
-            && self.text.trim_start().starts_with('+');
-        if is_tool_diff_removed || is_tool_diff_added {
-            let style = if is_tool_diff_removed {
-                base.fg(Color::Red)
-            } else {
-                base.fg(Color::Yellow)
-            };
-            return line_with_padding(vec![Span::styled(self.text.clone(), style)], width, style);
-        }
-
-        if matches!(self.kind, TranscriptLineKind::Working) {
-            return line_with_padding(vec![Span::styled(self.text.clone(), base)], width, base);
-        }
-
-        let spans = highlighted_spans(self.text.as_str(), base);
-        line_with_padding(spans, width, base)
-    }
-}
-
-fn line_with_padding(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Line<'static> {
-    if width == 0 {
-        return Line::from(spans);
-    }
-    let text_width = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>();
-    if text_width < width {
-        spans.push(Span::styled(" ".repeat(width - text_width), style));
-    }
-    Line::from(spans)
-}
-
-fn highlighted_spans(text: &str, base: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut buffer = String::new();
-    let mut buffer_is_token = None::<bool>;
-
-    for ch in text.chars() {
-        let is_token = is_token_char(ch);
-        match buffer_is_token {
-            None => {
-                buffer.push(ch);
-                buffer_is_token = Some(is_token);
-            }
-            Some(state) if state == is_token => {
-                buffer.push(ch);
-            }
-            Some(state) => {
-                spans.push(styled_fragment(&buffer, state, base));
-                buffer.clear();
-                buffer.push(ch);
-                buffer_is_token = Some(is_token);
-            }
-        }
-    }
-
-    if let Some(state) = buffer_is_token {
-        spans.push(styled_fragment(&buffer, state, base));
-    }
-
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
-    }
-
-    spans
-}
-
-fn styled_fragment(fragment: &str, is_token: bool, base: Style) -> Span<'static> {
-    if !is_token {
-        return Span::styled(fragment.to_string(), base);
-    }
-
-    let style = if is_file_path_token(fragment) {
-        base.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else if is_key_token(fragment) {
-        base.fg(Color::LightYellow).add_modifier(Modifier::BOLD)
-    } else {
-        base
-    };
-    Span::styled(fragment.to_string(), style)
-}
-
-fn is_token_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '+' | '~')
-}
-
-fn is_file_path_token(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
-        )
-    });
-    if trimmed.is_empty() {
-        return false;
-    }
-    if let Some((path, line)) = trimmed.rsplit_once(':') {
-        if path.contains('/') && !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit()) {
-            return true;
-        }
-    }
-    (trimmed.contains('/') || trimmed.starts_with("~/") || trimmed.starts_with("./"))
-        && (trimmed.contains('.') || trimmed.contains('/'))
-}
-
-fn is_key_token(token: &str) -> bool {
-    let normalized = token
-        .trim_matches(|ch: char| {
-            matches!(
-                ch,
-                ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`' | ':'
-            )
-        })
-        .to_ascii_lowercase();
-    if normalized.contains("pageup") || normalized.contains("pagedown") {
-        return true;
-    }
-    matches!(
-        normalized.as_str(),
-        "ctrl+a" | "ctrl+e" | "ctrl+w" | "ctrl+u" | "up" | "down"
-    )
-}
-
 pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Result<(), String> {
     enable_raw_mode().map_err(|error| format!("enable raw mode failed: {error}"))?;
     execute!(io::stdout(), EnterAlternateScreen)
@@ -989,7 +651,10 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     let submitted = app.take_input_trimmed();
                     app.record_input_history(&submitted);
                     app.scroll_transcript_to_latest();
-                    app.push_lines([format!("{}> {}", options.app_name, submitted)]);
+                    app.push_user_input_line(format_user_input_line(
+                        submitted.as_str(),
+                        options.theme.input_prompt(),
+                    ));
                     run_prompt_streaming(
                         backend,
                         &mut terminal,
@@ -1046,7 +711,10 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     Err(error) if error == "__EXIT__" => return Ok(()),
                     Err(error) => return Err(error),
                 }
-                app.push_lines([format!("{}> {}", options.app_name, submitted)]);
+                app.push_user_input_line(format_user_input_line(
+                    submitted.as_str(),
+                    options.theme.input_prompt(),
+                ));
                 run_prompt_streaming(
                     backend,
                     &mut terminal,
@@ -1231,6 +899,10 @@ fn keybinding_label_lower(bindings: &[KeyBinding]) -> String {
         .map(format_keybinding_lower)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn format_user_input_line(input: &str, input_prompt: &str) -> String {
+    format!("{input_prompt}{input}")
 }
 
 fn format_keybinding_lower(binding: KeyBinding) -> String {
@@ -1498,7 +1170,10 @@ async fn process_queued_follow_ups<B: TuiBackend>(
     events: &mut EventStream,
 ) -> Result<(), String> {
     while let Some(queued) = app.pop_follow_up() {
-        app.push_lines([format!("{}> {}", options.app_name, queued)]);
+        app.push_user_input_line(format_user_input_line(
+            queued.as_str(),
+            options.theme.input_prompt(),
+        ));
         run_prompt_streaming(backend, terminal, app, options, &queued, events).await?;
     }
     Ok(())
@@ -1600,7 +1275,8 @@ fn has_aborted_assistant(messages: &[Message]) -> bool {
 }
 
 fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
-    let input_height = input_area_height(app, frame.area());
+    let input_prompt = options.theme.input_prompt();
+    let input_height = input_area_height(app, frame.area(), input_prompt);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1622,39 +1298,37 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         app.show_thinking,
         app.working_line(),
         app.transcript_scroll_from_bottom,
+        options.theme,
     );
     let transcript = Paragraph::new(Text::from(visible_lines))
         .block(
             Block::default()
                 .borders(Borders::NONE)
-                .title(format!("{} Chat", options.app_name)),
+                .title(format!("Welcome to {} Chat", options.app_name)),
         )
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(options.theme.transcript_style());
     frame.render_widget(transcript, transcript_area);
 
-    let input_scroll = input_scroll_offset(app, input_area);
-    let input = Paragraph::new(app.input.as_str())
+    let input_scroll = input_scroll_offset(app, input_area, input_prompt);
+    let input_text = format!("{input_prompt}{}", app.input);
+    let input = Paragraph::new(input_text)
         .block(
             Block::default()
                 .borders(Borders::TOP | Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(options.theme.input_border_style()),
         )
         .wrap(Wrap { trim: false })
         .scroll((input_scroll, 0))
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(options.theme.input_style());
     frame.render_widget(input, input_area);
 
     if !app.show_help {
-        let (cursor_x, cursor_y) = input_cursor_position(app, input_area);
+        let (cursor_x, cursor_y) = input_cursor_position(app, input_area, input_prompt);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    let footer = Paragraph::new(render_status_bar_lines(app, footer_area.width as usize)).style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .bg(Color::Black)
-            .add_modifier(Modifier::DIM),
-    );
+    let footer = Paragraph::new(render_status_bar_lines(app, footer_area.width as usize))
+        .style(options.theme.footer_style());
     frame.render_widget(footer, footer_area);
 
     if app.show_help {
@@ -1718,28 +1392,37 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             )),
             Line::from("  Ctrl+A / Ctrl+E move cursor"),
             Line::from("  Ctrl+W / Ctrl+U delete backward"),
-            Line::from(format!("  {} insert newline", keybinding_label(&options.keybindings.newline))),
+            Line::from(format!(
+                "  {} insert newline",
+                keybinding_label(&options.keybindings.newline)
+            )),
             Line::from("  Up/Down input history, PageUp/PageDown scroll messages"),
             Line::from(""),
             Line::from("Use interrupt or help key to close help."),
         ]))
-        .block(Block::default().title("Help").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Help")
+                .borders(Borders::ALL)
+                .border_style(options.theme.help_border_style()),
+        )
+        .style(options.theme.help_style())
         .wrap(Wrap { trim: false });
         frame.render_widget(help, popup);
     }
 }
 
-fn input_cursor_position(app: &TuiApp, input_area: Rect) -> (u16, u16) {
-    let (x, y, _) = input_cursor_layout(app, input_area);
+fn input_cursor_position(app: &TuiApp, input_area: Rect, input_prompt: &str) -> (u16, u16) {
+    let (x, y, _) = input_cursor_layout(app, input_area, input_prompt);
     (x, y)
 }
 
-fn input_scroll_offset(app: &TuiApp, input_area: Rect) -> u16 {
-    let (_, _, scroll) = input_cursor_layout(app, input_area);
+fn input_scroll_offset(app: &TuiApp, input_area: Rect, input_prompt: &str) -> u16 {
+    let (_, _, scroll) = input_cursor_layout(app, input_area, input_prompt);
     scroll
 }
 
-fn input_cursor_layout(app: &TuiApp, input_area: Rect) -> (u16, u16, u16) {
+fn input_cursor_layout(app: &TuiApp, input_area: Rect, input_prompt: &str) -> (u16, u16, u16) {
     let inner_width = input_area.width as usize;
     let inner_height = input_area.height.saturating_sub(2) as usize;
     if inner_width == 0 || inner_height == 0 {
@@ -1749,7 +1432,12 @@ fn input_cursor_layout(app: &TuiApp, input_area: Rect) -> (u16, u16, u16) {
         return (input_area.x, fallback_y, 0);
     }
 
-    let (row, col) = input_cursor_row_col(app.input.as_str(), app.cursor_pos, inner_width);
+    let (row, col) = input_cursor_row_col(
+        app.input.as_str(),
+        app.cursor_pos,
+        inner_width,
+        input_prompt,
+    );
     let scroll = row.saturating_sub(inner_height.saturating_sub(1));
     let visible_row = row
         .saturating_sub(scroll)
@@ -1765,7 +1453,36 @@ fn input_cursor_layout(app: &TuiApp, input_area: Rect) -> (u16, u16, u16) {
     (x, y, scroll as u16)
 }
 
-fn input_cursor_row_col(input: &str, cursor_pos: usize, max_width: usize) -> (usize, usize) {
+fn advance_cursor_row_col(row: &mut usize, col: &mut usize, ch: char, max_width: usize) {
+    if ch == '\n' {
+        *row = row.saturating_add(1);
+        *col = 0;
+        return;
+    }
+
+    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+    if ch_width == 0 {
+        return;
+    }
+
+    if *col > 0 && *col + ch_width > max_width {
+        *row = row.saturating_add(1);
+        *col = 0;
+    }
+
+    *col += ch_width;
+    if *col >= max_width {
+        *row = row.saturating_add(1);
+        *col = 0;
+    }
+}
+
+fn input_cursor_row_col(
+    input: &str,
+    cursor_pos: usize,
+    max_width: usize,
+    input_prompt: &str,
+) -> (usize, usize) {
     if max_width == 0 {
         return (0, 0);
     }
@@ -1773,37 +1490,21 @@ fn input_cursor_row_col(input: &str, cursor_pos: usize, max_width: usize) -> (us
     let mut row = 0usize;
     let mut col = 0usize;
 
+    for ch in input_prompt.chars() {
+        advance_cursor_row_col(&mut row, &mut col, ch, max_width);
+    }
     for ch in input.chars().take(cursor_pos) {
-        if ch == '\n' {
-            row = row.saturating_add(1);
-            col = 0;
-            continue;
-        }
-
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width == 0 {
-            continue;
-        }
-
-        if col > 0 && col + ch_width > max_width {
-            row = row.saturating_add(1);
-            col = 0;
-        }
-
-        col += ch_width;
-        if col >= max_width {
-            row = row.saturating_add(1);
-            col = 0;
-        }
+        advance_cursor_row_col(&mut row, &mut col, ch, max_width);
     }
 
     (row, col)
 }
 
-fn input_area_height(app: &TuiApp, frame_area: Rect) -> u16 {
+fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str) -> u16 {
     // Input block has top+bottom borders only.
     let inner_width = frame_area.width as usize;
-    let line_count = wrap_text_by_display_width(app.input.as_str(), inner_width)
+    let display_input = format!("{input_prompt}{}", app.input);
+    let line_count = wrap_text_by_display_width(display_input.as_str(), inner_width)
         .len()
         .max(1);
     let desired_height = line_count.saturating_add(2) as u16;
@@ -1843,186 +1544,6 @@ fn compose_left_right_status_line(left: &str, right: &str, width: usize) -> Stri
 
     let gap = width.saturating_sub(left_width + right_width);
     format!("{left}{}{right}", " ".repeat(gap))
-}
-
-fn visible_transcript_lines(
-    lines: &[TranscriptLine],
-    max_lines: usize,
-    max_width: usize,
-    show_tool_results: bool,
-    show_thinking: bool,
-    working_line: Option<TranscriptLine>,
-    scroll_from_bottom: usize,
-) -> Vec<Line<'static>> {
-    if max_lines == 0 || max_width == 0 {
-        return vec![];
-    }
-
-    let mut filtered = lines
-        .iter()
-        .filter(|line| match line.kind {
-            TranscriptLineKind::Normal => true,
-            TranscriptLineKind::Thinking => show_thinking,
-            TranscriptLineKind::Tool => show_tool_results,
-            TranscriptLineKind::Working => true,
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if let Some(working_line) = working_line {
-        filtered.push(working_line);
-    }
-
-    let compacted = compact_tool_transcript_lines(&filtered);
-    let wrapped = wrap_transcript_lines(&compacted, max_width);
-    let max_scroll = wrapped.len().saturating_sub(max_lines);
-    let scroll = scroll_from_bottom.min(max_scroll);
-    let end = wrapped.len().saturating_sub(scroll);
-    let start = end.saturating_sub(max_lines);
-    wrapped[start..end]
-        .iter()
-        .map(|line| line.to_line(max_width))
-        .collect()
-}
-
-fn wrap_transcript_lines(lines: &[TranscriptLine], max_width: usize) -> Vec<TranscriptLine> {
-    let mut wrapped = Vec::new();
-    for line in lines {
-        for segment in wrap_text_by_display_width(&line.text, max_width) {
-            wrapped.push(TranscriptLine::new(segment, line.kind.clone()));
-        }
-    }
-    wrapped
-}
-
-fn compact_tool_transcript_lines(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
-    let mut compacted = Vec::with_capacity(lines.len());
-    let mut cursor = 0usize;
-    while cursor < lines.len() {
-        if lines[cursor].kind != TranscriptLineKind::Tool {
-            compacted.push(lines[cursor].clone());
-            cursor += 1;
-            continue;
-        }
-
-        let mut block_end = cursor;
-        while block_end < lines.len() && lines[block_end].kind == TranscriptLineKind::Tool {
-            block_end += 1;
-        }
-        compacted.extend(compact_tool_block(&lines[cursor..block_end]));
-        cursor = block_end;
-    }
-    compacted
-}
-
-fn compact_tool_block(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
-    if lines.is_empty() {
-        return vec![];
-    }
-
-    let mut compacted = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < lines.len() {
-        let line = &lines[cursor];
-        if is_tool_run_line(line.text.as_str()) {
-            compacted.push(line.clone());
-            cursor += 1;
-        } else if let Some((tool_name, is_error)) = parse_legacy_tool_header(line.text.as_str()) {
-            let title = if is_error {
-                format!("• Ran {tool_name} (error)")
-            } else {
-                format!("• Ran {tool_name}")
-            };
-            compacted.push(TranscriptLine::new(title, TranscriptLineKind::Tool));
-            cursor += 1;
-        } else {
-            compacted.extend(compact_tool_body_lines(&lines[cursor..]));
-            break;
-        }
-
-        let body_start = cursor;
-        while cursor < lines.len()
-            && !is_tool_run_line(lines[cursor].text.as_str())
-            && parse_legacy_tool_header(lines[cursor].text.as_str()).is_none()
-        {
-            cursor += 1;
-        }
-        compacted.extend(compact_tool_body_lines(&lines[body_start..cursor]));
-    }
-
-    compacted
-}
-
-fn compact_tool_body_lines(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
-    if lines.len() <= TOOL_COMPACTION_HEAD_LINES + TOOL_COMPACTION_TAIL_LINES {
-        return lines.to_vec();
-    }
-
-    let hidden = lines
-        .len()
-        .saturating_sub(TOOL_COMPACTION_HEAD_LINES + TOOL_COMPACTION_TAIL_LINES);
-    if hidden == 0 {
-        return lines.to_vec();
-    }
-
-    let mut compacted = Vec::new();
-    compacted.extend(lines.iter().take(TOOL_COMPACTION_HEAD_LINES).cloned());
-    let suffix = if hidden == 1 { "line" } else { "lines" };
-    compacted.push(TranscriptLine::new(
-        format!("    … +{hidden} {suffix}"),
-        TranscriptLineKind::Tool,
-    ));
-    compacted.extend(
-        lines
-            .iter()
-            .skip(lines.len() - TOOL_COMPACTION_TAIL_LINES)
-            .cloned(),
-    );
-    compacted
-}
-
-fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![String::new()];
-    }
-
-    let mut lines = Vec::new();
-    for raw_line in text.split('\n') {
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let mut current = String::new();
-        let mut current_width = 0usize;
-
-        for ch in raw_line.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width > 0 && current_width + ch_width > max_width {
-                lines.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-
-            current.push(ch);
-            current_width += ch_width;
-
-            if current_width >= max_width && ch_width > 0 {
-                lines.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-        }
-
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
 fn matches_keybinding(bindings: &[KeyBinding], key: KeyEvent) -> bool {
@@ -2096,133 +1617,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
-fn render_messages(messages: &[Message]) -> Vec<TranscriptLine> {
-    let mut lines = Vec::new();
-    for message in messages {
-        match message {
-            Message::Assistant {
-                content,
-                stop_reason,
-                error_message,
-                ..
-            } => {
-                for block in content {
-                    match block {
-                        AssistantContentBlock::Text { text, .. } => {
-                            if !text.trim().is_empty() {
-                                lines.push(TranscriptLine::new(
-                                    text.clone(),
-                                    TranscriptLineKind::Normal,
-                                ));
-                            }
-                        }
-                        AssistantContentBlock::Thinking { thinking, .. } => {
-                            if !thinking.trim().is_empty() {
-                                lines.push(TranscriptLine::new(
-                                    format!("[thinking] {thinking}"),
-                                    TranscriptLineKind::Thinking,
-                                ));
-                            }
-                        }
-                        AssistantContentBlock::ToolCall { .. } => {}
-                    }
-                }
-                if matches!(stop_reason, StopReason::Error | StopReason::Aborted) {
-                    if let Some(error) = error_message {
-                        lines.push(TranscriptLine::new(
-                            format!("[assistant_{}] {error}", stop_reason_label(stop_reason)),
-                            TranscriptLineKind::Normal,
-                        ));
-                    }
-                }
-            }
-            Message::ToolResult {
-                tool_name,
-                content,
-                is_error,
-                ..
-            } => {
-                let title = if *is_error {
-                    format!("• Ran {tool_name} (error)")
-                } else {
-                    format!("• Ran {tool_name}")
-                };
-                lines.push(TranscriptLine::new(title, TranscriptLineKind::Tool));
-                for block in content {
-                    match block {
-                        ToolResultContentBlock::Text { text, .. } => {
-                            for tool_line in split_tool_output_lines(text) {
-                                lines
-                                    .push(TranscriptLine::new(tool_line, TranscriptLineKind::Tool));
-                            }
-                        }
-                        ToolResultContentBlock::Image { .. } => lines.push(TranscriptLine::new(
-                            "(image tool result omitted)".to_string(),
-                            TranscriptLineKind::Tool,
-                        )),
-                    }
-                }
-            }
-            Message::User { .. } => {}
-        }
-    }
-    lines
-}
-
-fn is_thinking_line(line: &str) -> bool {
-    line.starts_with("[thinking]")
-}
-
-fn parse_tool_name(line: &str) -> Option<&str> {
-    if let Some((name, _)) = parse_legacy_tool_header(line) {
-        return Some(name);
-    }
-    line.strip_prefix("• Ran ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .filter(|name| !name.is_empty())
-}
-
-fn parse_legacy_tool_header(line: &str) -> Option<(&str, bool)> {
-    let rest = line.strip_prefix("[tool:")?.strip_suffix(']')?;
-    let mut parts = rest.splitn(2, ':');
-    let tool_name = parts.next()?.trim();
-    if tool_name.is_empty() {
-        return None;
-    }
-    let status = parts.next().unwrap_or_default();
-    Some((tool_name, status == "error"))
-}
-
-fn normalize_tool_line_for_display(line: String) -> String {
-    if let Some((tool_name, is_error)) = parse_legacy_tool_header(line.as_str()) {
-        if is_error {
-            return format!("• Ran {tool_name} (error)");
-        }
-        return format!("• Ran {tool_name}");
-    }
-    line
-}
-
-fn split_tool_output_lines(text: &str) -> Vec<String> {
-    text.split('\n')
-        .map(|line| line.trim_end_matches('\r').to_string())
-        .collect()
-}
-
-fn is_tool_run_line(line: &str) -> bool {
-    line.starts_with("• Ran ")
-}
-
-fn stop_reason_label(reason: &StopReason) -> &'static str {
-    match reason {
-        StopReason::Stop => "stop",
-        StopReason::Length => "length",
-        StopReason::ToolUse => "tool_use",
-        StopReason::Error => "error",
-        StopReason::Aborted => "aborted",
-    }
-}
-
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2248,6 +1642,8 @@ impl Drop for TerminalRestore {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use pi_agent_core::AgentAbortSignal;
 
     use super::*;
 
@@ -2480,7 +1876,7 @@ mod tests {
             width: 10,
             height: 4,
         };
-        assert_eq!(input_cursor_position(&app, area), (0, 2));
+        assert_eq!(input_cursor_position(&app, area, "› "), (0, 2));
     }
 
     #[test]
@@ -2492,13 +1888,13 @@ mod tests {
             width: 20,
             height: 24,
         };
-        assert_eq!(input_area_height(&app, frame), 3);
+        assert_eq!(input_area_height(&app, frame, "› "), 3);
 
         app.input = "line 1\nline 2".to_string();
-        assert_eq!(input_area_height(&app, frame), 4);
+        assert_eq!(input_area_height(&app, frame, "› "), 4);
 
         app.input = "line 1".to_string();
-        assert_eq!(input_area_height(&app, frame), 3);
+        assert_eq!(input_area_height(&app, frame, "› "), 3);
     }
 
     #[test]
@@ -2547,10 +1943,42 @@ mod tests {
             height: 3,
         };
 
-        assert_eq!(input_cursor_position(&app, area), (2, 1));
+        assert_eq!(input_cursor_position(&app, area, "› "), (4, 1));
 
         app.cursor_pos = 2;
-        assert_eq!(input_cursor_position(&app, area), (3, 1));
+        assert_eq!(input_cursor_position(&app, area, "› "), (5, 1));
+    }
+
+    #[test]
+    fn input_cursor_starts_after_default_prompt_prefix() {
+        let app = TuiApp::new("ready".to_string(), true, false);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+
+        assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
+    }
+
+    #[test]
+    fn backspace_at_input_start_keeps_prompt_visible() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        assert!(!handle_editor_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor_pos, 0);
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
     }
 
     #[test]
@@ -2561,10 +1989,40 @@ mod tests {
             TranscriptLine::new("l3".to_string(), TranscriptLineKind::Thinking),
             TranscriptLine::new("l4".to_string(), TranscriptLineKind::Normal),
         ];
-        let visible = visible_transcript_lines(&lines, 2, 80, true, true, None, 0);
+        let visible = visible_transcript_lines(&lines, 2, 80, true, true, None, 0, TuiTheme::Dark);
         assert_eq!(visible.len(), 2);
-        assert!(line_text(&visible[0]).starts_with("l3"));
+        assert!(line_text(&visible[0]).trim().is_empty());
         assert!(line_text(&visible[1]).starts_with("l4"));
+    }
+
+    #[test]
+    fn visible_transcript_uses_single_spacing_before_tool_block() {
+        let lines = vec![
+            TranscriptLine::new("normal".to_string(), TranscriptLineKind::Normal),
+            TranscriptLine::new("tool".to_string(), TranscriptLineKind::Tool),
+        ];
+        let visible = visible_transcript_lines(&lines, 10, 80, true, true, None, 0, TuiTheme::Dark);
+        assert_eq!(visible.len(), 3);
+        assert!(line_text(&visible[0]).starts_with("normal"));
+        assert!(line_text(&visible[1]).trim().is_empty());
+        assert!(line_text(&visible[2]).starts_with("tool"));
+    }
+
+    #[test]
+    fn visible_transcript_reuses_existing_block_padding_when_present() {
+        let lines = vec![
+            TranscriptLine::new(String::new(), TranscriptLineKind::UserInput),
+            TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput),
+            TranscriptLine::new(String::new(), TranscriptLineKind::UserInput),
+            TranscriptLine::new("reply".to_string(), TranscriptLineKind::Normal),
+        ];
+        let visible = visible_transcript_lines(&lines, 10, 80, true, true, None, 0, TuiTheme::Dark);
+        assert_eq!(visible.len(), 5);
+        assert!(line_text(&visible[0]).trim().is_empty());
+        assert!(line_text(&visible[1]).starts_with("hello"));
+        assert!(line_text(&visible[2]).trim().is_empty());
+        assert!(line_text(&visible[3]).trim().is_empty());
+        assert!(line_text(&visible[4]).starts_with("reply"));
     }
 
     #[test]
@@ -2574,7 +2032,8 @@ mod tests {
             TranscriptLine::new("tool".to_string(), TranscriptLineKind::Tool),
             TranscriptLine::new("thinking".to_string(), TranscriptLineKind::Thinking),
         ];
-        let visible = visible_transcript_lines(&lines, 10, 80, false, false, None, 0);
+        let visible =
+            visible_transcript_lines(&lines, 10, 80, false, false, None, 0, TuiTheme::Dark);
         assert_eq!(visible.len(), 1);
         assert!(line_text(&visible[0]).starts_with("normal"));
     }
@@ -2596,10 +2055,12 @@ mod tests {
                 TranscriptLineKind::Working,
             )),
             0,
+            TuiTheme::Dark,
         );
-        assert_eq!(visible.len(), 2);
+        assert_eq!(visible.len(), 3);
         assert!(line_text(&visible[0]).starts_with("normal"));
-        assert_eq!(visible[1].spans[0].content, "[-] pi is working...");
+        assert!(line_text(&visible[1]).trim().is_empty());
+        assert_eq!(visible[2].spans[0].content, "[-] pi is working...");
     }
 
     #[test]
@@ -2609,7 +2070,7 @@ mod tests {
             TranscriptLine::new("abcdefghijklm".to_string(), TranscriptLineKind::Normal),
         ];
 
-        let visible = visible_transcript_lines(&lines, 2, 4, true, true, None, 0);
+        let visible = visible_transcript_lines(&lines, 2, 4, true, true, None, 0, TuiTheme::Dark);
         assert_eq!(visible.len(), 2);
         assert!(line_text(&visible[0]).starts_with("ijkl"));
         assert!(line_text(&visible[1]).starts_with("m"));
@@ -2624,12 +2085,12 @@ mod tests {
             TranscriptLine::new("line 4".to_string(), TranscriptLineKind::Normal),
         ];
 
-        let bottom = visible_transcript_lines(&lines, 2, 80, true, true, None, 0);
+        let bottom = visible_transcript_lines(&lines, 2, 80, true, true, None, 0, TuiTheme::Dark);
         assert_eq!(bottom.len(), 2);
         assert!(line_text(&bottom[0]).starts_with("line 3"));
         assert!(line_text(&bottom[1]).starts_with("line 4"));
 
-        let scrolled = visible_transcript_lines(&lines, 2, 80, true, true, None, 1);
+        let scrolled = visible_transcript_lines(&lines, 2, 80, true, true, None, 1, TuiTheme::Dark);
         assert_eq!(scrolled.len(), 2);
         assert!(line_text(&scrolled[0]).starts_with("line 2"));
         assert!(line_text(&scrolled[1]).starts_with("line 3"));
@@ -2650,7 +2111,8 @@ mod tests {
             TranscriptLine::new("line 6".to_string(), TranscriptLineKind::Tool),
         ];
 
-        let visible = visible_transcript_lines(&lines, 20, 120, true, true, None, 0);
+        let visible =
+            visible_transcript_lines(&lines, 20, 120, true, true, None, 0, TuiTheme::Dark);
         let texts = visible.iter().map(line_text).collect::<Vec<_>>();
         assert!(texts.iter().any(|line| line.contains("• Ran bash -lc")));
         assert!(texts.iter().any(|line| line.contains("… +3 lines")));
@@ -2667,7 +2129,16 @@ mod tests {
             "line 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string(),
         ));
 
-        let visible = visible_transcript_lines(&app.transcript, 20, 120, true, true, None, 0);
+        let visible = visible_transcript_lines(
+            &app.transcript,
+            20,
+            120,
+            true,
+            true,
+            None,
+            0,
+            TuiTheme::Dark,
+        );
         let texts = visible.iter().map(line_text).collect::<Vec<_>>();
         assert!(
             texts
@@ -2681,19 +2152,83 @@ mod tests {
     #[test]
     fn tool_diff_lines_use_expected_colors() {
         let removed = TranscriptLine::new("- old assertion".to_string(), TranscriptLineKind::Tool)
-            .to_line(40);
+            .to_line(40, TuiTheme::Dark);
         let added = TranscriptLine::new("+ new assertion".to_string(), TranscriptLineKind::Tool)
-            .to_line(40);
+            .to_line(40, TuiTheme::Dark);
         assert_eq!(removed.spans[0].style.fg, Some(Color::Red));
         assert_eq!(added.spans[0].style.fg, Some(Color::Yellow));
     }
 
     #[test]
     fn tool_lines_keep_default_background_and_use_light_text() {
-        let tool =
-            TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool).to_line(40);
+        let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
+            .to_line(40, TuiTheme::Dark);
         assert_eq!(tool.spans[0].style.fg, Some(Color::Gray));
         assert_eq!(tool.spans[0].style.bg, None);
+    }
+
+    #[test]
+    fn user_input_line_uses_input_block_background_from_theme() {
+        let input = TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput)
+            .to_line(40, TuiTheme::Dark);
+        assert_eq!(input.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
+    }
+
+    #[test]
+    fn format_user_input_line_prefixes_prompt() {
+        assert_eq!(format_user_input_line("hello", "› "), "› hello");
+        assert_eq!(
+            format_user_input_line("this is second question", "pi> "),
+            "pi> this is second question"
+        );
+    }
+
+    #[test]
+    fn push_user_input_line_wraps_content_with_blank_padding_lines() {
+        let mut app = TuiApp::new("ready".to_string(), true, false);
+        app.push_user_input_line("hello".to_string());
+
+        assert_eq!(app.transcript.len(), 3);
+        assert_eq!(app.transcript[0].text, "");
+        assert_eq!(app.transcript[0].kind, TranscriptLineKind::UserInput);
+        assert_eq!(app.transcript[1].text, "hello");
+        assert_eq!(app.transcript[1].kind, TranscriptLineKind::UserInput);
+        assert_eq!(app.transcript[2].text, "");
+        assert_eq!(app.transcript[2].kind, TranscriptLineKind::UserInput);
+    }
+
+    #[test]
+    fn parse_tui_theme_names_case_insensitive() {
+        assert_eq!(TuiTheme::from_name("dark"), Some(TuiTheme::Dark));
+        assert_eq!(TuiTheme::from_name("LIGHT"), Some(TuiTheme::Light));
+        assert_eq!(TuiTheme::from_name(""), None);
+        assert_eq!(TuiTheme::from_name("solarized"), None);
+    }
+
+    #[test]
+    fn light_theme_uses_light_palette_for_tokens_and_tool_lines() {
+        let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
+            .to_line(40, TuiTheme::Light);
+        assert_eq!(tool.spans[0].style.fg, Some(Color::Rgb(108, 108, 108)));
+
+        let line = TranscriptLine::new(
+            "See crates/pi-tui/src/lib.rs:902 and PageUp".to_string(),
+            TranscriptLineKind::Normal,
+        )
+        .to_line(80, TuiTheme::Light);
+
+        assert!(
+            line.spans.iter().any(|span| {
+                span.content.contains("crates/pi-tui/src/lib.rs:902")
+                    && span.style.fg == Some(Color::Rgb(84, 125, 167))
+            }),
+            "file path token should be highlighted in light theme"
+        );
+        assert!(
+            line.spans.iter().any(|span| span.content.contains("PageUp")
+                && span.style.fg == Some(Color::Rgb(90, 128, 128))),
+            "PageUp token should be highlighted in light theme"
+        );
     }
 
     #[test]
@@ -2702,7 +2237,7 @@ mod tests {
             "See crates/pi-tui/src/lib.rs:902 and PageUp / PageDown".to_string(),
             TranscriptLineKind::Normal,
         )
-        .to_line(80);
+        .to_line(80, TuiTheme::Dark);
 
         assert!(
             line.spans.iter().any(|span| {
@@ -2732,6 +2267,15 @@ mod tests {
         assert_eq!(parse_tool_name("[tool:read:ok]"), Some("read"));
         assert_eq!(parse_tool_name("• Ran bash -lc 'cargo test'"), Some("bash"));
         assert_eq!(parse_tool_name("tool output line"), None);
+    }
+
+    #[test]
+    fn transcript_module_exposes_tool_helpers() {
+        assert!(crate::transcript::is_tool_run_line("• Ran read /tmp/file"));
+        assert_eq!(
+            crate::transcript::parse_tool_name("[tool:write:error]"),
+            Some("write")
+        );
     }
 
     #[test]

@@ -26,7 +26,21 @@ pub type ConvertToLlmFn = Arc<dyn Fn(Vec<AgentMessage>) -> Vec<Message> + Send +
 pub type MessageQueueFn = Arc<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
 
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>>;
-pub type AgentToolExecuteFn = Arc<dyn Fn(String, Value) -> ToolFuture + Send + Sync>;
+
+pub trait AgentToolExecutor: Send + Sync {
+    fn execute(&self, tool_call_id: String, args: Value) -> ToolFuture;
+}
+
+impl<F> AgentToolExecutor for F
+where
+    F: Fn(String, Value) -> ToolFuture + Send + Sync + 'static,
+{
+    fn execute(&self, tool_call_id: String, args: Value) -> ToolFuture {
+        (self)(tool_call_id, args)
+    }
+}
+
+pub type AgentToolExecuteFn = Arc<dyn AgentToolExecutor>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRetryConfig {

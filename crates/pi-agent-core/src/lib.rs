@@ -9,5 +9,5 @@ pub use agent_loop::{agent_loop, agent_loop_continue};
 pub use types::{
     AgentAbortController, AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig,
     AgentMessage, AgentRetryConfig, AgentRunMetrics, AgentTool, AgentToolExecuteFn,
-    AgentToolResult, ConvertToLlmFn, MessageQueueFn, StreamFn,
+    AgentToolExecutor, AgentToolResult, ConvertToLlmFn, MessageQueueFn, StreamFn, ToolFuture,
 };

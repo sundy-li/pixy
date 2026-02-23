@@ -590,7 +590,7 @@ async fn execute_tool_calls_with_controls(
         let tool_execution_started = Instant::now();
         let tool = tools.iter().find(|tool| tool.name == *tool_name);
         let (result, is_error) = if let Some(tool) = tool {
-            let execute_future = (tool.execute)(tool_call_id.to_string(), args.clone());
+            let execute_future = tool.execute.execute(tool_call_id.to_string(), args.clone());
             let execution = if let Some(signal_ref) = signal {
                 tokio::select! {
                     _ = signal_ref.cancelled() => Err("Tool execution aborted".to_string()),

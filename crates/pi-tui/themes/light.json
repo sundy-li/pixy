@@ -1,0 +1,21 @@
+{
+  "name": "light",
+  "inputPrompt": "› ",
+  "colors": {
+    "transcriptFg": "black",
+    "transcriptBg": "#f8f8f8",
+    "inputBlockBg": "#e8e8e8",
+    "inputBorder": "#547da7",
+    "footerFg": "#767676",
+    "footerBg": "#f8f8f8",
+    "helpBorder": "#b0b0b0",
+    "thinkingFg": "#6c6c6c",
+    "toolFg": "#6c6c6c",
+    "workingFg": "black",
+    "workingBg": "#d0d0e0",
+    "toolDiffAdded": "#588458",
+    "toolDiffRemoved": "#aa5555",
+    "filePathFg": "#547da7",
+    "keyTokenFg": "#5a8080"
+  }
+}

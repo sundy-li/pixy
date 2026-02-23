@@ -12,7 +12,7 @@ use pi_ai::{
 use pi_coding_agent::{
     AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, SessionManager, create_coding_tools,
 };
-use pi_tui::{KeyBinding, TuiKeyBindings, TuiOptions, parse_key_id};
+use pi_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
@@ -59,6 +59,8 @@ struct ChatArgs {
     hide_tool_results: bool,
     #[arg(long, default_value_t = false)]
     no_tui: bool,
+    #[arg(long)]
+    theme: Option<String>,
 }
 
 #[tokio::main]
@@ -112,6 +114,12 @@ async fn run(args: ChatArgs) -> Result<(), String> {
     }
 
     if use_tui {
+        let theme_name = resolve_tui_theme_name(
+            args.theme.as_deref(),
+            local_config.settings.theme.as_deref(),
+        )?;
+        let theme = TuiTheme::from_name(theme_name.as_str())
+            .ok_or_else(|| format!("unsupported theme '{theme_name}', expected dark or light"))?;
         let status_top = build_status_top_line(&cwd);
         let status_left = format!(
             "0.0%/{} (auto)",
@@ -125,6 +133,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
             status_top,
             status_left,
             status_right,
+            theme,
             ..TuiOptions::default()
         };
         if let Some(keybindings) = load_tui_keybindings(&agent_dir) {
@@ -507,6 +516,26 @@ fn default_agent_dir() -> PathBuf {
         .join(".pi/agent")
 }
 
+fn resolve_tui_theme_name(
+    cli_theme: Option<&str>,
+    settings_theme: Option<&str>,
+) -> Result<String, String> {
+    let selected = first_non_empty([
+        cli_theme.map(str::to_string),
+        settings_theme.map(str::to_string),
+        Some("dark".to_string()),
+    ])
+    .expect("default theme candidate is always available");
+    let normalized = selected.trim().to_ascii_lowercase();
+    if TuiTheme::from_name(normalized.as_str()).is_some() {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "unsupported theme '{selected}', expected dark or light"
+        ))
+    }
+}
+
 fn load_tui_keybindings(agent_dir: &Path) -> Option<TuiKeyBindings> {
     let config_path = agent_dir.join("keybindings.json");
     let content = std::fs::read_to_string(config_path).ok()?;
@@ -599,6 +628,7 @@ struct AgentSettingsFile {
     default_provider: Option<String>,
     #[serde(rename = "defaultModel")]
     default_model: Option<String>,
+    theme: Option<String>,
     #[serde(default)]
     env: HashMap<String, String>,
 }
@@ -878,7 +908,8 @@ fn first_non_empty<const N: usize>(candidates: [Option<String>; N]) -> Option<St
 
 fn infer_api_for_provider(provider: &str) -> Option<String> {
     match provider {
-        "openai" | "openai-completions" => Some("openai-completions".to_string()),
+        "openai" => Some("openai-responses".to_string()),
+        "openai-completions" => Some("openai-completions".to_string()),
         "openai-responses" => Some("openai-responses".to_string()),
         "openai-codex-responses" | "codex" => Some("openai-codex-responses".to_string()),
         "azure-openai" | "azure-openai-responses" => Some("azure-openai-responses".to_string()),
@@ -1002,12 +1033,14 @@ mod tests {
             no_tools: false,
             hide_tool_results: false,
             no_tui: false,
+            theme: None,
         };
 
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: Some("anthropic".to_string()),
                 default_model: Some("claude-opus-4-6".to_string()),
+                theme: None,
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                     "token-from-settings".to_string(),
@@ -1054,12 +1087,14 @@ mod tests {
             no_tools: false,
             hide_tool_results: false,
             no_tui: false,
+            theme: None,
         };
 
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: Some("anthropic".to_string()),
                 default_model: Some("claude-opus-4-6".to_string()),
+                theme: None,
                 env: HashMap::new(),
             },
             models: ModelsFile::default(),
@@ -1068,7 +1103,7 @@ mod tests {
         let resolved =
             resolve_runtime_config(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "openai");
-        assert_eq!(resolved.model.api, "openai-completions");
+        assert_eq!(resolved.model.api, "openai-responses");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
     }
 
@@ -1091,12 +1126,14 @@ mod tests {
             no_tools: false,
             hide_tool_results: false,
             no_tui: false,
+            theme: None,
         };
 
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: None,
                 default_model: None,
+                theme: None,
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                     "anthropic-token".to_string(),
@@ -1129,6 +1166,7 @@ mod tests {
             no_tools: false,
             hide_tool_results: false,
             no_tui: false,
+            theme: None,
         };
 
         let local = AgentLocalConfig {
@@ -1245,6 +1283,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tui_theme_name_prefers_cli_then_settings_then_default() {
+        assert_eq!(
+            resolve_tui_theme_name(Some("light"), Some("dark")).expect("cli theme should win"),
+            "light"
+        );
+        assert_eq!(
+            resolve_tui_theme_name(None, Some("light")).expect("settings theme should be used"),
+            "light"
+        );
+        assert_eq!(
+            resolve_tui_theme_name(None, None).expect("default theme should be dark"),
+            "dark"
+        );
+    }
+
+    #[test]
+    fn resolve_tui_theme_name_rejects_unknown_values() {
+        let error = resolve_tui_theme_name(Some("solarized"), None).expect_err("invalid theme");
+        assert!(error.contains("unsupported theme"));
+        assert!(error.contains("dark"));
+        assert!(error.contains("light"));
+    }
+
+    #[test]
     fn cli_stream_renderer_formats_deltas_and_tool_lines() {
         let mut renderer = CliStreamRenderer::new(Vec::<u8>::new(), true);
 
@@ -1319,6 +1381,7 @@ mod tests {
             no_tools: false,
             hide_tool_results: false,
             no_tui: false,
+            theme: None,
         };
         let local = AgentLocalConfig::default();
 

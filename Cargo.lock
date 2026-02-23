@@ -1171,6 +1171,8 @@ dependencies = [
  "pi-agent-core",
  "pi-ai",
  "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
  "unicode-width 0.2.0",
 ]
