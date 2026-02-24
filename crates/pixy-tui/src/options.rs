@@ -16,6 +16,7 @@ pub struct TuiOptions {
     pub input_history_path: Option<PathBuf>,
     pub input_history_limit: usize,
     pub enable_mouse_capture: bool,
+    pub startup_resource_lines: Vec<String>,
 }
 
 impl Default for TuiOptions {
@@ -33,6 +34,7 @@ impl Default for TuiOptions {
             input_history_path: None,
             input_history_limit: 256,
             enable_mouse_capture: false,
+            startup_resource_lines: vec![],
         }
     }
 }

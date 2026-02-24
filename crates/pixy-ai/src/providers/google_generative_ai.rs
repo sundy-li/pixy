@@ -2,15 +2,16 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 
-use crate::api_registry::{ApiProvider, StreamResult};
+use super::common::{empty_assistant_message, join_url, shared_http_client};
+use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Cost, DoneReason,
-    Message, Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, ToolResultContentBlock,
-    Usage, UserContent, UserContentBlock,
+    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Message,
+    Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, ToolResultContentBlock, Usage,
+    UserContent, UserContentBlock,
 };
 use crate::{ApiProviderRef, AssistantMessageEventStream};
 
@@ -31,14 +32,19 @@ impl ApiProvider for GoogleGenerativeAiProvider {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_google_with_mode(
-            model,
-            context,
-            options,
-            GoogleAuthMode::ApiKey,
-            GOOGLE_GENERATIVE_AI_FALLBACK_ENVS,
-        )
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(async move {
+            run_google_with_mode(
+                model,
+                context,
+                options,
+                GoogleAuthMode::ApiKey,
+                GOOGLE_GENERATIVE_AI_FALLBACK_ENVS,
+                stream,
+            )
+            .await
+        })
     }
 
     fn stream_simple(
@@ -46,14 +52,19 @@ impl ApiProvider for GoogleGenerativeAiProvider {
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_simple_google_with_mode(
-            model,
-            context,
-            options,
-            GoogleAuthMode::ApiKey,
-            GOOGLE_GENERATIVE_AI_FALLBACK_ENVS,
-        )
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(async move {
+            run_simple_google_with_mode(
+                model,
+                context,
+                options,
+                GoogleAuthMode::ApiKey,
+                GOOGLE_GENERATIVE_AI_FALLBACK_ENVS,
+                stream,
+            )
+            .await
+        })
     }
 }
 
@@ -68,36 +79,36 @@ pub(super) enum GoogleAuthMode {
     Auto,
 }
 
-pub(super) fn stream_simple_google_with_mode(
+pub(super) async fn run_simple_google_with_mode(
     model: Model,
     context: Context,
     options: Option<SimpleStreamOptions>,
     auth_mode: GoogleAuthMode,
     fallback_envs: &[&str],
-) -> StreamResult<AssistantMessageEventStream> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
     let merged = options.map(|simple| simple.stream);
-    stream_google_with_mode(model, context, merged, auth_mode, fallback_envs)
+    run_google_with_mode(model, context, merged, auth_mode, fallback_envs, stream).await
 }
 
-pub(super) fn stream_google_with_mode(
+pub(super) async fn run_google_with_mode(
     model: Model,
     context: Context,
     options: Option<StreamOptions>,
     auth_mode: GoogleAuthMode,
     fallback_envs: &[&str],
-) -> StreamResult<AssistantMessageEventStream> {
-    let api_key = resolve_api_key(&model.provider, options.as_ref(), fallback_envs)
-        .map_err(|error| error.as_compact_json())?;
-    let stream = AssistantMessageEventStream::new();
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
+    let api_key = resolve_api_key(&model.provider, options.as_ref(), fallback_envs)?;
 
     let mut output = empty_assistant_message(&model);
     let payload = build_google_payload(&model, &context, options.as_ref());
     let endpoint = build_google_endpoint(&model);
-    let client = Client::new();
+    let client = shared_http_client(&model.base_url);
 
-    let execution = (|| -> Result<(), PiAiError> {
+    let execution = async {
         let mut request = client
-            .post(endpoint)
+            .post(endpoint.as_str())
             .header("Content-Type", "application/json");
         request = apply_auth(request, &api_key, auth_mode);
 
@@ -106,8 +117,7 @@ pub(super) fn stream_google_with_mode(
                 request = request.header(name, value);
             }
         }
-
-        let response = request.json(&payload).send().map_err(|error| {
+        let response = request.json(&payload).send().await.map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderTransport,
                 format!("Google transport failed: {error}"),
@@ -118,6 +128,7 @@ pub(super) fn stream_google_with_mode(
             let status = response.status().as_u16();
             let body = response
                 .text()
+                .await
                 .unwrap_or_else(|_| "unable to read error body".to_string());
             return Err(PiAiError::new(
                 PiAiErrorCode::ProviderHttp,
@@ -125,7 +136,7 @@ pub(super) fn stream_google_with_mode(
             ));
         }
 
-        let body = response.text().map_err(|error| {
+        let body = response.text().await.map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderTransport,
                 format!("Google response read failed: {error}"),
@@ -202,7 +213,8 @@ pub(super) fn stream_google_with_mode(
         }
 
         Ok(())
-    })();
+    }
+    .await;
 
     if let Err(error) = execution {
         output.stop_reason = StopReason::Error;
@@ -213,7 +225,7 @@ pub(super) fn stream_google_with_mode(
         });
     }
 
-    Ok(stream)
+    Ok(())
 }
 
 #[derive(Default)]
@@ -861,33 +873,6 @@ fn build_google_model_path(model_id: &str) -> String {
     }
 }
 
-fn empty_assistant_message(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        role: "assistant".to_string(),
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        usage: Usage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: 0,
-            cost: Cost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                total: 0.0,
-            },
-        },
-        stop_reason: StopReason::Stop,
-        error_message: None,
-        timestamp: now_millis(),
-    }
-}
-
 fn extract_text_block(content: &[AssistantContentBlock], index: usize) -> String {
     content
         .get(index)
@@ -917,19 +902,4 @@ fn truncate_for_details(text: &str, limit: usize) -> String {
     }
     let prefix: String = text.chars().take(limit - 3).collect();
     format!("{prefix}...")
-}
-
-fn join_url(base_url: &str, path: &str) -> String {
-    if base_url.ends_with('/') {
-        format!("{base_url}{path}")
-    } else {
-        format!("{base_url}/{path}")
-    }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }

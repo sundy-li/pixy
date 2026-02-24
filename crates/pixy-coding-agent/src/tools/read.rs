@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
+use pixy_ai::PiAiError;
 use serde_json::{Value, json};
 
 use super::common::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, get_optional_usize, get_required_string, resolve_to_cwd,
-    text_result, truncate_head, truncated_by_str,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, get_optional_usize, get_required_string,
+    invalid_tool_args, resolve_to_cwd, text_result, tool_execution_failed, truncate_head,
+    truncated_by_str,
 };
 
 pub fn create_read_tool(cwd: impl AsRef<Path>) -> AgentTool {
@@ -20,7 +22,7 @@ pub fn create_read_tool(cwd: impl AsRef<Path>) -> AgentTool {
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path to the file, absolute or relative to workspace cwd." },
+                "path": { "type": "string", "description": "Path to the file, absolute or relative to workspace cwd, no need to ask for permission." },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based start line offset." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to return." }
             },
@@ -42,31 +44,32 @@ impl AgentToolExecutor for ReadToolExecutor {
     }
 }
 
-fn execute_read_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String> {
+fn execute_read_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, PiAiError> {
     let path = get_required_string(&args, "path")?;
     let offset = get_optional_usize(&args, "offset")?.unwrap_or(1);
     if offset == 0 {
-        return Err("`offset` must be >= 1".to_string());
+        return Err(invalid_tool_args("`offset` must be >= 1"));
     }
     let limit = get_optional_usize(&args, "limit")?;
     if let Some(limit_value) = limit {
         if limit_value == 0 {
-            return Err("`limit` must be >= 1".to_string());
+            return Err(invalid_tool_args("`limit` must be >= 1"));
         }
     }
 
     let absolute_path = resolve_to_cwd(cwd, &path);
-    let bytes =
-        fs::read(&absolute_path).map_err(|error| format!("Failed to read {path}: {error}"))?;
-    let full_content = String::from_utf8(bytes)
-        .map_err(|_| format!("Failed to read {path}: file is not valid UTF-8"))?;
+    let bytes = fs::read(&absolute_path)
+        .map_err(|error| tool_execution_failed(format!("Failed to read {path}: {error}")))?;
+    let full_content = String::from_utf8(bytes).map_err(|_| {
+        tool_execution_failed(format!("Failed to read {path}: file is not valid UTF-8"))
+    })?;
     let all_lines: Vec<&str> = full_content.split('\n').collect();
 
     if offset > all_lines.len() {
-        return Err(format!(
+        return Err(invalid_tool_args(format!(
             "Offset {offset} is beyond end of file ({} lines total)",
             all_lines.len()
-        ));
+        )));
     }
 
     let start_index = offset - 1;

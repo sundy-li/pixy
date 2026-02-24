@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use pixy_agent_core::AgentAbortSignal;
-use pixy_tui::{BackendFuture, StreamUpdate, TuiBackend};
+use pixy_tui::{BackendFuture, ResumeCandidate, StreamUpdate, TuiBackend};
 
 use crate::{AgentSession, AgentSessionStreamUpdate};
 
@@ -24,6 +24,25 @@ impl TuiBackend for AgentSession {
             AgentSession::prompt_streaming_with_abort(self, input, abort_signal, |update| {
                 on_update(map_stream_update(update))
             })
+            .await
+        })
+    }
+
+    fn prompt_stream_with_blocks<'a>(
+        &'a mut self,
+        input: &'a str,
+        blocks: Option<Vec<pixy_ai::UserContentBlock>>,
+        abort_signal: Option<AgentAbortSignal>,
+        on_update: &'a mut dyn FnMut(StreamUpdate),
+    ) -> BackendFuture<'a> {
+        Box::pin(async move {
+            AgentSession::prompt_streaming_blocks_with_abort(
+                self,
+                input,
+                blocks,
+                abort_signal,
+                |update| on_update(map_stream_update(update)),
+            )
             .await
         })
     }
@@ -56,6 +75,24 @@ impl TuiBackend for AgentSession {
     fn select_model(&mut self) -> Result<Option<String>, String> {
         AgentSession::select_model(self).map(|maybe_model| {
             maybe_model.map(|model| format!("model: {}/{}", model.provider, model.id))
+        })
+    }
+
+    fn recent_resumable_sessions(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<Vec<ResumeCandidate>>, String> {
+        AgentSession::recent_resumable_session_candidates(self, limit).map(|candidates| {
+            Some(
+                candidates
+                    .into_iter()
+                    .map(|candidate| ResumeCandidate {
+                        session_ref: candidate.path.display().to_string(),
+                        title: candidate.title,
+                        updated_at: candidate.updated_at,
+                    })
+                    .collect(),
+            )
         })
     }
 

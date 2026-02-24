@@ -8,8 +8,59 @@ pub struct KeyBinding {
 
 impl KeyBinding {
     pub(crate) fn matches(self, key: KeyEvent) -> bool {
-        key.code == self.code && key.modifiers == self.modifiers
+        if key.code != self.code {
+            return false;
+        }
+
+        let expected = normalize_modifiers(self.modifiers);
+        let actual = normalize_modifiers(key.modifiers);
+        if actual == expected {
+            return true;
+        }
+
+        // Some terminals report Alt+arrows as Alt+Shift+arrows.
+        if !expected.contains(KeyModifiers::SHIFT)
+            && is_navigation_key(self.code)
+            && actual == (expected | KeyModifiers::SHIFT)
+        {
+            return true;
+        }
+
+        false
     }
+}
+
+fn normalize_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
+    let mut normalized = KeyModifiers::NONE;
+
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        normalized |= KeyModifiers::SHIFT;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        normalized |= KeyModifiers::CONTROL;
+    }
+    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {
+        normalized |= KeyModifiers::ALT;
+    }
+    if modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER) {
+        normalized |= KeyModifiers::SUPER;
+    }
+
+    normalized
+}
+
+fn is_navigation_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+    )
 }
 
 pub fn parse_key_id(key_id: &str) -> Option<KeyBinding> {
@@ -60,6 +111,7 @@ pub struct TuiKeyBindings {
     pub newline: Vec<KeyBinding>,
     pub clear: Vec<KeyBinding>,
     pub continue_run: Vec<KeyBinding>,
+    pub dequeue: Vec<KeyBinding>,
     pub show_help: Vec<KeyBinding>,
     pub show_session: Vec<KeyBinding>,
     pub quit: Vec<KeyBinding>,
@@ -95,6 +147,10 @@ impl Default for TuiKeyBindings {
             }],
             continue_run: vec![KeyBinding {
                 code: KeyCode::Enter,
+                modifiers: KeyModifiers::ALT,
+            }],
+            dequeue: vec![KeyBinding {
+                code: KeyCode::Up,
                 modifiers: KeyModifiers::ALT,
             }],
             show_help: vec![KeyBinding {

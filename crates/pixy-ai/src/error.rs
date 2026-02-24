@@ -8,6 +8,7 @@ use serde_json::Value;
 pub enum PiAiErrorCode {
     ToolNotFound,
     ToolArgumentsInvalid,
+    ToolExecutionFailed,
     SchemaInvalid,
     ProviderAuthMissing,
     ProviderHttp,

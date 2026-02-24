@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use pixy_agent_core::AgentAbortSignal;
-use pixy_ai::Message;
+use pixy_ai::{Message, UserContentBlock};
 
 pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Message>, String>> + 'a>>;
 
@@ -12,6 +12,13 @@ pub enum StreamUpdate {
     AssistantTextDelta(String),
     AssistantLine(String),
     ToolLine(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeCandidate {
+    pub session_ref: String,
+    pub title: String,
+    pub updated_at: String,
 }
 
 pub trait TuiBackend {
@@ -23,6 +30,16 @@ pub trait TuiBackend {
         abort_signal: Option<AgentAbortSignal>,
         on_update: &'a mut dyn FnMut(StreamUpdate),
     ) -> BackendFuture<'a>;
+    fn prompt_stream_with_blocks<'a>(
+        &'a mut self,
+        input: &'a str,
+        blocks: Option<Vec<UserContentBlock>>,
+        abort_signal: Option<AgentAbortSignal>,
+        on_update: &'a mut dyn FnMut(StreamUpdate),
+    ) -> BackendFuture<'a> {
+        let _ = blocks;
+        self.prompt_stream(input, abort_signal, on_update)
+    }
     fn continue_run_stream<'a>(
         &'a mut self,
         abort_signal: Option<AgentAbortSignal>,
@@ -35,6 +52,12 @@ pub trait TuiBackend {
         Ok(None)
     }
     fn select_model(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn recent_resumable_sessions(
+        &mut self,
+        _limit: usize,
+    ) -> Result<Option<Vec<ResumeCandidate>>, String> {
         Ok(None)
     }
     fn resume_session(&mut self, _session_ref: Option<&str>) -> Result<Option<String>, String> {

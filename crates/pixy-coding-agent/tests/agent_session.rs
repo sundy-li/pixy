@@ -161,6 +161,104 @@ fn text_delta_stream(deltas: &[&str], final_text: &str, ts: i64) -> AssistantMes
     stream
 }
 
+fn thinking_delta_stream(
+    deltas: &[&str],
+    final_thinking: &str,
+    ts: i64,
+) -> AssistantMessageEventStream {
+    let partial = assistant_message(
+        vec![AssistantContentBlock::Thinking {
+            thinking: String::new(),
+            thinking_signature: None,
+        }],
+        StopReason::Stop,
+        ts,
+    );
+    let final_message = assistant_message(
+        vec![AssistantContentBlock::Thinking {
+            thinking: final_thinking.to_string(),
+            thinking_signature: None,
+        }],
+        StopReason::Stop,
+        ts,
+    );
+
+    let stream = AssistantMessageEventStream::new();
+    stream.push(AssistantMessageEvent::Start {
+        partial: partial.clone(),
+    });
+    stream.push(AssistantMessageEvent::ThinkingStart {
+        content_index: 0,
+        partial: partial.clone(),
+    });
+    for delta in deltas {
+        stream.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: 0,
+            delta: (*delta).to_string(),
+            partial: partial.clone(),
+        });
+    }
+    stream.push(AssistantMessageEvent::Done {
+        reason: DoneReason::Stop,
+        message: final_message,
+    });
+    stream
+}
+
+fn thinking_snapshot_stream(
+    snapshots: &[&str],
+    final_thinking: &str,
+    ts: i64,
+) -> AssistantMessageEventStream {
+    let start_partial = assistant_message(
+        vec![AssistantContentBlock::Thinking {
+            thinking: String::new(),
+            thinking_signature: None,
+        }],
+        StopReason::Stop,
+        ts,
+    );
+    let final_message = assistant_message(
+        vec![AssistantContentBlock::Thinking {
+            thinking: final_thinking.to_string(),
+            thinking_signature: None,
+        }],
+        StopReason::Stop,
+        ts,
+    );
+
+    let stream = AssistantMessageEventStream::new();
+    stream.push(AssistantMessageEvent::Start {
+        partial: start_partial.clone(),
+    });
+    stream.push(AssistantMessageEvent::ThinkingStart {
+        content_index: 0,
+        partial: start_partial,
+    });
+
+    for snapshot in snapshots {
+        let partial = assistant_message(
+            vec![AssistantContentBlock::Thinking {
+                thinking: (*snapshot).to_string(),
+                thinking_signature: None,
+            }],
+            StopReason::Stop,
+            ts,
+        );
+        stream.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: 0,
+            delta: (*snapshot).to_string(),
+            partial,
+        });
+    }
+
+    stream.push(AssistantMessageEvent::Done {
+        reason: DoneReason::Stop,
+        message: final_message,
+    });
+    stream
+}
+
 fn is_summary_request(context: &Context) -> bool {
     context.messages.iter().any(|message| {
         matches!(
@@ -1212,6 +1310,88 @@ async fn agent_session_continue_run_streaming_emits_updates() {
         ]
     );
     assert_eq!(produced.len(), 1, "continue should only append assistant");
+}
+
+#[tokio::test]
+async fn agent_session_prompt_streaming_updates_thinking_without_duplicate_append() {
+    let dir = tempdir().expect("tempdir");
+    let session_dir = dir.path().join("sessions");
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            Ok(thinking_delta_stream(
+                &["Analy", "zing"],
+                "Analyzing",
+                1_700_000_000_030,
+            ))
+        },
+    );
+
+    let manager = SessionManager::create(dir.path().to_str().expect("cwd utf-8"), &session_dir)
+        .expect("create manager");
+    let config = AgentSessionConfig {
+        model: sample_model("test-api"),
+        system_prompt: "You are helpful".to_string(),
+        stream_fn,
+        tools: create_coding_tools(dir.path()),
+    };
+    let mut session = AgentSession::new(manager, config);
+
+    let mut updates = vec![];
+    let produced = session
+        .prompt_streaming("hi", |update| updates.push(update))
+        .await
+        .expect("prompt streaming succeeds");
+
+    assert_eq!(
+        updates,
+        vec![
+            AgentSessionStreamUpdate::AssistantLine("[thinking] Analy".to_string()),
+            AgentSessionStreamUpdate::AssistantLine("[thinking] Analyzing".to_string()),
+        ]
+    );
+    assert_eq!(produced.len(), 2, "user + assistant");
+}
+
+#[tokio::test]
+async fn agent_session_prompt_streaming_thinking_snapshot_deltas_do_not_duplicate() {
+    let dir = tempdir().expect("tempdir");
+    let session_dir = dir.path().join("sessions");
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            Ok(thinking_snapshot_stream(
+                &[
+                    "**Analyzing directory settings**",
+                    "**Analyzing directory settings**",
+                ],
+                "**Analyzing directory settings**",
+                1_700_000_000_031,
+            ))
+        },
+    );
+
+    let manager = SessionManager::create(dir.path().to_str().expect("cwd utf-8"), &session_dir)
+        .expect("create manager");
+    let config = AgentSessionConfig {
+        model: sample_model("test-api"),
+        system_prompt: "You are helpful".to_string(),
+        stream_fn,
+        tools: create_coding_tools(dir.path()),
+    };
+    let mut session = AgentSession::new(manager, config);
+
+    let mut updates = vec![];
+    let produced = session
+        .prompt_streaming("hi", |update| updates.push(update))
+        .await
+        .expect("prompt streaming succeeds");
+
+    assert_eq!(
+        updates,
+        vec![AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] **Analyzing directory settings**".to_string()
+        )]
+    );
+    assert_eq!(produced.len(), 2, "user + assistant");
 }
 
 #[tokio::test]

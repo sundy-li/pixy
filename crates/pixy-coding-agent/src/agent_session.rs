@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, TimeZone};
 use pixy_agent_core::{
     AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentRetryConfig,
-    AgentTool, StreamFn, agent_loop, agent_loop_continue,
+    AgentTool, IdentityMessageConverter, StreamFn, agent_loop, agent_loop_continue,
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessageEvent, Context as LlmContext, Message, Model,
@@ -12,7 +13,10 @@ use pixy_ai::{
 };
 use serde_json::Value;
 
-use crate::{SessionContext, SessionManager};
+use crate::{
+    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, SessionContext, SessionManager,
+    bash_command::normalize_nested_bash_lc,
+};
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
 const AUTO_COMPACTION_SUMMARIZATION_PROMPT: &str = "Summarize the conversation above so another LLM can continue the task. Include: user goal, completed work, current status, and concrete next steps. Preserve exact file paths, commands, and error messages where relevant. Keep it concise.";
@@ -29,6 +33,13 @@ pub enum AgentSessionStreamUpdate {
     AssistantTextDelta(String),
     AssistantLine(String),
     ToolLine(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionResumeCandidate {
+    pub path: PathBuf,
+    pub title: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +98,45 @@ impl AgentSession {
         self.session_manager = loaded;
         self.sync_model_from_session_state();
         Ok(target_path)
+    }
+
+    pub fn recent_resumable_sessions(&self, limit: usize) -> Result<Vec<PathBuf>, String> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
+        let current_session_file =
+            self.session_manager
+                .session_file()
+                .cloned()
+                .ok_or_else(|| {
+                    "Current session file unavailable; cannot list resumable sessions".to_string()
+                })?;
+        let session_dir = current_session_file
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "Cannot determine session directory from {}",
+                    current_session_file.display()
+                )
+            })?
+            .to_path_buf();
+
+        let mut files = list_session_files(&session_dir)?;
+        files.retain(|path| !paths_equal(path, &current_session_file));
+        files.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+        files.truncate(limit);
+        Ok(files)
+    }
+
+    pub(crate) fn recent_resumable_session_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionResumeCandidate>, String> {
+        self.recent_resumable_sessions(limit)?
+            .into_iter()
+            .map(build_session_resume_candidate)
+            .collect()
     }
 
     pub fn auto_compaction_config(&self) -> &AutoCompactionConfig {
@@ -186,8 +236,22 @@ impl AgentSession {
     where
         F: FnMut(AgentSessionStreamUpdate),
     {
+        self.prompt_streaming_blocks_with_abort(input, None, abort_signal, &mut on_update)
+            .await
+    }
+
+    pub async fn prompt_streaming_blocks_with_abort<F>(
+        &mut self,
+        input: &str,
+        blocks: Option<Vec<UserContentBlock>>,
+        abort_signal: Option<AgentAbortSignal>,
+        mut on_update: F,
+    ) -> Result<Vec<AgentMessage>, String>
+    where
+        F: FnMut(AgentSessionStreamUpdate),
+    {
         let mut produced = self
-            .run_prompt_once_streaming(input, abort_signal, Some(&mut on_update))
+            .run_prompt_once_streaming(input, blocks, abort_signal, Some(&mut on_update))
             .await?;
         if let Some(mut retry_messages) = self.maybe_handle_overflow_and_retry(&produced).await? {
             for update in render_messages_for_streaming(&retry_messages) {
@@ -234,11 +298,16 @@ impl AgentSession {
     async fn run_prompt_once_streaming(
         &mut self,
         input: &str,
+        blocks: Option<Vec<UserContentBlock>>,
         abort_signal: Option<AgentAbortSignal>,
         on_update: Option<&mut dyn FnMut(AgentSessionStreamUpdate)>,
     ) -> Result<Vec<AgentMessage>, String> {
+        let content = match blocks {
+            Some(blocks) => UserContent::Blocks(blocks),
+            None => UserContent::Text(input.to_string()),
+        };
         let prompt = Message::User {
-            content: UserContent::Text(input.to_string()),
+            content,
             timestamp: now_millis(),
         };
 
@@ -437,7 +506,7 @@ impl AgentSession {
         AgentLoopConfig {
             model: self.config.model.clone(),
             fallback_models,
-            convert_to_llm: Arc::new(|messages: Vec<AgentMessage>| messages),
+            convert_to_llm: Arc::new(IdentityMessageConverter),
             stream_fn: self.config.stream_fn.clone(),
             retry: self.retry_config.clone(),
             get_steering_messages: None,
@@ -619,10 +688,9 @@ impl AgentSession {
 
         let stream_fn = self.config.stream_fn.clone();
         let model = self.config.model.clone();
-        let response =
-            tokio::task::spawn_blocking(move || (stream_fn)(model, summary_context, None))
-                .await
-                .map_err(|error| format!("Compaction summary stream task failed: {error}"))??;
+        let response = stream_fn
+            .stream(model, summary_context, None)
+            .map_err(|error| error.as_compact_json())?;
 
         let summary_message = response
             .result()
@@ -661,12 +729,16 @@ async fn collect_agent_loop_result(
     mut on_update: Option<&mut dyn FnMut(AgentSessionStreamUpdate)>,
 ) -> Result<Vec<AgentMessage>, String> {
     let mut saw_assistant_text_delta = false;
+    let mut saw_assistant_thinking_delta = false;
+    let mut thinking_buffer = String::new();
 
     while let Some(event) = stream.next().await {
         match event {
             AgentEvent::MessageStart { message } => {
                 if matches!(message, Message::Assistant { .. }) {
                     saw_assistant_text_delta = false;
+                    saw_assistant_thinking_delta = false;
+                    thinking_buffer.clear();
                 }
             }
             AgentEvent::ToolExecutionStart {
@@ -684,14 +756,43 @@ async fn collect_agent_loop_result(
             } => {
                 if let Some(callback) = on_update.as_mut() {
                     match assistant_message_event {
+                        AssistantMessageEvent::ThinkingStart { .. } => {
+                            thinking_buffer.clear();
+                        }
                         AssistantMessageEvent::TextDelta { delta, .. } => {
                             callback(AgentSessionStreamUpdate::AssistantTextDelta(delta));
                             saw_assistant_text_delta = true;
                         }
-                        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                            callback(AgentSessionStreamUpdate::AssistantLine(format!(
-                                "[thinking] {delta}"
-                            )));
+                        AssistantMessageEvent::ThinkingDelta {
+                            content_index,
+                            delta,
+                            partial,
+                        } => {
+                            let partial_thinking =
+                                partial
+                                    .content
+                                    .get(content_index)
+                                    .and_then(|block| match block {
+                                        AssistantContentBlock::Thinking { thinking, .. } => {
+                                            Some(thinking.clone())
+                                        }
+                                        _ => None,
+                                    });
+                            let next_thinking = partial_thinking
+                                .filter(|thinking| !thinking.is_empty() || delta.is_empty())
+                                .unwrap_or_else(|| {
+                                    let mut merged = thinking_buffer.clone();
+                                    merged.push_str(&delta);
+                                    merged
+                                });
+
+                            if next_thinking != thinking_buffer {
+                                thinking_buffer = next_thinking;
+                                callback(AgentSessionStreamUpdate::AssistantLine(format!(
+                                    "[thinking] {thinking_buffer}"
+                                )));
+                                saw_assistant_thinking_delta = true;
+                            }
                         }
                         _ => {}
                     }
@@ -703,6 +804,7 @@ async fn collect_agent_loop_result(
                         for update in render_assistant_message_for_streaming(
                             &message,
                             saw_assistant_text_delta,
+                            saw_assistant_thinking_delta,
                         ) {
                             callback(update);
                         }
@@ -737,7 +839,9 @@ fn render_messages_for_streaming(messages: &[AgentMessage]) -> Vec<AgentSessionS
     for message in messages {
         match message {
             Message::Assistant { .. } => {
-                updates.extend(render_assistant_message_for_streaming(message, false));
+                updates.extend(render_assistant_message_for_streaming(
+                    message, false, false,
+                ));
             }
             Message::ToolResult {
                 tool_name,
@@ -788,7 +892,8 @@ fn format_bash_tool_start_line(args: &Value) -> String {
         return "• Ran bash".to_string();
     };
 
-    format!("• Ran bash -lc '{}'", shell_quote_single(command))
+    let command = normalize_nested_bash_lc(command);
+    format!("• Ran bash -lc '{}'", shell_quote_single(command.as_ref()))
 }
 
 fn format_path_tool_start_line(tool_name: &str, args: &Value) -> String {
@@ -810,6 +915,7 @@ fn shell_quote_single(value: &str) -> String {
 fn render_assistant_message_for_streaming(
     message: &Message,
     had_text_delta: bool,
+    had_thinking_delta: bool,
 ) -> Vec<AgentSessionStreamUpdate> {
     let mut updates = vec![];
     let Message::Assistant {
@@ -833,7 +939,7 @@ fn render_assistant_message_for_streaming(
                     }
                 }
                 AssistantContentBlock::Thinking { thinking, .. } => {
-                    if !thinking.trim().is_empty() {
+                    if !had_thinking_delta && !thinking.trim().is_empty() {
                         updates.push(AgentSessionStreamUpdate::AssistantLine(format!(
                             "[thinking] {thinking}"
                         )));
@@ -1218,6 +1324,89 @@ fn list_session_files(session_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+fn build_session_resume_candidate(path: PathBuf) -> Result<SessionResumeCandidate, String> {
+    let manager = SessionManager::load(&path)?;
+    let context = manager.build_session_context();
+    let title = session_candidate_title(&context).unwrap_or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| path.display().to_string())
+    });
+    let updated_at = session_candidate_updated_at(&path).unwrap_or_else(|| "unknown".to_string());
+    Ok(SessionResumeCandidate {
+        path,
+        title,
+        updated_at,
+    })
+}
+
+fn session_candidate_title(context: &SessionContext) -> Option<String> {
+    context.messages.iter().find_map(|message| {
+        let Message::User { content, .. } = message else {
+            return None;
+        };
+        let candidate = user_content_preview(content)?;
+        let normalized = normalize_session_candidate_title(&candidate);
+        if normalized.is_empty()
+            || normalized.starts_with(COMPACTION_SUMMARY_PREFIX)
+            || normalized.starts_with(BRANCH_SUMMARY_PREFIX)
+        {
+            return None;
+        }
+        Some(truncate_chars(&normalized, 72))
+    })
+}
+
+fn user_content_preview(content: &UserContent) -> Option<String> {
+    match content {
+        UserContent::Text(text) => Some(text.clone()),
+        UserContent::Blocks(blocks) => {
+            let merged = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    UserContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if merged.trim().is_empty() {
+                None
+            } else {
+                Some(merged)
+            }
+        }
+    }
+}
+
+fn normalize_session_candidate_title(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn session_candidate_updated_at(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let millis = system_time_to_millis(modified)?;
+    Some(format_resume_timestamp(millis))
+}
+
+fn system_time_to_millis(value: SystemTime) -> Option<i64> {
+    if let Ok(duration) = value.duration_since(UNIX_EPOCH) {
+        return i64::try_from(duration.as_millis()).ok();
+    }
+    let duration = UNIX_EPOCH.duration_since(value).ok()?;
+    let millis = i64::try_from(duration.as_millis()).ok()?;
+    Some(-millis)
+}
+
+fn format_resume_timestamp(millis: i64) -> String {
+    Local
+        .timestamp_millis_opt(millis)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| millis.to_string())
+}
+
 fn paths_equal(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -1225,5 +1414,52 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pixy_ai::{Message, UserContent};
+    use serde_json::json;
+
+    use super::{
+        build_session_resume_candidate, format_bash_tool_start_line,
+        normalize_session_candidate_title,
+    };
+    use crate::SessionManager;
+
+    #[test]
+    fn format_bash_tool_start_line_unwraps_nested_bash_lc() {
+        let line = format_bash_tool_start_line(&json!({
+            "command": "bash -lc 'printf \"hello\"'"
+        }));
+
+        assert_eq!(line, "• Ran bash -lc 'printf \"hello\"'");
+    }
+
+    #[test]
+    fn normalize_session_candidate_title_compacts_whitespace() {
+        let normalized = normalize_session_candidate_title("  fix\n\n  websocket\t timeout  ");
+        assert_eq!(normalized, "fix websocket timeout");
+    }
+
+    #[test]
+    fn build_session_resume_candidate_extracts_first_user_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd_text = dir.path().to_str().expect("utf-8 cwd");
+        let mut manager = SessionManager::create(cwd_text, &session_dir).expect("create session");
+        manager
+            .append_message(Message::User {
+                content: UserContent::Text("investigate flaky test timeout".to_string()),
+                timestamp: 1_700_000_000_000,
+            })
+            .expect("append user message");
+        let session_file = manager.session_file().expect("session file").clone();
+
+        let candidate = build_session_resume_candidate(session_file.clone()).expect("candidate");
+        assert_eq!(candidate.path, session_file);
+        assert!(candidate.title.contains("investigate flaky test timeout"));
+        assert!(!candidate.updated_at.trim().is_empty());
     }
 }

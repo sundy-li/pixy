@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
-use crate::types::AssistantMessage;
-use crate::types::AssistantMessageEvent;
+use crate::types::{AssistantMessage, AssistantMessageEvent, DoneReason, ErrorReason};
 
 type CompletionFn<T, R> = dyn Fn(&T) -> Option<R> + Send + Sync;
 
@@ -138,6 +137,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct AssistantMessageEventStream {
     inner: EventStream<AssistantMessageEvent, AssistantMessage>,
 }
@@ -172,5 +172,38 @@ impl AssistantMessageEventStream {
 impl Default for AssistantMessageEventStream {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Clone)]
+pub struct AssistantStreamWriter {
+    stream: AssistantMessageEventStream,
+}
+
+impl AssistantStreamWriter {
+    pub fn new(stream: AssistantMessageEventStream) -> Self {
+        Self { stream }
+    }
+
+    pub fn stream(&self) -> AssistantMessageEventStream {
+        self.stream.clone()
+    }
+
+    pub fn push(&self, event: AssistantMessageEvent) {
+        self.stream.push(event);
+    }
+
+    pub fn done(&self, reason: DoneReason, message: AssistantMessage) {
+        self.stream
+            .push(AssistantMessageEvent::Done { reason, message });
+    }
+
+    pub fn error(&self, reason: ErrorReason, error: AssistantMessage) {
+        self.stream
+            .push(AssistantMessageEvent::Error { reason, error });
+    }
+
+    pub fn close(&self) {
+        self.stream.end(None);
     }
 }

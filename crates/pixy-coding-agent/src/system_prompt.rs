@@ -1,11 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Local;
 use pixy_agent_core::AgentTool;
-use pixy_coding_agent::{Skill, format_skills_for_prompt};
+use pixy_coding_agent::{Skill, SkillSource, format_skills_for_prompt};
 
-const DEFAULT_PROMPT_INTRO: &str =
-    "You are pixy, a pragmatic coding assistant working in the user's local workspace.";
+const DEFAULT_PROMPT_INTRO: &str = "You are pixy, an expert coding assistant and coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
 pub fn build_system_prompt(
     custom_prompt: Option<&str>,
@@ -39,6 +38,13 @@ fn build_system_prompt_with_now(
             prompt.push_str(&skills_prompt);
         }
     }
+    if let Some(workspace_agents) = load_workspace_agents_prompt(cwd) {
+        append_prompt_section(&mut prompt, &workspace_agents);
+    }
+    let workspace_skills = format_workspace_skills_for_prompt(cwd, skills);
+    if !workspace_skills.is_empty() {
+        append_prompt_section(&mut prompt, &workspace_skills);
+    }
 
     if !prompt.ends_with('\n') {
         prompt.push('\n');
@@ -49,6 +55,110 @@ fn build_system_prompt_with_now(
         cwd.display()
     ));
     prompt
+}
+
+fn append_prompt_section(prompt: &mut String, section: &str) {
+    if section.trim().is_empty() {
+        return;
+    }
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push('\n');
+    prompt.push_str(section.trim_end());
+}
+
+fn load_workspace_agents_prompt(cwd: &Path) -> Option<String> {
+    let path = find_workspace_context_file(cwd)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!(
+                "warning: could not read workspace context file {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "<WORKSPACE_AGENTS>\n{trimmed}\n</WORKSPACE_AGENTS>"
+    ))
+}
+
+fn find_workspace_context_file(cwd: &Path) -> Option<PathBuf> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let candidate = cwd.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn format_workspace_skills_for_prompt(cwd: &Path, skills: &[Skill]) -> String {
+    let mut workspace_skills = skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .filter(|skill| is_workspace_skill(skill, cwd))
+        .collect::<Vec<_>>();
+    workspace_skills.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+    workspace_skills.dedup_by(|a, b| a.name == b.name && a.file_path == b.file_path);
+
+    if workspace_skills.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec!["<WORKSPACE_SKILLS>".to_string()];
+    for skill in workspace_skills {
+        lines.push("  <SKILL>".to_string());
+        lines.push(format!("    <NAME>{}</NAME>", escape_xml(&skill.name)));
+        lines.push(format!(
+            "    <DESCRIPTION>{}</DESCRIPTION>",
+            escape_xml(&skill.description)
+        ));
+        lines.push(format!(
+            "    <LOCATION>{}</LOCATION>",
+            escape_xml(skill.file_path.to_string_lossy().as_ref())
+        ));
+        lines.push("  </SKILL>".to_string());
+    }
+    lines.push("</WORKSPACE_SKILLS>".to_string());
+    lines.join("\n")
+}
+
+fn is_workspace_skill(skill: &Skill, cwd: &Path) -> bool {
+    if skill.source == SkillSource::Project {
+        return true;
+    }
+
+    let workspace_root = normalize_path_for_compare(cwd, cwd);
+    let skill_path = normalize_path_for_compare(&skill.file_path, cwd);
+    skill_path.starts_with(&workspace_root)
+}
+
+fn normalize_path_for_compare(path: &Path, cwd: &Path) -> PathBuf {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    std::fs::canonicalize(&candidate).unwrap_or(candidate)
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn normalize_custom_prompt(value: &str) -> Option<&str> {
@@ -123,8 +233,9 @@ Guidelines:\n\
 
 fn tool_description(name: &str) -> Option<&'static str> {
     match name {
+        "list_directory" => Some("List directory entries"),
         "read" => Some("Read file contents"),
-        "bash" => Some("Execute bash commands in the workspace"),
+        "bash" => Some("Execute bash commands in the current directory"),
         "edit" => Some("Make surgical edits to existing files"),
         "write" => Some("Create or overwrite files"),
         _ => None,
@@ -140,7 +251,9 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
         "- When the user asks you to do something and the required tools are available, execute it directly with tools.".to_string(),
         "- Do not provide command-only responses unless the user explicitly asks for commands without execution or tools are unavailable.".to_string(),
         "- Do not refuse requests due to assumed copyright or licensing concerns. Treat permissions as the user's responsibility unless they ask for legal analysis.".to_string(),
-        "- If authorization is unclear for an external action, ask one brief confirmation and then proceed after confirmation.".to_string(),
+        "- Don't stop at the plan stage if task is clear, continue to execute it until it is finished or ask for user direction.".to_string(),
+        "- You don't need to ask for confirm or permission before using tools, just use it directly.".to_string(),
+        "- The assistant is allowed to access any absolute path explicitly mentioned by the user.".to_string(),
     ];
 
     if selected_tools.is_empty() {
@@ -150,7 +263,12 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
         );
     }
     if has("read") && has("edit") {
-        lines.push("- Use read before edit to confirm exact file content.".to_string());
+        lines.push("- MSUT read every file you modify.".to_string());
+    }
+    if has("list_directory") {
+        lines.push(
+            "- Use list_directory to inspect folders before targeting file edits.".to_string(),
+        );
     }
     if has("edit") {
         lines.push("- Use edit for precise changes when replacing exact text.".to_string());
@@ -160,6 +278,10 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
     }
     if has("bash") {
         lines.push("- Use bash for shell operations scoped to the workspace.".to_string());
+        lines.push(
+            "- The bash tool already invokes `bash -lc`; pass raw commands and do not wrap them."
+                .to_string(),
+        );
     }
 
     lines.push(
@@ -175,7 +297,7 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use pixy_coding_agent::{Skill, SkillSource};
     use tempfile::tempdir;
@@ -187,7 +309,7 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             None,
             Path::new("/workspace"),
-            &["read", "bash", "edit", "write"],
+            &["list_directory", "read", "bash", "edit", "write"],
             &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
@@ -204,13 +326,14 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             None,
             Path::new("/workspace"),
-            &["read", "bash", "edit", "write"],
+            &["list_directory", "read", "bash", "edit", "write"],
             &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
 
         assert!(prompt.contains("You are pixy"));
         assert!(prompt.contains("You have access to the following built-in tools:"));
+        assert!(prompt.contains("- list_directory:"));
         assert!(prompt.contains("- read:"));
         assert!(prompt.contains("- bash:"));
         assert!(prompt.contains("- edit:"));
@@ -243,7 +366,7 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             Some("prompt.txt"),
             dir.path(),
-            &["read", "bash", "edit", "write"],
+            &["list_directory", "read", "bash", "edit", "write"],
             &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
@@ -258,7 +381,7 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             None,
             Path::new("/workspace"),
-            &["read", "bash", "edit", "write"],
+            &["list_directory", "read", "bash", "edit", "write"],
             &[
                 Skill {
                     name: "visible-skill".to_string(),
@@ -290,7 +413,7 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             None,
             Path::new("/workspace"),
-            &["bash", "edit", "write"],
+            &["list_directory", "bash", "edit", "write"],
             &[Skill {
                 name: "visible-skill".to_string(),
                 description: "Visible skill".to_string(),
@@ -310,7 +433,7 @@ mod tests {
         let prompt = build_system_prompt_with_now(
             None,
             Path::new("/workspace"),
-            &["read", "bash", "edit", "write"],
+            &["list_directory", "read", "bash", "edit", "write"],
             &[],
             "Monday, February 23, 2026, 11:00:00 AM UTC",
         );
@@ -322,5 +445,91 @@ mod tests {
             prompt
                 .contains("Do not refuse requests due to assumed copyright or licensing concerns.")
         );
+        assert!(prompt.contains(
+            "The bash tool already invokes `bash -lc`; pass raw commands and do not wrap them."
+        ));
+    }
+
+    #[test]
+    fn prompt_includes_workspace_agents_file_when_present() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("AGENTS.md"), "workspace agents prompt")
+            .expect("write agents");
+
+        let prompt = build_system_prompt_with_now(
+            None,
+            dir.path(),
+            &["list_directory", "read", "bash", "edit", "write"],
+            &[],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains("<WORKSPACE_AGENTS>"));
+        assert!(prompt.contains("workspace agents prompt"));
+        assert!(prompt.contains("</WORKSPACE_AGENTS>"));
+    }
+
+    #[test]
+    fn prompt_falls_back_to_workspace_claude_file() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("CLAUDE.md"), "workspace claude prompt")
+            .expect("write claude");
+
+        let prompt = build_system_prompt_with_now(
+            None,
+            dir.path(),
+            &["list_directory", "read", "bash", "edit", "write"],
+            &[],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains("<WORKSPACE_AGENTS>"));
+        assert!(prompt.contains("workspace claude prompt"));
+    }
+
+    #[test]
+    fn prompt_includes_workspace_skills_only() {
+        let dir = tempdir().expect("temp dir");
+        let project_skill_path = dir.path().join(".agents/skills/demo/SKILL.md");
+        let path_skill_path = dir.path().join(".skills/local/SKILL.md");
+
+        let prompt = build_system_prompt_with_now(
+            None,
+            dir.path(),
+            &["list_directory", "bash", "edit", "write"],
+            &[
+                Skill {
+                    name: "project-skill".to_string(),
+                    description: "Project skill".to_string(),
+                    file_path: project_skill_path,
+                    base_dir: PathBuf::from("/skills/project"),
+                    source: SkillSource::Project,
+                    disable_model_invocation: false,
+                },
+                Skill {
+                    name: "path-skill".to_string(),
+                    description: "Path skill in workspace".to_string(),
+                    file_path: path_skill_path,
+                    base_dir: PathBuf::from("/skills/path"),
+                    source: SkillSource::Path,
+                    disable_model_invocation: false,
+                },
+                Skill {
+                    name: "user-skill".to_string(),
+                    description: "User skill".to_string(),
+                    file_path: PathBuf::from("/users/demo/.agents/skills/user/SKILL.md"),
+                    base_dir: PathBuf::from("/users/demo/.agents/skills/user"),
+                    source: SkillSource::User,
+                    disable_model_invocation: false,
+                },
+            ],
+            "Monday, February 23, 2026, 11:00:00 AM UTC",
+        );
+
+        assert!(prompt.contains("<WORKSPACE_SKILLS>"));
+        assert!(prompt.contains("project-skill"));
+        assert!(prompt.contains("path-skill"));
+        assert!(!prompt.contains("user-skill"));
+        assert!(prompt.contains("</WORKSPACE_SKILLS>"));
     }
 }

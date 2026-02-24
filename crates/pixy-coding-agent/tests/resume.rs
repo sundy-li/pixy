@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pixy_agent_core::StreamFn;
-use pixy_ai::{Cost, Message, Model, UserContent};
+use pixy_ai::{Cost, Message, Model, PiAiError, PiAiErrorCode, UserContent};
 use pixy_coding_agent::{AgentSession, AgentSessionConfig, SessionManager};
 
 fn sample_model() -> Model {
@@ -29,7 +29,12 @@ fn sample_model() -> Model {
 }
 
 fn sample_stream_fn() -> StreamFn {
-    Arc::new(|_model, _context, _options| Err("unused in resume tests".to_string()))
+    Arc::new(|_model, _context, _options| {
+        Err(PiAiError::new(
+            PiAiErrorCode::ProviderProtocol,
+            "unused in resume tests",
+        ))
+    })
 }
 
 fn create_session_with_user_message(
@@ -130,4 +135,53 @@ fn resume_with_file_name_loads_target_session() {
         .resume(Some(&target_name))
         .expect("resume by file name should succeed");
     assert_eq!(resumed, target_file);
+}
+
+#[test]
+fn recent_resumable_sessions_lists_newest_history_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_dir = dir.path().join("sessions");
+
+    let manager_oldest =
+        create_session_with_user_message(&session_dir, dir.path(), "oldest session")
+            .expect("create oldest session");
+    let oldest_file = manager_oldest
+        .session_file()
+        .expect("oldest session path")
+        .clone();
+
+    std::thread::sleep(Duration::from_millis(2));
+
+    let manager_middle =
+        create_session_with_user_message(&session_dir, dir.path(), "middle session")
+            .expect("create middle session");
+    let middle_file = manager_middle
+        .session_file()
+        .expect("middle session path")
+        .clone();
+
+    std::thread::sleep(Duration::from_millis(2));
+
+    let manager_current =
+        create_session_with_user_message(&session_dir, dir.path(), "current session")
+            .expect("create current session");
+    let session = AgentSession::new(
+        manager_current,
+        AgentSessionConfig {
+            model: sample_model(),
+            system_prompt: "test".to_string(),
+            stream_fn: sample_stream_fn(),
+            tools: vec![],
+        },
+    );
+
+    let recent = session
+        .recent_resumable_sessions(10)
+        .expect("recent resumable sessions should resolve");
+    assert_eq!(recent, vec![middle_file.clone(), oldest_file]);
+
+    let limited = session
+        .recent_resumable_sessions(1)
+        .expect("limited list should resolve");
+    assert_eq!(limited, vec![middle_file]);
 }

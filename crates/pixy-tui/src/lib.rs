@@ -1,13 +1,15 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -15,10 +17,10 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use pixy_agent_core::AgentAbortController;
-use pixy_ai::{Message, StopReason};
+use pixy_ai::{Message, StopReason, UserContentBlock};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -29,10 +31,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub mod backend;
 pub mod keybindings;
 pub mod options;
+mod resume;
 pub mod theme;
 mod transcript;
 
-pub use backend::{BackendFuture, StreamUpdate, TuiBackend};
+pub use backend::{BackendFuture, ResumeCandidate, StreamUpdate, TuiBackend};
 pub use keybindings::{KeyBinding, TuiKeyBindings, parse_key_id};
 pub use options::TuiOptions;
 pub use theme::TuiTheme;
@@ -44,6 +47,26 @@ use transcript::{
 
 const FORCE_EXIT_SIGNAL: &str = "__FORCE_EXIT__";
 const FORCE_EXIT_STATUS: &str = "force exiting...";
+const PASTED_TEXT_PREVIEW_LIMIT: usize = 100;
+const RESUME_LIST_LIMIT: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTextAttachment {
+    placeholder: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingImageAttachment {
+    placeholder: String,
+    block: UserContentBlock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResumePickerState {
+    candidates: Vec<ResumeCandidate>,
+    selected: usize,
+}
 
 #[derive(Clone, Debug)]
 struct InputHistoryStore {
@@ -115,6 +138,9 @@ impl InputHistoryStore {
 
 struct TuiApp {
     input: String,
+    input_blocks: Option<Vec<UserContentBlock>>,
+    pending_text_attachments: Vec<PendingTextAttachment>,
+    pending_image_attachments: Vec<PendingImageAttachment>,
     cursor_pos: usize,
     input_history: Vec<String>,
     input_history_store: Option<InputHistoryStore>,
@@ -131,18 +157,23 @@ struct TuiApp {
     working_tick: usize,
     working_started_at: Option<Instant>,
     interrupt_hint_label: String,
+    dequeue_hint_label: String,
     last_clear_key_at_ms: i64,
     queued_follow_ups: Vec<String>,
     transcript_scroll_from_bottom: usize,
     status_top: String,
     status_left: String,
     status_right: String,
+    resume_picker: Option<ResumePickerState>,
 }
 
 impl TuiApp {
     fn new(status: String, show_tool_results: bool, show_help: bool) -> Self {
         Self {
             input: String::new(),
+            input_blocks: None,
+            pending_text_attachments: vec![],
+            pending_image_attachments: vec![],
             cursor_pos: 0,
             input_history: vec![],
             input_history_store: None,
@@ -159,12 +190,14 @@ impl TuiApp {
             working_tick: 0,
             working_started_at: None,
             interrupt_hint_label: "esc".to_string(),
+            dequeue_hint_label: "Alt+Up".to_string(),
             last_clear_key_at_ms: 0,
             queued_follow_ups: vec![],
             transcript_scroll_from_bottom: 0,
             status_top: String::new(),
             status_left: String::new(),
             status_right: String::new(),
+            resume_picker: None,
         }
     }
 
@@ -179,6 +212,32 @@ impl TuiApp {
             return;
         }
         self.interrupt_hint_label = label;
+    }
+
+    fn set_dequeue_hint_label(&mut self, label: String) {
+        if label.trim().is_empty() {
+            return;
+        }
+        self.dequeue_hint_label = label;
+    }
+
+    fn open_resume_picker(&mut self, candidates: Vec<ResumeCandidate>) {
+        if candidates.is_empty() {
+            self.resume_picker = None;
+            return;
+        }
+        self.resume_picker = Some(ResumePickerState {
+            candidates,
+            selected: 0,
+        });
+    }
+
+    fn close_resume_picker(&mut self) {
+        self.resume_picker = None;
+    }
+
+    fn has_resume_picker(&self) -> bool {
+        self.resume_picker.is_some()
     }
 
     fn set_input_history_store(&mut self, store: Option<InputHistoryStore>) {
@@ -237,19 +296,70 @@ impl TuiApp {
 
     fn clear_input(&mut self) {
         self.input.clear();
+        self.input_blocks = None;
+        self.pending_text_attachments.clear();
+        self.pending_image_attachments.clear();
         self.cursor_pos = 0;
         self.reset_input_history_navigation();
     }
 
-    fn take_input_trimmed(&mut self) -> String {
+    fn has_non_text_input_blocks(&self) -> bool {
+        self.input_blocks.as_ref().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| !matches!(block, UserContentBlock::Text { .. }))
+        })
+    }
+
+    fn has_input_payload(&self) -> bool {
+        !self.input.trim().is_empty() || self.has_non_text_input_blocks()
+    }
+
+    fn take_input_payload(&mut self) -> (String, String, Option<Vec<UserContentBlock>>) {
         self.cursor_pos = 0;
         self.reset_input_history_navigation();
-        let trimmed = self.input.trim().to_string();
+
+        let display = self.input.trim().to_string();
+        let expanded = self.expand_pasted_text_placeholders(&display);
+        let text_for_blocks = self.strip_pending_image_placeholders(expanded.as_str());
         self.input.clear();
-        trimmed
+
+        let blocks = self.input_blocks.take().and_then(|mut blocks| {
+            if text_for_blocks.is_empty() {
+                blocks.retain(|block| !matches!(block, UserContentBlock::Text { .. }));
+                return if blocks.is_empty() {
+                    None
+                } else {
+                    Some(blocks)
+                };
+            }
+
+            if let Some(UserContentBlock::Text { text, .. }) = blocks
+                .iter_mut()
+                .find(|block| matches!(block, UserContentBlock::Text { .. }))
+            {
+                *text = text_for_blocks.clone();
+                Some(blocks)
+            } else {
+                let mut out = Vec::with_capacity(blocks.len() + 1);
+                out.push(UserContentBlock::Text {
+                    text: text_for_blocks.clone(),
+                    text_signature: None,
+                });
+                out.extend(blocks);
+                Some(out)
+            }
+        });
+
+        self.pending_text_attachments.clear();
+        self.pending_image_attachments.clear();
+        (display, expanded, blocks)
     }
 
-    fn insert_char(&mut self, ch: char) {
+    fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         self.reset_input_history_navigation();
         let byte_pos = self
             .input
@@ -257,9 +367,57 @@ impl TuiApp {
             .nth(self.cursor_pos)
             .map(|(i, _)| i)
             .unwrap_or(self.input.len());
-        self.input.insert(byte_pos, ch);
-        self.cursor_pos += 1;
+        self.input.insert_str(byte_pos, text);
+        self.cursor_pos += text.chars().count();
         self.scroll_transcript_to_latest();
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let mut buffer = [0_u8; 4];
+        let text = ch.encode_utf8(&mut buffer);
+        self.insert_text(text);
+    }
+
+    fn expand_pasted_text_placeholders(&self, text: &str) -> String {
+        let mut expanded = text.to_string();
+        for attachment in &self.pending_text_attachments {
+            expanded = expanded.replacen(&attachment.placeholder, &attachment.content, 1);
+        }
+        expanded
+    }
+
+    fn strip_pending_image_placeholders(&self, text: &str) -> String {
+        let mut stripped = text.to_string();
+        for attachment in &self.pending_image_attachments {
+            stripped = stripped.replacen(&attachment.placeholder, "", 1);
+        }
+        stripped.trim().to_string()
+    }
+
+    fn push_pending_pasted_text(&mut self, content: String) {
+        let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
+        self.pending_text_attachments.push(PendingTextAttachment {
+            placeholder: placeholder.clone(),
+            content,
+        });
+        self.insert_text(&placeholder);
+    }
+
+    fn push_pending_image_attachment(&mut self, placeholder: String, block: UserContentBlock) {
+        self.pending_image_attachments.push(PendingImageAttachment {
+            placeholder: placeholder.clone(),
+            block: block.clone(),
+        });
+        self.insert_text(&placeholder);
+
+        let pending_blocks = self
+            .pending_image_attachments
+            .iter()
+            .map(|pending| pending.block.clone())
+            .collect::<Vec<_>>();
+        let blocks = self.input_blocks.get_or_insert_with(Vec::new);
+        blocks.retain(|candidate| !pending_blocks.iter().any(|pending| pending == candidate));
+        blocks.extend(pending_blocks);
     }
 
     fn delete_char_before_cursor(&mut self) -> bool {
@@ -453,6 +611,38 @@ impl TuiApp {
         self.queued_follow_ups.push(input);
     }
 
+    fn dequeue_follow_ups_to_editor(&mut self) -> Option<usize> {
+        let count = self.queued_follow_ups.len();
+        if count == 0 {
+            return None;
+        }
+        self.input = self.queued_follow_ups.join("\n");
+        self.cursor_pos = self.input_char_count();
+        self.queued_follow_ups.clear();
+        self.reset_input_history_navigation();
+        self.scroll_transcript_to_latest();
+        Some(count)
+    }
+
+    fn steering_status_lines(&self) -> Vec<String> {
+        if !self.is_working || self.queued_follow_ups.is_empty() {
+            return vec![];
+        }
+
+        let mut lines = self
+            .queued_follow_ups
+            .iter()
+            .map(|queued| {
+                format!("Steering: {}", summarize_steering_message(queued))
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "↳ {} to edit all queued messages",
+            self.dequeue_hint_label
+        ));
+        lines
+    }
+
     fn pop_follow_up(&mut self) -> Option<String> {
         if self.queued_follow_ups.is_empty() {
             None
@@ -550,10 +740,9 @@ impl TuiApp {
                 } else if let Some(tool_name) = parse_tool_name(line) {
                     self.working_message = format!("• Ran {tool_name}");
                 } else {
-                    // Keep the running tool headline while new tool output lines stream in.
-                    if !is_tool_run_line(&self.working_message) {
-                        self.working_message = format!("{app_name} is working...");
-                    }
+                    // Tool output lines are emitted after the tool returns.
+                    // Switch back to generic "working" while waiting for next assistant token.
+                    self.working_message = format!("{app_name} is working...");
                 }
             }
         }
@@ -601,12 +790,27 @@ impl TuiApp {
             StreamUpdate::AssistantLine(line) => {
                 self.assistant_stream_open = false;
                 if !line.is_empty() {
-                    let kind = if is_thinking_line(&line) {
-                        TranscriptLineKind::Thinking
+                    if is_thinking_line(&line) {
+                        if self.is_working
+                            && matches!(
+                                self.transcript.last(),
+                                Some(TranscriptLine {
+                                    kind: TranscriptLineKind::Thinking,
+                                    ..
+                                })
+                            )
+                        {
+                            if let Some(last) = self.transcript.last_mut() {
+                                last.text = line;
+                            }
+                        } else {
+                            self.transcript
+                                .push(TranscriptLine::new(line, TranscriptLineKind::Thinking));
+                        }
                     } else {
-                        TranscriptLineKind::Normal
-                    };
-                    self.transcript.push(TranscriptLine::new(line, kind));
+                        self.transcript
+                            .push(TranscriptLine::new(line, TranscriptLineKind::Normal));
+                    }
                 }
             }
             StreamUpdate::ToolLine(line) => {
@@ -671,9 +875,12 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             false
         };
 
+    let bracketed_paste_enabled = execute!(io::stdout(), EnableBracketedPaste).is_ok();
+
     let mut _restore = TerminalRestore {
         keyboard_enhancement_enabled,
         mouse_capture_enabled: options.enable_mouse_capture,
+        bracketed_paste_enabled,
         selection_colors_applied: false,
     };
 
@@ -692,6 +899,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
     app.set_interrupt_hint_label(primary_keybinding_label_lower(
         &options.keybindings.interrupt,
     ));
+    app.set_dequeue_hint_label(keybinding_label(&options.keybindings.dequeue));
     app.set_input_history_store(
         options
             .input_history_path
@@ -726,6 +934,12 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             continue;
         }
 
+        if let Event::Paste(pasted) = event {
+            handle_paste_event(&mut app, pasted);
+            needs_redraw = true;
+            continue;
+        }
+
         if !matches!(event, Event::Key(_)) {
             // Keep resize/focus redraw responsive without repainting on every mouse drag.
             needs_redraw = true;
@@ -743,6 +957,9 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
         if matches_keybinding(&options.keybindings.quit, key) {
             return Ok(());
         }
+        if handle_resume_picker_key_event(key, backend, &mut app) {
+            continue;
+        }
         if matches_keybinding(&options.keybindings.interrupt, key) {
             app.clear_input();
             app.show_help = false;
@@ -750,7 +967,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             continue;
         }
         if matches_keybinding(&options.keybindings.clear, key) {
-            if !app.input.is_empty() {
+            if app.has_input_payload() || !app.pending_text_attachments.is_empty() {
                 app.clear_input();
                 app.last_clear_key_at_ms = now_millis();
                 app.status = "input cleared".to_string();
@@ -837,7 +1054,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             continue;
         }
         if matches_keybinding(&options.keybindings.continue_run, key) {
-            if app.input.trim().is_empty() {
+            if !app.has_input_payload() {
                 if let Err(error) = handle_continue_streaming(
                     backend,
                     &mut terminal,
@@ -867,33 +1084,18 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     return Err(error);
                 }
             } else {
-                let submitted = app.take_input_trimmed();
-                app.record_input_history(&submitted);
-                app.scroll_transcript_to_latest();
-                app.push_user_input_line(format_user_input_line(
-                    submitted.as_str(),
-                    options.theme.input_prompt(),
-                ));
-                if let Err(error) = run_prompt_streaming(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    &submitted,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
+                let (display_input, submitted, blocks) = app.take_input_payload();
+                if submitted.is_empty() && blocks.is_none() {
+                    continue;
                 }
-                if let Err(error) = process_queued_follow_ups(
+                if let Err(error) = run_submitted_input(
                     backend,
                     &mut terminal,
                     &mut app,
                     &options,
+                    display_input,
+                    submitted,
+                    blocks,
                     &mut events,
                 )
                 .await
@@ -905,77 +1107,34 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                 }
             }
             continue;
+        }
+        if matches_keybinding(&options.keybindings.dequeue, key) {
+            if let Some(count) = app.dequeue_follow_ups_to_editor() {
+                let label = if count == 1 { "message" } else { "messages" };
+                app.status = format!("editing {count} queued {label}");
+                continue;
+            }
         }
         if matches_keybinding(&options.keybindings.newline, key) {
             app.insert_char('\n');
             continue;
         }
         if matches_keybinding(&options.keybindings.submit, key) {
-            let submitted = app.take_input_trimmed();
-            if submitted.is_empty() {
+            let (display_input, submitted, blocks) = app.take_input_payload();
+            if submitted.is_empty() && blocks.is_none() {
                 continue;
             }
-            app.record_input_history(&submitted);
-            app.scroll_transcript_to_latest();
-            if submitted == "/continue" {
-                if let Err(error) = handle_continue_streaming(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-                if let Err(error) = process_queued_follow_ups(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-                continue;
-            }
-            match handle_slash_command(&submitted, backend, &mut app).await {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) if error == "__EXIT__" => return Ok(()),
-                Err(error) => return Err(error),
-            }
-            app.push_user_input_line(format_user_input_line(
-                submitted.as_str(),
-                options.theme.input_prompt(),
-            ));
-            if let Err(error) = run_prompt_streaming(
+            if let Err(error) = run_submitted_input(
                 backend,
                 &mut terminal,
                 &mut app,
                 &options,
-                &submitted,
+                display_input,
+                submitted,
+                blocks,
                 &mut events,
             )
             .await
-            {
-                if is_force_exit_signal(&error) {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            if let Err(error) =
-                process_queued_follow_ups(backend, &mut terminal, &mut app, &options, &mut events)
-                    .await
             {
                 if is_force_exit_signal(&error) {
                     return Ok(());
@@ -1139,13 +1298,16 @@ fn is_ctrl_only(modifiers: KeyModifiers) -> bool {
         && !modifiers.contains(KeyModifiers::SUPER)
 }
 
+fn transcript_title(app_name: &str, version: &str) -> String {
+    if version.trim().is_empty() {
+        format!("Welcome to {app_name} Chat")
+    } else {
+        format!("Welcome to {app_name} Chat  v{version}")
+    }
+}
+
 fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
     let kb = &options.keybindings;
-    let version_suffix = if options.version.is_empty() {
-        String::new()
-    } else {
-        format!(" v{}", options.version)
-    };
 
     let interrupt_label = keybinding_label_lower(&kb.interrupt);
     let clear_label = keybinding_label_lower(&kb.clear);
@@ -1157,11 +1319,11 @@ fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
     let expand_tools_label = keybinding_label_lower(&kb.expand_tools);
     let toggle_thinking_label = keybinding_label_lower(&kb.toggle_thinking);
     let follow_up_label = keybinding_label_lower(&kb.continue_run);
+    let dequeue_label = keybinding_label_lower(&kb.dequeue);
     let newline_label = keybinding_label_lower(&kb.newline);
 
-    vec![
+    let mut lines = vec![
         String::new(),
-        format!(" {}{}", options.app_name, version_suffix),
         format!(" {} to interrupt", interrupt_label),
         format!(" {} to clear", clear_label),
         format!(" {} twice to exit", clear_label),
@@ -1173,11 +1335,25 @@ fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
         format!(" {} to expand thinking", toggle_thinking_label),
         format!(" / for commands"),
         format!(" {} to queue follow-up", follow_up_label),
+        format!(" {} to edit queued follow-ups", dequeue_label),
         " ctrl+a/e: move cursor, ctrl+w/u: delete backward".to_string(),
         format!(" {}: newline", newline_label),
         history_navigation_help_line(options.enable_mouse_capture).to_string(),
-        String::new(),
-    ]
+    ];
+
+    if !options.startup_resource_lines.is_empty() {
+        lines.push(String::new());
+        lines.extend(options.startup_resource_lines.iter().map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!(" {line}")
+            }
+        }));
+    }
+
+    lines.push(String::new());
+    lines
 }
 
 fn history_navigation_help_line(enable_mouse_capture: bool) -> &'static str {
@@ -1218,6 +1394,171 @@ fn primary_keybinding_label_lower(bindings: &[KeyBinding]) -> String {
 
 fn format_user_input_line(input: &str, input_prompt: &str) -> String {
     format!("{input_prompt}{input}")
+}
+
+fn handle_paste_event(app: &mut TuiApp, pasted: String) {
+    if let Some(token) = parse_image_placeholder(pasted.as_str()) {
+        match load_image_block_for_placeholder(token.as_str()) {
+            Ok(block) => {
+                app.push_pending_image_attachment(token.clone(), block);
+                app.status = format!("attached {token}");
+            }
+            Err(error) => {
+                app.insert_text(&token);
+                app.status = format!("{token} not attached: {error}");
+            }
+        }
+        return;
+    }
+
+    if should_shorten_pasted_text(pasted.as_str()) {
+        app.push_pending_pasted_text(pasted);
+        app.status = "pasted text inserted as placeholder".to_string();
+        return;
+    }
+
+    app.insert_text(&pasted);
+}
+
+fn should_shorten_pasted_text(text: &str) -> bool {
+    text.chars().count() > PASTED_TEXT_PREVIEW_LIMIT || text.contains('\n')
+}
+
+fn parse_image_placeholder(text: &str) -> Option<String> {
+    let token = text.trim();
+    if !token.starts_with("[image") || !token.ends_with(']') {
+        return None;
+    }
+    let digits = &token[6..token.len() - 1];
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn load_image_block_for_placeholder(placeholder: &str) -> Result<UserContentBlock, String> {
+    let path = resolve_image_path_for_placeholder(placeholder)?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("read {} failed: {error}", path.display()))?;
+    let mime_type = infer_image_mime_type(&path)?;
+    Ok(UserContentBlock::Image {
+        data: BASE64_STANDARD.encode(bytes),
+        mime_type,
+    })
+}
+
+fn resolve_image_path_for_placeholder(placeholder: &str) -> Result<PathBuf, String> {
+    let stem = placeholder.trim_start_matches('[').trim_end_matches(']');
+    let image_dirs = candidate_image_dirs();
+
+    for image_dir in &image_dirs {
+        for extension in ["png", "jpg", "jpeg", "webp", "gif", "bmp"] {
+            let candidate = image_dir.join(format!("{stem}.{extension}"));
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+
+        if let Some(path) = newest_matching_image_file(image_dir, stem)? {
+            return Ok(path);
+        }
+    }
+
+    let searched = image_dirs
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("no image file found in {searched}"))
+}
+
+fn candidate_image_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(configured) = env::var("PIXY_PASTED_IMAGE_DIR") {
+        let configured = configured.trim();
+        if !configured.is_empty() {
+            dirs.push(PathBuf::from(configured));
+        }
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        dirs.push(PathBuf::from(&home).join(".pixy/workspace/tmp"));
+    }
+    dirs.push(PathBuf::from("~/.pixy/workspace/tmp"));
+
+    dedup_paths(dirs)
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if deduped.iter().any(|existing: &PathBuf| existing == &path) {
+            continue;
+        }
+        deduped.push(path);
+    }
+    deduped
+}
+
+fn newest_matching_image_file(image_dir: &Path, stem: &str) -> Result<Option<PathBuf>, String> {
+    let mut best_match: Option<(SystemTime, PathBuf)> = None;
+    let entries = match fs::read_dir(image_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("scan {} failed: {error}", image_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(file_name == stem || file_name.starts_with(&format!("{stem}."))) {
+            continue;
+        }
+        let modified = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if let Some((best_time, _)) = &best_match {
+            if modified <= *best_time {
+                continue;
+            }
+        }
+        best_match = Some((modified, path));
+    }
+
+    Ok(best_match.map(|(_, path)| path))
+}
+
+fn infer_image_mime_type(path: &Path) -> Result<String, String> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => return Err(format!("unsupported image extension: {}", ext)),
+    };
+    Ok(mime.to_string())
+}
+
+fn summarize_steering_message(message: &str) -> String {
+    let compacted = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compacted.is_empty() {
+        "(empty)".to_string()
+    } else {
+        compacted
+    }
 }
 
 fn format_keybinding_lower(binding: KeyBinding) -> String {
@@ -1273,29 +1614,66 @@ async fn handle_slash_command<B: TuiBackend>(
             Ok(true)
         }
         command if command.starts_with("/resume") => {
-            let target = command
-                .strip_prefix("/resume")
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            match backend.resume_session(target) {
-                Ok(Some(status)) => {
-                    app.status = status;
-                    Ok(true)
-                }
-                Ok(None) => {
-                    app.status = "resume is not supported by this backend".to_string();
-                    Ok(true)
-                }
-                Err(error) => {
-                    app.push_lines([format!("[resume_error] {error}")]);
-                    app.status = format!("resume failed: {error}");
-                    Ok(true)
-                }
-            }
+            resume::handle_slash_resume_command(command, backend, app)
         }
         "/exit" | "/quit" => Err("__EXIT__".to_string()),
         _ => Ok(false),
     }
+}
+
+fn handle_resume_picker_key_event<B: TuiBackend>(
+    key: KeyEvent,
+    backend: &mut B,
+    app: &mut TuiApp,
+) -> bool {
+    resume::handle_resume_picker_key_event(key, backend, app)
+}
+
+async fn run_submitted_input<B: TuiBackend>(
+    backend: &mut B,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+    options: &TuiOptions,
+    display_input: String,
+    submitted_input: String,
+    blocks: Option<Vec<UserContentBlock>>,
+    events: &mut EventStream,
+) -> Result<(), String> {
+    app.record_input_history(&display_input);
+    app.scroll_transcript_to_latest();
+
+    if blocks.is_none() && submitted_input == "/continue" {
+        handle_continue_streaming(backend, terminal, app, options, events).await?;
+        process_queued_follow_ups(backend, terminal, app, options, events).await?;
+        return Ok(());
+    }
+
+    if blocks.is_none() {
+        match handle_slash_command(&submitted_input, backend, app).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error == "__EXIT__" => return Err(FORCE_EXIT_SIGNAL.to_string()),
+            Err(error) => return Err(error),
+        }
+    }
+
+    app.push_user_input_line(format_user_input_line(
+        display_input.as_str(),
+        options.theme.input_prompt(),
+    ));
+
+    run_prompt_streaming(
+        backend,
+        terminal,
+        app,
+        options,
+        &submitted_input,
+        blocks,
+        events,
+    )
+    .await?;
+
+    process_queued_follow_ups(backend, terminal, app, options, events).await
 }
 
 async fn run_prompt_streaming<B: TuiBackend>(
@@ -1304,6 +1682,7 @@ async fn run_prompt_streaming<B: TuiBackend>(
     app: &mut TuiApp,
     options: &TuiOptions,
     input: &str,
+    blocks: Option<Vec<UserContentBlock>>,
     events: &mut EventStream,
 ) -> Result<(), String> {
     app.start_working(format!("{} is working...", options.app_name));
@@ -1317,8 +1696,12 @@ async fn run_prompt_streaming<B: TuiBackend>(
     let mut on_update = move |update: StreamUpdate| {
         let _ = update_tx.send(update);
     };
-    let stream_future =
-        backend.prompt_stream(input, Some(abort_controller.signal()), &mut on_update);
+    let stream_future = backend.prompt_stream_with_blocks(
+        input,
+        blocks,
+        Some(abort_controller.signal()),
+        &mut on_update,
+    );
     tokio::pin!(stream_future);
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1333,6 +1716,7 @@ async fn run_prompt_streaming<B: TuiBackend>(
                         &options.keybindings.quit,
                         &options.keybindings.interrupt,
                         &options.keybindings.continue_run,
+                        &options.keybindings.dequeue,
                         &options.keybindings.newline,
                         &abort_controller,
                         app,
@@ -1426,6 +1810,7 @@ async fn handle_continue_streaming<B: TuiBackend>(
                         &options.keybindings.quit,
                         &options.keybindings.interrupt,
                         &options.keybindings.continue_run,
+                        &options.keybindings.dequeue,
                         &options.keybindings.newline,
                         &abort_controller,
                         app,
@@ -1497,7 +1882,7 @@ async fn process_queued_follow_ups<B: TuiBackend>(
             queued.as_str(),
             options.theme.input_prompt(),
         ));
-        run_prompt_streaming(backend, terminal, app, options, &queued, events).await?;
+        run_prompt_streaming(backend, terminal, app, options, &queued, None, events).await?;
     }
     Ok(())
 }
@@ -1514,6 +1899,7 @@ fn handle_streaming_event(
     quit_bindings: &[KeyBinding],
     interrupt_bindings: &[KeyBinding],
     follow_up_bindings: &[KeyBinding],
+    dequeue_bindings: &[KeyBinding],
     newline_bindings: &[KeyBinding],
     abort_controller: &AgentAbortController,
     app: &mut TuiApp,
@@ -1522,6 +1908,15 @@ fn handle_streaming_event(
         return StreamingEventOutcome {
             interrupted: false,
             ui_changed: handle_mouse_history_event(app, mouse),
+            force_exit: false,
+        };
+    }
+
+    if let Event::Paste(pasted) = event {
+        handle_paste_event(app, pasted);
+        return StreamingEventOutcome {
+            interrupted: false,
+            ui_changed: true,
             force_exit: false,
         };
     }
@@ -1557,7 +1952,9 @@ fn handle_streaming_event(
         };
     }
 
-    if matches_keybinding(follow_up_bindings, key) {
+    let plain_enter_during_streaming =
+        key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE;
+    if matches_keybinding(follow_up_bindings, key) || plain_enter_during_streaming {
         let queued = app.input.trim().to_string();
         if queued.is_empty() {
             return StreamingEventOutcome::default();
@@ -1572,6 +1969,19 @@ fn handle_streaming_event(
             ui_changed: true,
             force_exit: false,
         };
+    }
+
+    if matches_keybinding(dequeue_bindings, key) {
+        if let Some(count) = app.dequeue_follow_ups_to_editor() {
+            let label = if count == 1 { "message" } else { "messages" };
+            app.status = format!("editing {count} queued {label}");
+            return StreamingEventOutcome {
+                interrupted: false,
+                ui_changed: true,
+                force_exit: false,
+            };
+        }
+        return StreamingEventOutcome::default();
     }
 
     if matches_keybinding(newline_bindings, key) {
@@ -1628,22 +2038,34 @@ fn is_force_exit_signal(error: &str) -> bool {
 
 fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     let input_prompt = options.theme.input_prompt();
-    let input_height = input_area_height(app, frame.area(), input_prompt);
+    let footer_height = status_bar_height().min(frame.area().height.saturating_sub(1).max(1));
+    let desired_steering_height = steering_panel_height(app);
+    let steering_height = desired_steering_height.min(
+        frame.area()
+            .height
+            .saturating_sub(footer_height)
+            .saturating_sub(1),
+    );
+    let reserved_height = footer_height.saturating_add(steering_height);
+    let input_height = input_area_height(app, frame.area(), input_prompt, reserved_height);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(steering_height),
             Constraint::Length(input_height),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
 
     let transcript_area = areas[0];
-    let input_area = areas[1];
-    let footer_area = areas[2];
+    let steering_area = areas[1];
+    let input_area = areas[2];
+    let footer_area = areas[3];
 
     let visible_lines = visible_transcript_lines(
         &app.transcript,
+        &[],
         transcript_area.height.saturating_sub(2) as usize,
         transcript_area.width.saturating_sub(2) as usize,
         app.show_tool_results,
@@ -1656,10 +2078,19 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         .block(
             Block::default()
                 .borders(Borders::NONE)
-                .title(format!("Welcome to {} Chat", options.app_name)),
+                .title(transcript_title(options.app_name.as_str(), options.version.as_str())),
         )
         .style(options.theme.transcript_style());
     frame.render_widget(transcript, transcript_area);
+
+    if steering_height > 0 {
+        let steering = Paragraph::new(render_steering_panel_lines(
+            app,
+            steering_area.width as usize,
+        ))
+        .style(options.theme.transcript_style());
+        frame.render_widget(steering, steering_area);
+    }
 
     let input_scroll = input_scroll_offset(app, input_area, input_prompt);
     let input_text = format!("{input_prompt}{}", app.input);
@@ -1674,7 +2105,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         .style(options.theme.input_style());
     frame.render_widget(input, input_area);
 
-    if !app.show_help {
+    if !app.show_help && !app.has_resume_picker() {
         let (cursor_x, cursor_y) = input_cursor_position(app, input_area, input_prompt);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
@@ -1704,6 +2135,10 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             Line::from(format!(
                 "  {:<14} toggle tool output",
                 keybinding_label(&options.keybindings.expand_tools)
+            )),
+            Line::from(format!(
+                "  {:<14} edit queued follow-ups",
+                keybinding_label(&options.keybindings.dequeue)
             )),
             Line::from(format!(
                 "  {:<14} cycle thinking level (mapped)",
@@ -1763,6 +2198,47 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         .style(options.theme.help_style())
         .wrap(Wrap { trim: false });
         frame.render_widget(help, popup);
+    } else if let Some(picker) = app.resume_picker.as_ref() {
+        let popup = centered_rect(88, 50, frame.area());
+        frame.render_widget(Clear, popup);
+
+        let mut lines = vec![
+            Line::from("Select a session to resume"),
+            Line::from("Up/Down to move, Enter to resume, Esc to cancel"),
+            Line::from(""),
+        ];
+
+        for (index, candidate) in picker.candidates.iter().enumerate() {
+            let indicator = if index == picker.selected { ">" } else { " " };
+            let label = format!(
+                "{indicator} {:>2}. {} ({})",
+                index + 1,
+                candidate.title,
+                candidate.updated_at
+            );
+            let line = if index == picker.selected {
+                Line::from(label).style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                Line::from(label)
+            };
+            lines.push(line);
+        }
+
+        if let Some(latest) = picker.candidates.first() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("0 means latest: {}", latest.title)));
+        }
+
+        let picker_popup = Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title("Resume Session")
+                    .borders(Borders::ALL)
+                    .border_style(options.theme.help_border_style()),
+            )
+            .style(options.theme.help_style())
+            .wrap(Wrap { trim: false });
+        frame.render_widget(picker_popup, popup);
     }
 }
 
@@ -1854,7 +2330,7 @@ fn input_cursor_row_col(
     (row, col)
 }
 
-fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str) -> u16 {
+fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str, footer_height: u16) -> u16 {
     // Input block has top+bottom borders only.
     let inner_width = frame_area.width as usize;
     let display_input = format!("{input_prompt}{}", app.input);
@@ -1863,9 +2339,17 @@ fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str) -> u16 
         .max(1);
     let desired_height = line_count.saturating_add(2) as u16;
 
-    let max_height = frame_area.height.saturating_sub(2).max(1);
+    let max_height = frame_area.height.saturating_sub(footer_height).max(1);
     let min_height = 3u16.min(max_height);
     desired_height.max(min_height).min(max_height)
+}
+
+fn status_bar_height() -> u16 {
+    2
+}
+
+fn steering_panel_height(app: &TuiApp) -> u16 {
+    app.steering_status_lines().len().min(u16::MAX as usize) as u16
 }
 
 fn render_status_bar_lines(app: &TuiApp, width: usize) -> Text<'static> {
@@ -1881,6 +2365,28 @@ fn render_status_bar_lines(app: &TuiApp, width: usize) -> Text<'static> {
     let bottom =
         compose_left_right_status_line(app.status_left.as_str(), app.status_right.as_str(), width);
     Text::from(vec![Line::from(top), Line::from(bottom)])
+}
+
+fn render_steering_panel_lines(app: &TuiApp, width: usize) -> Text<'static> {
+    Text::from(
+        app.steering_status_lines()
+            .into_iter()
+            .map(|line| Line::from(right_align_status_line(line.as_str(), width)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn right_align_status_line(line: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let line_width = UnicodeWidthStr::width(line);
+    if line_width >= width {
+        return line.to_string();
+    }
+
+    format!("{}{}", " ".repeat(width - line_width), line)
 }
 
 fn compose_left_right_status_line(left: &str, right: &str, width: usize) -> String {
@@ -2202,6 +2708,7 @@ struct TerminalCapabilities {
 struct TerminalRestore {
     keyboard_enhancement_enabled: bool,
     mouse_capture_enabled: bool,
+    bracketed_paste_enabled: bool,
     selection_colors_applied: bool,
 }
 
@@ -2214,6 +2721,9 @@ impl Drop for TerminalRestore {
         if self.selection_colors_applied {
             reset_selection_osc_colors();
         }
+        if self.bracketed_paste_enabled {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+        }
         if self.mouse_capture_enabled {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
@@ -2222,1083 +2732,5 @@ impl Drop for TerminalRestore {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-
-    use pixy_agent_core::AgentAbortSignal;
-
-    use super::*;
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    fn mouse_scroll_event(kind: crossterm::event::MouseEventKind) -> crossterm::event::MouseEvent {
-        crossterm::event::MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
-    struct TestBackend {
-        resume_result: Result<Option<String>, String>,
-        resume_targets: Vec<Option<String>>,
-    }
-
-    impl TuiBackend for TestBackend {
-        fn prompt<'a>(&'a mut self, _input: &'a str) -> BackendFuture<'a> {
-            Box::pin(async { Ok(vec![]) })
-        }
-
-        fn continue_run<'a>(&'a mut self) -> BackendFuture<'a> {
-            Box::pin(async { Ok(vec![]) })
-        }
-
-        fn prompt_stream<'a>(
-            &'a mut self,
-            _input: &'a str,
-            _abort_signal: Option<AgentAbortSignal>,
-            _on_update: &'a mut dyn FnMut(StreamUpdate),
-        ) -> BackendFuture<'a> {
-            Box::pin(async { Ok(vec![]) })
-        }
-
-        fn continue_run_stream<'a>(
-            &'a mut self,
-            _abort_signal: Option<AgentAbortSignal>,
-            _on_update: &'a mut dyn FnMut(StreamUpdate),
-        ) -> BackendFuture<'a> {
-            Box::pin(async { Ok(vec![]) })
-        }
-
-        fn resume_session(&mut self, session_ref: Option<&str>) -> Result<Option<String>, String> {
-            self.resume_targets.push(session_ref.map(ToOwned::to_owned));
-            self.resume_result.clone()
-        }
-
-        fn session_file(&self) -> Option<PathBuf> {
-            None
-        }
-    }
-
-    #[test]
-    fn default_keybindings_match_expected_keys() {
-        let bindings = TuiKeyBindings::default();
-        assert_eq!(
-            bindings.submit,
-            vec![KeyBinding {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE
-            }]
-        );
-        assert_eq!(
-            bindings.clear,
-            vec![KeyBinding {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-        assert_eq!(
-            bindings.expand_tools,
-            vec![KeyBinding {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-        assert_eq!(
-            bindings.continue_run,
-            vec![KeyBinding {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::ALT
-            }]
-        );
-        assert_eq!(
-            bindings.toggle_thinking,
-            vec![KeyBinding {
-                code: KeyCode::Char('t'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-        assert_eq!(
-            bindings.interrupt,
-            vec![KeyBinding {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE
-            }]
-        );
-        assert_eq!(
-            bindings.cycle_thinking_level,
-            vec![KeyBinding {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::SHIFT
-            }]
-        );
-        assert_eq!(
-            bindings.cycle_model_forward,
-            vec![KeyBinding {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-        assert_eq!(
-            bindings.cycle_model_backward,
-            vec![KeyBinding {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT
-            }]
-        );
-        assert_eq!(
-            bindings.select_model,
-            vec![KeyBinding {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-        assert_eq!(
-            bindings.quit,
-            vec![KeyBinding {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL
-            }]
-        );
-    }
-
-    #[test]
-    fn parse_key_id_supports_common_shortcuts() {
-        assert_eq!(
-            parse_key_id("ctrl+o"),
-            Some(KeyBinding {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL
-            })
-        );
-        assert_eq!(
-            parse_key_id("shift+tab"),
-            Some(KeyBinding {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::SHIFT
-            })
-        );
-        assert_eq!(
-            parse_key_id("shift+ctrl+p"),
-            Some(KeyBinding {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::SHIFT | KeyModifiers::CONTROL
-            })
-        );
-        assert_eq!(
-            parse_key_id("esc"),
-            Some(KeyBinding {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE
-            })
-        );
-        assert_eq!(parse_key_id(""), None);
-        assert_eq!(parse_key_id("ctrl+unknown"), None);
-    }
-
-    #[test]
-    fn editor_supports_common_emacs_shortcuts() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.input = "hello rust world".to_string();
-        app.cursor_pos = app.input_char_count();
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
-        ));
-        assert_eq!(app.input, "hello rust ");
-        assert_eq!(app.cursor_pos, "hello rust ".chars().count());
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-        ));
-        assert_eq!(app.cursor_pos, 0);
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-        ));
-        assert_eq!(app.cursor_pos, app.input_char_count());
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-        ));
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor_pos, 0);
-    }
-
-    #[test]
-    fn editing_input_resets_transcript_scroll_to_latest() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.scroll_transcript_up(8);
-        assert_eq!(app.transcript_scroll_from_bottom, 8);
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-        ));
-        assert_eq!(app.transcript_scroll_from_bottom, 0);
-    }
-
-    #[test]
-    fn shift_enter_inserts_newline_and_moves_cursor_to_next_input_row() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.input = "hello".to_string();
-        app.cursor_pos = app.input_char_count();
-
-        assert!(handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-        ));
-        assert_eq!(app.input, "hello\n");
-        assert_eq!(app.cursor_pos, "hello\n".chars().count());
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 4,
-        };
-        assert_eq!(input_cursor_position(&app, area, "› "), (0, 2));
-    }
-
-    #[test]
-    fn input_area_height_grows_and_shrinks_with_multiline_input() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        let frame = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 24,
-        };
-        assert_eq!(input_area_height(&app, frame, "› "), 3);
-
-        app.input = "line 1\nline 2".to_string();
-        assert_eq!(input_area_height(&app, frame, "› "), 4);
-
-        app.input = "line 1".to_string();
-        assert_eq!(input_area_height(&app, frame, "› "), 3);
-    }
-
-    #[test]
-    fn up_down_keys_navigate_input_history() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.record_input_history("first");
-        app.record_input_history("second");
-        app.input = "draft".to_string();
-        app.cursor_pos = app.input_char_count();
-
-        assert!(handle_input_history_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-        ));
-        assert_eq!(app.input, "draft");
-        assert_eq!(app.cursor_pos, 0);
-
-        assert!(handle_input_history_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-        ));
-        assert_eq!(app.input, "second");
-        assert_eq!(app.cursor_pos, app.input_char_count());
-
-        app.move_cursor_home();
-        assert!(handle_input_history_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-        ));
-        assert_eq!(app.input, "second");
-        assert_eq!(app.cursor_pos, app.input_char_count());
-
-        assert!(handle_input_history_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-        ));
-        assert_eq!(app.input, "draft");
-        assert_eq!(app.cursor_pos, app.input_char_count());
-    }
-
-    #[test]
-    fn mouse_scroll_navigates_input_history_like_up_down() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.record_input_history("first");
-        app.record_input_history("second");
-        app.input = "draft".to_string();
-        app.cursor_pos = app.input_char_count();
-
-        assert!(handle_mouse_history_event(
-            &mut app,
-            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollUp),
-        ));
-        assert_eq!(app.input, "second");
-
-        assert!(handle_mouse_history_event(
-            &mut app,
-            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollUp),
-        ));
-        assert_eq!(app.input, "first");
-
-        assert!(handle_mouse_history_event(
-            &mut app,
-            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollDown),
-        ));
-        assert_eq!(app.input, "second");
-
-        assert!(handle_mouse_history_event(
-            &mut app,
-            mouse_scroll_event(crossterm::event::MouseEventKind::ScrollDown),
-        ));
-        assert_eq!(app.input, "draft");
-    }
-
-    #[test]
-    fn input_history_is_persisted_and_restored_with_ring_buffer_limit() {
-        let history_file = std::env::temp_dir().join(format!(
-            "pi-tui-history-{}-{}.jsonl",
-            std::process::id(),
-            now_millis()
-        ));
-        let _ = fs::remove_file(&history_file);
-
-        let store = InputHistoryStore::new(history_file.clone(), 3);
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.set_input_history_store(Some(store.clone()));
-        app.record_input_history("first");
-        app.record_input_history("second");
-        app.record_input_history("third");
-        app.record_input_history("fourth");
-
-        let persisted = fs::read_to_string(&history_file).expect("history file should exist");
-        assert_eq!(persisted.lines().count(), 3);
-
-        let mut restored = TuiApp::new("ready".to_string(), true, false);
-        restored.set_input_history_store(Some(store));
-        assert_eq!(
-            restored.input_history,
-            vec![
-                "second".to_string(),
-                "third".to_string(),
-                "fourth".to_string(),
-            ]
-        );
-
-        let _ = fs::remove_file(&history_file);
-    }
-
-    #[test]
-    fn input_cursor_position_uses_display_width_for_cjk() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.input = "你a".to_string();
-        app.cursor_pos = 1;
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 3,
-        };
-
-        assert_eq!(input_cursor_position(&app, area, "› "), (4, 1));
-
-        app.cursor_pos = 2;
-        assert_eq!(input_cursor_position(&app, area, "› "), (5, 1));
-    }
-
-    #[test]
-    fn input_cursor_starts_after_default_prompt_prefix() {
-        let app = TuiApp::new("ready".to_string(), true, false);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 3,
-        };
-
-        assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
-    }
-
-    #[test]
-    fn backspace_at_input_start_keeps_prompt_visible() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        assert!(!handle_editor_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-        ));
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor_pos, 0);
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 3,
-        };
-        assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
-    }
-
-    #[test]
-    fn visible_transcript_picks_latest_lines() {
-        let lines = vec![
-            TranscriptLine::new("l1".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("l2".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("l3".to_string(), TranscriptLineKind::Thinking),
-            TranscriptLine::new("l4".to_string(), TranscriptLineKind::Normal),
-        ];
-        let visible = visible_transcript_lines(&lines, 2, 80, true, true, None, 0, TuiTheme::Dark);
-        assert_eq!(visible.len(), 2);
-        assert!(line_text(&visible[0]).trim().is_empty());
-        assert!(line_text(&visible[1]).starts_with("l4"));
-    }
-
-    #[test]
-    fn visible_transcript_uses_single_spacing_before_tool_block() {
-        let lines = vec![
-            TranscriptLine::new("normal".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("tool".to_string(), TranscriptLineKind::Tool),
-        ];
-        let visible = visible_transcript_lines(&lines, 10, 80, true, true, None, 0, TuiTheme::Dark);
-        assert_eq!(visible.len(), 3);
-        assert!(line_text(&visible[0]).starts_with("normal"));
-        assert!(line_text(&visible[1]).trim().is_empty());
-        assert!(line_text(&visible[2]).starts_with("tool"));
-    }
-
-    #[test]
-    fn visible_transcript_reuses_existing_block_padding_when_present() {
-        let lines = vec![
-            TranscriptLine::new(String::new(), TranscriptLineKind::UserInput),
-            TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput),
-            TranscriptLine::new(String::new(), TranscriptLineKind::UserInput),
-            TranscriptLine::new("reply".to_string(), TranscriptLineKind::Normal),
-        ];
-        let visible = visible_transcript_lines(&lines, 10, 80, true, true, None, 0, TuiTheme::Dark);
-        assert_eq!(visible.len(), 5);
-        assert!(line_text(&visible[0]).trim().is_empty());
-        assert!(line_text(&visible[1]).starts_with("hello"));
-        assert!(line_text(&visible[2]).trim().is_empty());
-        assert!(line_text(&visible[3]).trim().is_empty());
-        assert!(line_text(&visible[4]).starts_with("reply"));
-    }
-
-    #[test]
-    fn visible_transcript_respects_tool_and_thinking_toggles() {
-        let lines = vec![
-            TranscriptLine::new("normal".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("tool".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("thinking".to_string(), TranscriptLineKind::Thinking),
-        ];
-        let visible =
-            visible_transcript_lines(&lines, 10, 80, false, false, None, 0, TuiTheme::Dark);
-        assert_eq!(visible.len(), 1);
-        assert!(line_text(&visible[0]).starts_with("normal"));
-    }
-
-    #[test]
-    fn visible_transcript_appends_working_line() {
-        let lines = vec![TranscriptLine::new(
-            "normal".to_string(),
-            TranscriptLineKind::Normal,
-        )];
-        let visible = visible_transcript_lines(
-            &lines,
-            10,
-            80,
-            true,
-            true,
-            Some(TranscriptLine::new(
-                "[-] pi is working...".to_string(),
-                TranscriptLineKind::Working,
-            )),
-            0,
-            TuiTheme::Dark,
-        );
-        assert_eq!(visible.len(), 3);
-        assert!(line_text(&visible[0]).starts_with("normal"));
-        assert!(line_text(&visible[1]).trim().is_empty());
-        assert_eq!(visible[2].spans[0].content, "[-] pi is working...");
-    }
-
-    #[test]
-    fn working_line_includes_elapsed_and_interrupt_hint_when_running_tool() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.start_working("• Ran read".to_string());
-
-        let working = app
-            .working_line()
-            .expect("working line should be present while working");
-
-        assert!(working.text.contains("• Ran read"));
-        assert!(working.text.contains("s •"));
-        assert!(working.text.contains("to interrupt"));
-    }
-
-    #[test]
-    fn status_bar_shows_elapsed_and_interrupt_hint_while_working() {
-        let mut app = TuiApp::new("pi is working...".to_string(), true, false);
-        app.start_working("pi is working...".to_string());
-
-        let status = render_status_bar_lines(&app, 120);
-        let top = line_text(&status.lines[0]);
-
-        assert!(top.contains("pi is working..."));
-        assert!(top.contains("s •"));
-        assert!(top.contains("to interrupt"));
-    }
-
-    #[test]
-    fn working_line_formats_elapsed_time_as_minutes_and_seconds() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.start_working("Checking file git status flags".to_string());
-        app.working_started_at = Some(Instant::now() - Duration::from_secs(510));
-
-        let working = app
-            .working_line()
-            .expect("working line should be present while working");
-
-        assert!(working.text.contains("(8m 30s •"));
-    }
-
-    #[test]
-    fn working_line_marquee_highlights_four_chars_and_rotates() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.start_working("Checking file git status flags".to_string());
-        app.working_tick = 0;
-
-        let line0 = app
-            .working_line()
-            .expect("working line should be present")
-            .to_line(200, TuiTheme::Dark);
-        assert!(
-            line0.spans.iter().any(|span| {
-                span.content.contains("Chec")
-                    && span.style.fg == Some(Color::White)
-                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
-            }),
-            "tick=0 should highlight first 4 chars with white-on-black"
-        );
-        assert!(
-            line0.spans.iter().any(|span| {
-                span.style.fg == Some(Color::Rgb(148, 150, 153))
-                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
-            }),
-            "non-highlight text should use gray-on-black"
-        );
-
-        app.working_tick = 1;
-        let line1 = app
-            .working_line()
-            .expect("working line should be present")
-            .to_line(200, TuiTheme::Dark);
-        assert!(
-            line1.spans.iter().any(|span| {
-                span.content.contains("heck")
-                    && span.style.fg == Some(Color::White)
-                    && span.style.bg == Some(Color::Rgb(40, 44, 52))
-            }),
-            "tick=1 should move highlight window forward by one char"
-        );
-    }
-
-    #[test]
-    fn working_line_marquee_uses_light_theme_colors() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.start_working("Checking file git status flags".to_string());
-
-        let line = app
-            .working_line()
-            .expect("working line should be present")
-            .to_line(200, TuiTheme::Light);
-
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.style.bg == Some(Color::Rgb(208, 208, 224))),
-            "light theme should use configured working background"
-        );
-        assert!(
-            line.spans.iter().any(|span| {
-                span.content.contains("Chec") && span.style.fg == Some(Color::Black)
-            }),
-            "highlight text should use light theme highlight color"
-        );
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.style.fg == Some(Color::Rgb(108, 108, 108))),
-            "non-highlight text should use light theme working text color"
-        );
-    }
-
-    #[test]
-    fn visible_transcript_wraps_and_keeps_latest_at_bottom() {
-        let lines = vec![
-            TranscriptLine::new("old".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("abcdefghijklm".to_string(), TranscriptLineKind::Normal),
-        ];
-
-        let visible = visible_transcript_lines(&lines, 2, 4, true, true, None, 0, TuiTheme::Dark);
-        assert_eq!(visible.len(), 2);
-        assert!(line_text(&visible[0]).starts_with("ijkl"));
-        assert!(line_text(&visible[1]).starts_with("m"));
-    }
-
-    #[test]
-    fn visible_transcript_supports_scrolling_up_from_bottom() {
-        let lines = vec![
-            TranscriptLine::new("line 1".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("line 2".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("line 3".to_string(), TranscriptLineKind::Normal),
-            TranscriptLine::new("line 4".to_string(), TranscriptLineKind::Normal),
-        ];
-
-        let bottom = visible_transcript_lines(&lines, 2, 80, true, true, None, 0, TuiTheme::Dark);
-        assert_eq!(bottom.len(), 2);
-        assert!(line_text(&bottom[0]).starts_with("line 3"));
-        assert!(line_text(&bottom[1]).starts_with("line 4"));
-
-        let scrolled = visible_transcript_lines(&lines, 2, 80, true, true, None, 1, TuiTheme::Dark);
-        assert_eq!(scrolled.len(), 2);
-        assert!(line_text(&scrolled[0]).starts_with("line 2"));
-        assert!(line_text(&scrolled[1]).starts_with("line 3"));
-    }
-
-    #[test]
-    fn tool_output_is_compacted_with_omitted_line_marker() {
-        let lines = vec![
-            TranscriptLine::new(
-                "• Ran bash -lc 'cargo test'".to_string(),
-                TranscriptLineKind::Tool,
-            ),
-            TranscriptLine::new("line 1".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("line 2".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("line 3".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("line 4".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("line 5".to_string(), TranscriptLineKind::Tool),
-            TranscriptLine::new("line 6".to_string(), TranscriptLineKind::Tool),
-        ];
-
-        let visible =
-            visible_transcript_lines(&lines, 20, 120, true, true, None, 0, TuiTheme::Dark);
-        let texts = visible.iter().map(line_text).collect::<Vec<_>>();
-        assert!(texts.iter().any(|line| line.contains("• Ran bash -lc")));
-        assert!(texts.iter().any(|line| line.contains("… +3 lines")));
-        assert!(texts.iter().any(|line| line.contains("line 6")));
-    }
-
-    #[test]
-    fn multiline_tool_update_is_split_and_compacted() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.apply_stream_update(StreamUpdate::ToolLine(
-            "• Ran read /tmp/example.txt".to_string(),
-        ));
-        app.apply_stream_update(StreamUpdate::ToolLine(
-            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string(),
-        ));
-
-        let visible = visible_transcript_lines(
-            &app.transcript,
-            20,
-            120,
-            true,
-            true,
-            None,
-            0,
-            TuiTheme::Dark,
-        );
-        let texts = visible.iter().map(line_text).collect::<Vec<_>>();
-        assert!(
-            texts
-                .iter()
-                .any(|line| line.contains("• Ran read /tmp/example.txt"))
-        );
-        assert!(texts.iter().any(|line| line.contains("… +3 lines")));
-        assert!(texts.iter().any(|line| line.contains("line 6")));
-    }
-
-    #[test]
-    fn tool_diff_lines_use_expected_colors() {
-        let removed = TranscriptLine::new("- old assertion".to_string(), TranscriptLineKind::Tool)
-            .to_line(40, TuiTheme::Dark);
-        let added = TranscriptLine::new("+ new assertion".to_string(), TranscriptLineKind::Tool)
-            .to_line(40, TuiTheme::Dark);
-        assert_eq!(removed.spans[0].style.fg, Some(Color::Red));
-        assert_eq!(added.spans[0].style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn tool_diff_stat_line_colors_plus_and_minus_segments() {
-        let line = TranscriptLine::new(
-            "crates/pixy-coding-agent/tests/tools.rs | 124 ++++++++++---------".to_string(),
-            TranscriptLineKind::Tool,
-        )
-        .to_line(80, TuiTheme::Dark);
-
-        let plus_span = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains('+'))
-            .expect("plus span");
-        let minus_span = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains('-'))
-            .expect("minus span");
-        assert_eq!(plus_span.style.fg, Some(Color::Green));
-        assert_eq!(minus_span.style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn tool_lines_keep_default_background_and_use_light_text() {
-        let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
-            .to_line(40, TuiTheme::Dark);
-        assert_eq!(tool.spans[0].style.fg, Some(Color::Gray));
-        assert_eq!(tool.spans[0].style.bg, None);
-    }
-
-    #[test]
-    fn user_input_line_uses_input_block_background_from_theme() {
-        let input = TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput)
-            .to_line(40, TuiTheme::Dark);
-        assert_eq!(input.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
-    }
-
-    #[test]
-    fn format_user_input_line_prefixes_prompt() {
-        assert_eq!(format_user_input_line("hello", "› "), "› hello");
-        assert_eq!(
-            format_user_input_line("this is second question", "pi> "),
-            "pi> this is second question"
-        );
-    }
-
-    #[test]
-    fn push_user_input_line_wraps_content_with_blank_padding_lines() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.push_user_input_line("hello".to_string());
-
-        assert_eq!(app.transcript.len(), 3);
-        assert_eq!(app.transcript[0].text, "");
-        assert_eq!(app.transcript[0].kind, TranscriptLineKind::UserInput);
-        assert_eq!(app.transcript[1].text, "hello");
-        assert_eq!(app.transcript[1].kind, TranscriptLineKind::UserInput);
-        assert_eq!(app.transcript[2].text, "");
-        assert_eq!(app.transcript[2].kind, TranscriptLineKind::UserInput);
-    }
-
-    #[test]
-    fn parse_tui_theme_names_case_insensitive() {
-        assert_eq!(TuiTheme::from_name("dark"), Some(TuiTheme::Dark));
-        assert_eq!(TuiTheme::from_name("LIGHT"), Some(TuiTheme::Light));
-        assert_eq!(TuiTheme::from_name(""), None);
-        assert_eq!(TuiTheme::from_name("solarized"), None);
-    }
-
-    #[test]
-    fn dark_theme_selection_osc_sequence_is_white_bg_black_fg() {
-        assert_eq!(
-            selection_osc_set_sequence(TuiTheme::Dark),
-            Some("\u{1b}]17;#ffffff\u{7}\u{1b}]19;#000000\u{7}".to_string())
-        );
-    }
-
-    #[test]
-    fn selection_osc_reset_sequence_resets_both_colors() {
-        assert_eq!(
-            selection_osc_reset_sequence(),
-            "\u{1b}]117;\u{7}\u{1b}]119;\u{7}"
-        );
-    }
-
-    #[test]
-    fn dark_theme_selection_osc_sequences_include_rgb_and_st_variants() {
-        let sequences =
-            selection_osc_set_sequences(TuiTheme::Dark, TerminalCapabilities::default())
-                .expect("dark theme should provide selection sequences");
-        assert!(
-            sequences
-                .iter()
-                .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{7}"))
-        );
-        assert!(
-            sequences
-                .iter()
-                .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{1b}\\"))
-        );
-    }
-
-    #[test]
-    fn selection_osc_sequences_are_wrapped_for_tmux() {
-        let sequences = selection_osc_set_sequences(
-            TuiTheme::Dark,
-            TerminalCapabilities {
-                multiplexer: Some(TerminalMultiplexer::Tmux),
-                ..TerminalCapabilities::default()
-            },
-        )
-        .expect("dark theme should provide selection sequences");
-        assert!(
-            sequences
-                .iter()
-                .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
-        );
-    }
-
-    #[test]
-    fn selection_osc_reset_sequences_are_wrapped_for_tmux() {
-        let sequences = selection_osc_reset_sequences(TerminalCapabilities {
-            multiplexer: Some(TerminalMultiplexer::Tmux),
-            ..TerminalCapabilities::default()
-        });
-        assert!(
-            sequences
-                .iter()
-                .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
-        );
-    }
-
-    #[test]
-    fn light_theme_uses_light_palette_for_tokens_and_tool_lines() {
-        let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
-            .to_line(40, TuiTheme::Light);
-        assert_eq!(tool.spans[0].style.fg, Some(Color::Rgb(108, 108, 108)));
-
-        let line = TranscriptLine::new(
-            "See crates/pixy-tui/src/lib.rs:902 and PageUp".to_string(),
-            TranscriptLineKind::Normal,
-        )
-        .to_line(80, TuiTheme::Light);
-
-        assert!(
-            line.spans.iter().any(|span| {
-                span.content.contains("crates/pixy-tui/src/lib.rs:902")
-                    && span.style.fg == Some(Color::Rgb(84, 125, 167))
-            }),
-            "file path token should be highlighted in light theme"
-        );
-        assert!(
-            line.spans.iter().any(|span| span.content.contains("PageUp")
-                && span.style.fg == Some(Color::Rgb(90, 128, 128))),
-            "PageUp token should be highlighted in light theme"
-        );
-    }
-
-    #[test]
-    fn highlights_file_path_and_key_tokens() {
-        let line = TranscriptLine::new(
-            "See crates/pixy-tui/src/lib.rs:902 and PageUp / PageDown".to_string(),
-            TranscriptLineKind::Normal,
-        )
-        .to_line(80, TuiTheme::Dark);
-
-        assert!(
-            line.spans.iter().any(|span| {
-                span.content.contains("crates/pixy-tui/src/lib.rs:902")
-                    && span.style.fg == Some(Color::Cyan)
-            }),
-            "file path token should be highlighted"
-        );
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("PageUp")
-                    && span.style.fg == Some(Color::LightYellow)),
-            "PageUp token should be highlighted"
-        );
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("PageDown")
-                    && span.style.fg == Some(Color::LightYellow)),
-            "PageDown token should be highlighted"
-        );
-    }
-
-    #[test]
-    fn parse_tool_name_extracts_name_from_tool_header() {
-        assert_eq!(parse_tool_name("[tool:read:ok]"), Some("read"));
-        assert_eq!(parse_tool_name("• Ran bash -lc 'cargo test'"), Some("bash"));
-        assert_eq!(parse_tool_name("tool output line"), None);
-    }
-
-    #[test]
-    fn transcript_module_exposes_tool_helpers() {
-        assert!(crate::transcript::is_tool_run_line("• Ran read /tmp/file"));
-        assert_eq!(
-            crate::transcript::parse_tool_name("[tool:write:error]"),
-            Some("write")
-        );
-    }
-
-    #[test]
-    fn apply_stream_update_normalizes_legacy_tool_header_to_ran_title() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.apply_stream_update(StreamUpdate::ToolLine("[tool:read:ok]".to_string()));
-        assert_eq!(app.transcript.len(), 1);
-        assert_eq!(app.transcript[0].text, "• Ran read");
-    }
-
-    #[tokio::test]
-    async fn slash_resume_command_updates_status_when_backend_supports_resume() {
-        let mut backend = TestBackend {
-            resume_result: Ok(Some("session: /tmp/resumed.jsonl".to_string())),
-            resume_targets: vec![],
-        };
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-
-        let handled = handle_slash_command("/resume old-session", &mut backend, &mut app)
-            .await
-            .expect("resume command should not error");
-
-        assert!(handled);
-        assert_eq!(
-            backend.resume_targets,
-            vec![Some("old-session".to_string())]
-        );
-        assert_eq!(app.status, "session: /tmp/resumed.jsonl");
-    }
-
-    #[tokio::test]
-    async fn slash_resume_command_renders_resume_error() {
-        let mut backend = TestBackend {
-            resume_result: Err("boom".to_string()),
-            resume_targets: vec![],
-        };
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-
-        let handled = handle_slash_command("/resume", &mut backend, &mut app)
-            .await
-            .expect("resume command should be handled");
-
-        assert!(handled);
-        assert_eq!(backend.resume_targets, vec![None]);
-        assert_eq!(app.status, "resume failed: boom");
-        assert!(
-            app.transcript
-                .iter()
-                .any(|line| line.text == "[resume_error] boom"
-                    && line.kind == TranscriptLineKind::Normal),
-            "resume error should be appended to transcript"
-        );
-    }
-
-    #[test]
-    fn streaming_follow_up_key_queues_input_and_clears_editor() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        app.input = "next question".to_string();
-        let quit = vec![KeyBinding {
-            code: KeyCode::Char('d'),
-            modifiers: KeyModifiers::CONTROL,
-        }];
-        let interrupt = vec![KeyBinding {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
-        }];
-        let follow_up = vec![KeyBinding {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::ALT,
-        }];
-        let abort_controller = AgentAbortController::new();
-
-        let outcome = handle_streaming_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
-            &quit,
-            &interrupt,
-            &follow_up,
-            &[],
-            &abort_controller,
-            &mut app,
-        );
-
-        assert!(!outcome.interrupted);
-        assert!(outcome.ui_changed);
-        assert!(!outcome.force_exit);
-        assert!(app.input.is_empty());
-        assert_eq!(app.input_history, vec!["next question".to_string()]);
-        assert_eq!(app.queued_follow_up_count(), 1);
-        assert_eq!(app.status, "queued follow-up (1)");
-    }
-
-    #[test]
-    fn streaming_follow_up_key_does_not_queue_empty_input() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        let quit = vec![KeyBinding {
-            code: KeyCode::Char('d'),
-            modifiers: KeyModifiers::CONTROL,
-        }];
-        let interrupt = vec![KeyBinding {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
-        }];
-        let follow_up = vec![KeyBinding {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::ALT,
-        }];
-        let abort_controller = AgentAbortController::new();
-
-        let outcome = handle_streaming_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
-            &quit,
-            &interrupt,
-            &follow_up,
-            &[],
-            &abort_controller,
-            &mut app,
-        );
-
-        assert!(!outcome.interrupted);
-        assert!(!outcome.ui_changed);
-        assert!(!outcome.force_exit);
-        assert_eq!(app.queued_follow_up_count(), 0);
-        assert_eq!(app.status, "ready");
-    }
-
-    #[test]
-    fn streaming_ctrl_d_sets_force_exit_status() {
-        let mut app = TuiApp::new("ready".to_string(), true, false);
-        let quit = vec![KeyBinding {
-            code: KeyCode::Char('d'),
-            modifiers: KeyModifiers::CONTROL,
-        }];
-        let interrupt = vec![KeyBinding {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
-        }];
-        let follow_up = vec![KeyBinding {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::ALT,
-        }];
-        let abort_controller = AgentAbortController::new();
-
-        let outcome = handle_streaming_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-            &quit,
-            &interrupt,
-            &follow_up,
-            &[],
-            &abort_controller,
-            &mut app,
-        );
-
-        assert!(!outcome.interrupted);
-        assert!(outcome.ui_changed);
-        assert!(outcome.force_exit);
-        assert_eq!(app.status, FORCE_EXIT_STATUS);
-    }
-
-    #[test]
-    fn welcome_banner_mentions_force_exit_for_quit_key() {
-        let lines = build_welcome_banner(&TuiOptions::default());
-        assert!(
-            lines.iter().any(|line| line.contains("to force exit")),
-            "welcome banner should explicitly advertise force-exit behavior"
-        );
-    }
-}
+#[path = "../tests/unit/lib_unit.rs"]
+mod tests;

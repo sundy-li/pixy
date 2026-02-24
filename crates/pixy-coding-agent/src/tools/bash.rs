@@ -3,13 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
+use pixy_ai::PiAiError;
 use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::bash_command::normalize_nested_bash_lc;
+
 use super::common::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_timeout, get_optional_f64, get_required_string,
-    text_result, truncate_tail, truncated_by_str,
+    invalid_tool_args, text_result, tool_execution_failed, truncate_tail, truncated_by_str,
 };
 
 pub fn create_bash_tool(cwd: impl AsRef<Path>) -> AgentTool {
@@ -18,12 +21,12 @@ pub fn create_bash_tool(cwd: impl AsRef<Path>) -> AgentTool {
         name: "bash".to_string(),
         label: "bash".to_string(),
         description:
-            "Execute a bash command in the workspace cwd and return combined stdout/stderr."
+            "Execute a shell command in the cwd and return combined stdout/stderr. This tool already runs via `bash -lc`."
                 .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Shell command to execute." },
+                "command": { "type": "string", "description": "Shell command to execute (do not prefix with `bash -lc`; the tool already does that)." },
                 "timeout": { "type": "number", "exclusiveMinimum": 0, "description": "Optional timeout in seconds." }
             },
             "required": ["command"],
@@ -44,39 +47,44 @@ impl AgentToolExecutor for BashToolExecutor {
     }
 }
 
-async fn execute_bash_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String> {
+async fn execute_bash_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, PiAiError> {
     if !cwd.exists() {
-        return Err(format!(
+        return Err(tool_execution_failed(format!(
             "Working directory does not exist: {}",
             cwd.display()
-        ));
+        )));
     }
 
     let command = get_required_string(&args, "command")?;
+    let normalized_command = normalize_nested_bash_lc(&command);
     let timeout_seconds = get_optional_f64(&args, "timeout")?;
     if let Some(seconds) = timeout_seconds {
         if seconds <= 0.0 {
-            return Err("`timeout` must be > 0".to_string());
+            return Err(invalid_tool_args("`timeout` must be > 0"));
         }
     }
 
     let mut process = Command::new("bash");
-    process.arg("-lc").arg(command).current_dir(cwd);
+    process
+        .arg("-lc")
+        .arg(normalized_command.as_ref())
+        .current_dir(cwd);
 
     let output = match timeout_seconds {
         Some(seconds) => timeout(Duration::from_secs_f64(seconds), process.output())
             .await
             .map_err(|_| {
-                format!(
+                tool_execution_failed(format!(
                     "Command timed out after {} seconds",
                     format_timeout(seconds)
-                )
+                ))
             })?
-            .map_err(|error| format!("Failed to execute command: {error}"))?,
-        None => process
-            .output()
-            .await
-            .map_err(|error| format!("Failed to execute command: {error}"))?,
+            .map_err(|error| {
+                tool_execution_failed(format!("Failed to execute command: {error}"))
+            })?,
+        None => process.output().await.map_err(|error| {
+            tool_execution_failed(format!("Failed to execute command: {error}"))
+        })?,
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -110,7 +118,7 @@ async fn execute_bash_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, S
         } else {
             output_text.push_str("\n\nCommand exited with unknown status");
         }
-        return Err(output_text);
+        return Err(tool_execution_failed(output_text));
     }
 
     Ok(text_result(

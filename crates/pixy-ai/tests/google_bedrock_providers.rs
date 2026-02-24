@@ -128,6 +128,7 @@ fn google_provider_parses_text_tool_and_usage() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");
@@ -199,6 +200,7 @@ fn bedrock_provider_parses_text_tool_and_usage() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");

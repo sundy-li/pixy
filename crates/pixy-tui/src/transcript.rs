@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::TuiTheme;
+use crate::keybindings::parse_key_id;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptLineKind {
@@ -296,10 +297,10 @@ fn styled_fragment(fragment: &str, is_token: bool, base: Style, theme: TuiTheme)
         return Span::styled(fragment.to_string(), base);
     }
 
-    let style = if is_file_path_token(fragment) {
-        theme.file_path_style(base)
-    } else if is_key_token(fragment) {
+    let style = if is_key_token(fragment) {
         theme.key_token_style(base)
+    } else if is_file_path_token(fragment) {
+        theme.file_path_style(base)
     } else {
         base
     };
@@ -338,17 +339,69 @@ fn is_key_token(token: &str) -> bool {
             )
         })
         .to_ascii_lowercase();
-    if normalized.contains("pageup") || normalized.contains("pagedown") {
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if is_compound_key_token(normalized.as_str()) {
         return true;
     }
-    matches!(
-        normalized.as_str(),
-        "ctrl+a" | "ctrl+e" | "ctrl+w" | "ctrl+u" | "up" | "down"
-    )
+
+    if normalized.len() > 1 && parse_key_id(normalized.as_str()).is_some() {
+        return true;
+    }
+
+    matches!(normalized.as_str(), "up" | "down" | "pageup" | "pagedown")
+}
+
+fn is_compound_key_token(normalized: &str) -> bool {
+    if !normalized.contains('/') {
+        // Highlight generic modifier+key labels like ctrl+c, ctrl+shift+p, shift+tab, alt+enter, etc.
+        // This keeps startup/help shortcut hints visually consistent even when keymaps are customized.
+        return normalized.contains('+') && parse_key_id(normalized).is_some();
+    }
+
+    if normalized.split('/').all(|part| {
+        matches!(
+            part,
+            "up" | "down" | "left" | "right" | "pageup" | "pagedown"
+        )
+    }) {
+        return true;
+    }
+
+    if !normalized.contains('+') {
+        return false;
+    }
+
+    // Support compact forms like ctrl+a/e, where trailing segments inherit modifiers.
+    let mut modifier_prefix: Option<&str> = None;
+    for segment in normalized.split('/') {
+        if segment.is_empty() {
+            return false;
+        }
+
+        if parse_key_id(segment).is_some() {
+            modifier_prefix = segment.rsplit_once('+').map(|(prefix, _)| prefix);
+            continue;
+        }
+
+        let Some(prefix) = modifier_prefix else {
+            return false;
+        };
+        let inherited = format!("{prefix}+{segment}");
+        if parse_key_id(inherited.as_str()).is_none() {
+            return false;
+        }
+    }
+
+    true
 }
 
 pub(crate) fn visible_transcript_lines(
     lines: &[TranscriptLine],
+    supplemental_lines: &[TranscriptLine],
     max_lines: usize,
     max_width: usize,
     show_tool_results: bool,
@@ -372,6 +425,8 @@ pub(crate) fn visible_transcript_lines(
         })
         .cloned()
         .collect::<Vec<_>>();
+
+    filtered.extend(supplemental_lines.iter().cloned());
 
     if let Some(working_line) = working_line {
         filtered.push(working_line);
@@ -496,20 +551,36 @@ fn compact_tool_block(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
         return vec![];
     }
 
-    let mut compacted = Vec::new();
+    let mut compacted: Vec<TranscriptLine> = Vec::new();
     let mut cursor = 0usize;
+    let mut saw_tool_invocation = false;
     while cursor < lines.len() {
         let line = &lines[cursor];
-        if is_tool_run_line(line.text.as_str()) {
-            compacted.push(line.clone());
-            cursor += 1;
+        let tool_title = if is_tool_run_line(line.text.as_str()) {
+            Some(line.text.clone())
         } else if let Some((tool_name, is_error)) = parse_legacy_tool_header(line.text.as_str()) {
             let title = if is_error {
                 format!("• Ran {tool_name} (error)")
             } else {
                 format!("• Ran {tool_name}")
             };
+            Some(title)
+        } else {
+            None
+        };
+
+        if let Some(title) = tool_title {
+            if saw_tool_invocation
+                && compacted
+                    .last()
+                    .map(|last| !last.text.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                compacted.push(TranscriptLine::new(String::new(), TranscriptLineKind::Tool));
+            }
+
             compacted.push(TranscriptLine::new(title, TranscriptLineKind::Tool));
+            saw_tool_invocation = true;
             cursor += 1;
         } else {
             compacted.extend(compact_tool_body_lines(&lines[cursor..]));

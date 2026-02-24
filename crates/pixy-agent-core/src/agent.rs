@@ -1,16 +1,24 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pixy_ai::{Message, Model, UserContent};
 use tokio::sync::Notify;
+use tracing::error;
 
-use crate::agent_loop::{agent_loop, agent_loop_continue};
+use crate::agent_loop::{agent_loop, try_agent_loop_continue};
 use crate::types::{
     AgentAbortController, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
-    AgentRetryConfig, AgentTool, ConvertToLlmFn, StreamFn,
+    AgentRetryConfig, AgentTool, ConvertToLlmFn, IdentityMessageConverter, StreamFn,
 };
+
+const ERR_PROMPT_MESSAGES_EMPTY: &str = "Prompt messages cannot be empty";
+const ERR_NO_MESSAGES_TO_CONTINUE: &str = "No messages to continue from";
+const ERR_CANNOT_CONTINUE_FROM_ASSISTANT: &str = "Cannot continue from message role: assistant";
+const ERR_AGENT_ALREADY_RUNNING: &str =
+    "Agent is already processing. Wait for completion before prompting again.";
+const ERR_LOOP_WITHOUT_RESULT: &str = "Agent loop ended without a final result";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueMode {
@@ -46,7 +54,7 @@ impl AgentConfig {
             fallback_models: vec![],
             tools: vec![],
             messages: vec![],
-            convert_to_llm: Arc::new(|messages: Vec<AgentMessage>| messages),
+            convert_to_llm: Arc::new(IdentityMessageConverter),
             stream_fn,
             retry: AgentRetryConfig::default(),
             steering_mode: QueueMode::OneAtATime,
@@ -76,8 +84,8 @@ struct AgentInner {
     stream_message: Option<AgentMessage>,
     pending_tool_calls: HashSet<String>,
     error: Option<String>,
-    steering_queue: Vec<AgentMessage>,
-    follow_up_queue: Vec<AgentMessage>,
+    steering_queue: VecDeque<AgentMessage>,
+    follow_up_queue: VecDeque<AgentMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     retry: AgentRetryConfig,
@@ -105,8 +113,8 @@ impl Agent {
                 stream_message: None,
                 pending_tool_calls: HashSet::new(),
                 error: None,
-                steering_queue: vec![],
-                follow_up_queue: vec![],
+                steering_queue: VecDeque::new(),
+                follow_up_queue: VecDeque::new(),
                 steering_mode: config.steering_mode,
                 follow_up_mode: config.follow_up_mode,
                 retry: config.retry,
@@ -119,8 +127,12 @@ impl Agent {
         }
     }
 
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, AgentInner> {
+        recover_lock(&self.inner)
+    }
+
     pub fn state(&self) -> AgentState {
-        let inner = self.inner.lock().expect("agent mutex poisoned");
+        let inner = self.lock_inner();
         let mut pending_tool_calls = inner.pending_tool_calls.iter().cloned().collect::<Vec<_>>();
         pending_tool_calls.sort();
 
@@ -137,98 +149,98 @@ impl Agent {
     }
 
     pub fn set_system_prompt(&self, system_prompt: String) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.system_prompt = system_prompt;
     }
 
     pub fn set_model(&self, model: Model) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.model = model;
     }
 
     pub fn set_fallback_models(&self, fallback_models: Vec<Model>) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.fallback_models = fallback_models;
     }
 
     pub fn set_retry_config(&self, retry: AgentRetryConfig) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.retry = retry;
     }
 
     pub fn set_tools(&self, tools: Vec<AgentTool>) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.tools = tools;
     }
 
     pub fn replace_messages(&self, messages: Vec<AgentMessage>) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.messages = messages;
     }
 
     pub fn append_message(&self, message: AgentMessage) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.messages.push(message);
     }
 
     pub fn clear_messages(&self) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.messages.clear();
     }
 
     pub fn set_steering_mode(&self, mode: QueueMode) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.steering_mode = mode;
     }
 
     pub fn steering_mode(&self) -> QueueMode {
-        let inner = self.inner.lock().expect("agent mutex poisoned");
+        let inner = self.lock_inner();
         inner.steering_mode
     }
 
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.follow_up_mode = mode;
     }
 
     pub fn follow_up_mode(&self) -> QueueMode {
-        let inner = self.inner.lock().expect("agent mutex poisoned");
+        let inner = self.lock_inner();
         inner.follow_up_mode
     }
 
     pub fn steer(&self, message: AgentMessage) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
-        inner.steering_queue.push(message);
+        let mut inner = self.lock_inner();
+        inner.steering_queue.push_back(message);
     }
 
     pub fn follow_up(&self, message: AgentMessage) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
-        inner.follow_up_queue.push(message);
+        let mut inner = self.lock_inner();
+        inner.follow_up_queue.push_back(message);
     }
 
     pub fn clear_steering_queue(&self) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.steering_queue.clear();
     }
 
     pub fn clear_follow_up_queue(&self) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.follow_up_queue.clear();
     }
 
     pub fn clear_all_queues(&self) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.steering_queue.clear();
         inner.follow_up_queue.clear();
     }
 
     pub fn has_queued_messages(&self) -> bool {
-        let inner = self.inner.lock().expect("agent mutex poisoned");
+        let inner = self.lock_inner();
         !inner.steering_queue.is_empty() || !inner.follow_up_queue.is_empty()
     }
 
     pub fn abort(&self) {
-        let inner = self.inner.lock().expect("agent mutex poisoned");
+        let inner = self.lock_inner();
         if let Some(controller) = inner.abort_controller.as_ref() {
             controller.abort();
         }
@@ -245,7 +257,7 @@ impl Agent {
 
     pub async fn prompt(&self, prompts: Vec<AgentMessage>) -> Result<Vec<AgentMessage>, String> {
         if prompts.is_empty() {
-            return Err("Prompt messages cannot be empty".to_string());
+            return Err(ERR_PROMPT_MESSAGES_EMPTY.to_string());
         }
         self.run(Some(prompts), false).await
     }
@@ -268,9 +280,9 @@ impl Agent {
         }
 
         let continue_mode = {
-            let mut inner = self.inner.lock().expect("agent mutex poisoned");
+            let mut inner = self.lock_inner();
             if inner.messages.is_empty() {
-                return Err("No messages to continue from".to_string());
+                return Err(ERR_NO_MESSAGES_TO_CONTINUE.to_string());
             }
 
             if matches!(inner.messages.last(), Some(Message::Assistant { .. })) {
@@ -290,7 +302,7 @@ impl Agent {
                             skip_initial_steering_poll: false,
                         }
                     } else {
-                        return Err("Cannot continue from message role: assistant".to_string());
+                        return Err(ERR_CANNOT_CONTINUE_FROM_ASSISTANT.to_string());
                     }
                 }
             } else {
@@ -317,10 +329,7 @@ impl Agent {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(
-                "Agent is already processing. Wait for completion before prompting again."
-                    .to_string(),
-            );
+            return Err(ERR_AGENT_ALREADY_RUNNING.to_string());
         }
 
         let run_result = async {
@@ -328,7 +337,7 @@ impl Agent {
             let signal = controller.signal();
 
             let (context, model, fallback_models, retry) = {
-                let mut inner = self.inner.lock().expect("agent mutex poisoned");
+                let mut inner = self.lock_inner();
                 inner.error = None;
                 inner.stream_message = None;
                 inner.pending_tool_calls.clear();
@@ -356,13 +365,13 @@ impl Agent {
                     return vec![];
                 }
 
-                let mut inner = steering_inner.lock().expect("agent mutex poisoned");
+                let mut inner = recover_lock(&steering_inner);
                 let mode = inner.steering_mode;
                 dequeue_messages(&mut inner.steering_queue, mode)
             });
 
             let get_follow_up_messages = Arc::new(move || {
-                let mut inner = follow_up_inner.lock().expect("agent mutex poisoned");
+                let mut inner = recover_lock(&follow_up_inner);
                 let mode = inner.follow_up_mode;
                 dequeue_messages(&mut inner.follow_up_queue, mode)
             });
@@ -379,7 +388,8 @@ impl Agent {
 
             let stream = match prompts {
                 Some(prompts) => agent_loop(prompts, context, config, Some(signal)),
-                None => agent_loop_continue(context, config, Some(signal)),
+                None => try_agent_loop_continue(context, config, Some(signal))
+                    .map_err(|error| error.to_string())?,
             };
 
             while let Some(event) = stream.next().await {
@@ -389,12 +399,12 @@ impl Agent {
             stream
                 .result()
                 .await
-                .ok_or_else(|| "Agent loop ended without a final result".to_string())
+                .ok_or_else(|| ERR_LOOP_WITHOUT_RESULT.to_string())
         }
         .await;
 
         {
-            let mut inner = self.inner.lock().expect("agent mutex poisoned");
+            let mut inner = self.lock_inner();
             inner.stream_message = None;
             inner.pending_tool_calls.clear();
             inner.abort_controller = None;
@@ -406,7 +416,7 @@ impl Agent {
     }
 
     fn apply_event(&self, event: AgentEvent) {
-        let mut inner = self.inner.lock().expect("agent mutex poisoned");
+        let mut inner = self.lock_inner();
 
         match event {
             AgentEvent::MessageStart { message } => {
@@ -445,16 +455,20 @@ impl Agent {
     }
 }
 
-fn dequeue_messages(queue: &mut Vec<AgentMessage>, mode: QueueMode) -> Vec<AgentMessage> {
-    match mode {
-        QueueMode::All => std::mem::take(queue),
-        QueueMode::OneAtATime => {
-            if queue.is_empty() {
-                vec![]
-            } else {
-                vec![queue.remove(0)]
-            }
+fn recover_lock<'a>(inner: &'a Arc<Mutex<AgentInner>>) -> std::sync::MutexGuard<'a, AgentInner> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!("agent mutex poisoned; recovering inner state");
+            poisoned.into_inner()
         }
+    }
+}
+
+fn dequeue_messages(queue: &mut VecDeque<AgentMessage>, mode: QueueMode) -> Vec<AgentMessage> {
+    match mode {
+        QueueMode::All => queue.drain(..).collect(),
+        QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
     }
 }
 
@@ -463,4 +477,64 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixy_ai::{AssistantMessageEventStream, Context, Cost, SimpleStreamOptions};
+
+    fn sample_model() -> Model {
+        Model {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            api: "test-api".to_string(),
+            provider: "test".to_string(),
+            base_url: "http://localhost".to_string(),
+            reasoning: false,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 128_000,
+            max_tokens: 8_192,
+        }
+    }
+
+    #[test]
+    fn lock_recovery_handles_poisoned_mutex_without_panicking() {
+        let stream_fn: StreamFn = Arc::new(
+            |_model: Model, _context: Context, _options: Option<SimpleStreamOptions>| {
+                Ok(AssistantMessageEventStream::new())
+            },
+        );
+        let agent = Agent::new(AgentConfig::new(
+            "You are helpful".to_string(),
+            sample_model(),
+            stream_fn,
+        ));
+
+        let poison_target = agent.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poison_target.inner.lock().expect("mutex should lock");
+            panic!("poison lock for regression test");
+        });
+        assert!(
+            handle.join().is_err(),
+            "thread should panic to poison mutex"
+        );
+        assert!(
+            agent.inner.lock().is_err(),
+            "setup must poison mutex before exercising recovery path"
+        );
+
+        agent.set_system_prompt("Recovered prompt".to_string());
+        let state = agent.state();
+        assert_eq!(state.system_prompt, "Recovered prompt");
+    }
 }

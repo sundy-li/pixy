@@ -1,15 +1,15 @@
 use std::env;
 use std::sync::Arc;
 
-use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
-use crate::api_registry::{ApiProvider, StreamResult};
+use super::common::{empty_assistant_message, join_url, shared_http_client};
+use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Cost, DoneReason,
-    Message, Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, ToolResultContentBlock,
-    Usage, UserContent, UserContentBlock,
+    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Message,
+    Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, ToolResultContentBlock, Usage,
+    UserContent, UserContentBlock,
 };
 use crate::{ApiProviderRef, AssistantMessageEventStream};
 
@@ -28,8 +28,9 @@ impl ApiProvider for BedrockConverseStreamProvider {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_bedrock_converse_stream(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(async move { run_bedrock_converse_stream(model, context, options, stream).await })
     }
 
     fn stream_simple(
@@ -37,8 +38,11 @@ impl ApiProvider for BedrockConverseStreamProvider {
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_simple_bedrock_converse_stream(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(async move {
+            run_simple_bedrock_converse_stream(model, context, options, stream).await
+        })
     }
 }
 
@@ -46,23 +50,22 @@ pub(super) fn provider() -> ApiProviderRef {
     Arc::new(BedrockConverseStreamProvider)
 }
 
-pub fn stream_bedrock_converse_stream(
+pub async fn run_bedrock_converse_stream(
     model: Model,
     context: Context,
     options: Option<StreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
-    let auth_token = resolve_auth_token(&model.provider, options.as_ref(), BEDROCK_FALLBACK_ENVS)
-        .map_err(|error| error.as_compact_json())?;
-    let stream = AssistantMessageEventStream::new();
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
+    let auth_token = resolve_auth_token(&model.provider, options.as_ref(), BEDROCK_FALLBACK_ENVS)?;
 
     let mut output = empty_assistant_message(&model);
     let payload = build_bedrock_payload(&context, options.as_ref());
     let endpoint = build_bedrock_endpoint(&model);
-    let client = Client::new();
+    let client = shared_http_client(&model.base_url);
 
-    let execution = (|| -> Result<(), PiAiError> {
+    let execution = async {
         let mut request = client
-            .post(endpoint)
+            .post(endpoint.as_str())
             .header("Content-Type", "application/json");
 
         if let Some(token) = auth_token.as_ref() {
@@ -74,8 +77,7 @@ pub fn stream_bedrock_converse_stream(
                 request = request.header(name, value);
             }
         }
-
-        let response = request.json(&payload).send().map_err(|error| {
+        let response = request.json(&payload).send().await.map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderTransport,
                 format!("Bedrock transport failed: {error}"),
@@ -86,6 +88,7 @@ pub fn stream_bedrock_converse_stream(
             let status = response.status().as_u16();
             let body = response
                 .text()
+                .await
                 .unwrap_or_else(|_| "unable to read error body".to_string());
             return Err(PiAiError::new(
                 PiAiErrorCode::ProviderHttp,
@@ -93,7 +96,7 @@ pub fn stream_bedrock_converse_stream(
             ));
         }
 
-        let body = response.text().map_err(|error| {
+        let body = response.text().await.map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderTransport,
                 format!("Bedrock response read failed: {error}"),
@@ -136,7 +139,8 @@ pub fn stream_bedrock_converse_stream(
         }
 
         Ok(())
-    })();
+    }
+    .await;
 
     if let Err(error) = execution {
         output.stop_reason = StopReason::Error;
@@ -147,16 +151,17 @@ pub fn stream_bedrock_converse_stream(
         });
     }
 
-    Ok(stream)
+    Ok(())
 }
 
-pub fn stream_simple_bedrock_converse_stream(
+pub async fn run_simple_bedrock_converse_stream(
     model: Model,
     context: Context,
     options: Option<SimpleStreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
     let merged = options.map(|simple| simple.stream);
-    stream_bedrock_converse_stream(model, context, merged)
+    run_bedrock_converse_stream(model, context, merged, stream).await
 }
 
 fn build_bedrock_payload(context: &Context, options: Option<&StreamOptions>) -> Value {
@@ -633,46 +638,4 @@ fn truncate_for_details(text: &str, limit: usize) -> String {
     }
     let prefix: String = text.chars().take(limit - 3).collect();
     format!("{prefix}...")
-}
-
-fn empty_assistant_message(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        role: "assistant".to_string(),
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        usage: Usage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: 0,
-            cost: Cost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                total: 0.0,
-            },
-        },
-        stop_reason: StopReason::Stop,
-        error_message: None,
-        timestamp: now_millis(),
-    }
-}
-
-fn join_url(base_url: &str, path: &str) -> String {
-    if base_url.ends_with('/') {
-        format!("{base_url}{path}")
-    } else {
-        format!("{base_url}/{path}")
-    }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }

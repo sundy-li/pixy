@@ -1,8 +1,9 @@
 use std::fs;
 
-use pixy_ai::ToolResultContentBlock;
+use pixy_ai::{PiAiErrorCode, ToolResultContentBlock};
 use pixy_coding_agent::{
-    create_bash_tool, create_coding_tools, create_edit_tool, create_read_tool, create_write_tool,
+    create_bash_tool, create_coding_tools, create_edit_tool, create_list_directory_tool,
+    create_read_tool, create_write_tool,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -104,7 +105,8 @@ async fn edit_tool_rejects_non_unique_match() {
         .await
         .expect_err("edit should fail for non-unique oldText");
 
-    assert!(error.contains("must be unique"));
+    assert_eq!(error.code, PiAiErrorCode::ToolExecutionFailed);
+    assert!(error.message.contains("must be unique"));
 }
 
 #[tokio::test]
@@ -134,8 +136,62 @@ async fn bash_tool_returns_output_and_exit_code_errors() {
         )
         .await
         .expect_err("bash should return error for non-zero exit code");
-    assert!(error.contains("Command exited with code 7"));
-    assert!(error.contains("fail"));
+    assert_eq!(error.code, PiAiErrorCode::ToolExecutionFailed);
+    assert!(error.message.contains("Command exited with code 7"));
+    assert!(error.message.contains("fail"));
+}
+
+#[tokio::test]
+async fn bash_tool_unwraps_nested_bash_lc_commands_before_execution() {
+    let dir = tempdir().expect("tempdir");
+    let bash_tool = create_bash_tool(dir.path());
+
+    let result = bash_tool
+        .execute
+        .execute(
+            "call-bash-nested".to_string(),
+            json!({
+                "command": "bash -lc 'ps -p $PPID -o comm='"
+            }),
+        )
+        .await
+        .expect("bash should succeed");
+
+    let parent_process = first_text(&result.content).trim().to_string();
+    assert_ne!(
+        parent_process, "bash",
+        "nested wrapping should be removed before execution"
+    );
+}
+
+#[tokio::test]
+async fn list_directory_tool_lists_entries_and_allows_absolute_paths_outside_workspace() {
+    let dir = tempdir().expect("tempdir");
+    let outside = tempdir().expect("outside tempdir");
+    fs::create_dir_all(dir.path().join("nested")).expect("create nested dir");
+    fs::write(dir.path().join("hello.txt"), "hello").expect("seed file");
+    fs::write(outside.path().join("outside.txt"), "outside").expect("seed outside file");
+    let list_directory_tool = create_list_directory_tool(dir.path());
+
+    let listed = list_directory_tool
+        .execute
+        .execute("call-list".to_string(), json!({ "path": "" }))
+        .await
+        .expect("list should succeed");
+    let listed_text = first_text(&listed.content);
+    assert!(listed_text.contains("nested/"));
+    assert!(listed_text.contains("hello.txt  (5 bytes)"));
+
+    let outside_list = list_directory_tool
+        .execute
+        .execute(
+            "call-list-outside".to_string(),
+            json!({ "path": outside.path().display().to_string() }),
+        )
+        .await
+        .expect("listing outside workspace should succeed");
+    let outside_text = first_text(&outside_list.content);
+    assert!(outside_text.contains("outside.txt  (7 bytes)"));
 }
 
 #[test]
@@ -143,5 +199,8 @@ fn create_coding_tools_returns_expected_order() {
     let dir = tempdir().expect("tempdir");
     let tools = create_coding_tools(dir.path());
     let names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
-    assert_eq!(names, vec!["read", "bash", "edit", "write"]);
+    assert_eq!(
+        names,
+        vec!["list_directory", "read", "bash", "edit", "write"]
+    );
 }

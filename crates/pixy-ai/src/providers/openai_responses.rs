@@ -1,37 +1,34 @@
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read};
-
-use reqwest::blocking::Client;
-use serde_json::{json, Map, Value};
 use tracing::info;
 
-use crate::api_registry::StreamResult;
+use super::common::{empty_assistant_message, join_url, shared_http_client};
+use crate::AssistantMessageEventStream;
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Cost, DoneReason,
-    Message, Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent,
+    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Message,
+    Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent,
     UserContentBlock,
 };
-use crate::AssistantMessageEventStream;
 
-pub fn stream_openai_responses(
+pub async fn run_openai_responses(
     model: Model,
     context: Context,
     options: Option<StreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
-    let api_key = resolve_api_key(&model.provider, options.as_ref())
-        .map_err(|error| error.as_compact_json())?;
-    let stream = AssistantMessageEventStream::new();
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
+    let api_key = resolve_api_key(&model.provider, options.as_ref())?;
 
     let mut output = empty_assistant_message(&model);
     let payload = build_openai_responses_payload(&model, &context, options.as_ref());
     let endpoint = join_url(&model.base_url, "responses");
-    let client = Client::new();
+    let client = shared_http_client(&model.base_url);
 
-    let execution = (|| -> Result<(), PiAiError> {
+    let execution = async {
         let mut request = client
-            .post(endpoint)
+            .post(endpoint.as_str())
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json");
 
@@ -40,8 +37,7 @@ pub fn stream_openai_responses(
                 request = request.header(key, value);
             }
         }
-
-        let response = request.json(&payload).send().map_err(|error| {
+        let response = request.json(&payload).send().await.map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderTransport,
                 format!("OpenAI transport failed: {error}"),
@@ -52,6 +48,7 @@ pub fn stream_openai_responses(
             let status = response.status().as_u16();
             let body = response
                 .text()
+                .await
                 .unwrap_or_else(|_| "unable to read error body".to_string());
             return Err(PiAiError::new(
                 PiAiErrorCode::ProviderHttp,
@@ -67,8 +64,14 @@ pub fn stream_openai_responses(
         let mut tool_block_indices: HashMap<String, usize> = HashMap::new();
         let mut tool_arg_buffers: HashMap<String, String> = HashMap::new();
 
-        let mut response = response;
-        process_sse_data_events(&mut response, |data| {
+        let body = response.text().await.map_err(|error| {
+            PiAiError::new(
+                PiAiErrorCode::ProviderTransport,
+                format!("OpenAI responses read failed: {error}"),
+            )
+        })?;
+        let mut reader = std::io::Cursor::new(body.into_bytes());
+        process_sse_data_events(&mut reader, |data| {
             handle_openai_responses_event(
                 data,
                 &mut output,
@@ -97,11 +100,12 @@ pub fn stream_openai_responses(
             message: output.clone(),
         });
         Ok(())
-    })();
+    }
+    .await;
 
     if let Err(error) = execution {
         if is_provider_http_404(&error) {
-            return Err(error.as_compact_json());
+            return Err(error);
         }
         output.stop_reason = StopReason::Error;
         output.error_message = Some(error.as_compact_json());
@@ -111,16 +115,19 @@ pub fn stream_openai_responses(
         });
     }
 
-    Ok(stream)
+    Ok(())
 }
 
-pub fn stream_simple_openai_responses(
+pub async fn run_simple_openai_responses(
     model: Model,
     context: Context,
     options: Option<SimpleStreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
+    let mut model = model;
+    apply_simple_reasoning_to_model(&mut model, options.as_ref());
     let stream_options = options.map(|simple| simple.stream);
-    stream_openai_responses(model, context, stream_options)
+    run_openai_responses(model, context, stream_options, stream).await
 }
 
 fn handle_openai_responses_event(
@@ -131,6 +138,7 @@ fn handle_openai_responses_event(
     tool_block_indices: &mut HashMap<String, usize>,
     tool_arg_buffers: &mut HashMap<String, String>,
 ) -> Result<bool, PiAiError> {
+    info!("OpenAI responses data: {}", data);
     if data == "[DONE]" {
         return Ok(true);
     }
@@ -459,6 +467,15 @@ fn build_openai_responses_payload(
     if let Some(tools) = &context.tools {
         payload["tools"] = convert_responses_tools(tools);
     }
+    if model.reasoning {
+        let effort = model
+            .reasoning_effort
+            .as_ref()
+            .unwrap_or(&crate::types::ThinkingLevel::Medium);
+        payload["reasoning"] = json!({
+            "effort": thinking_level_to_effort(model, effort),
+        });
+    }
 
     info!(
         target: "pixy_ai::providers::openai_responses",
@@ -469,6 +486,32 @@ fn build_openai_responses_payload(
     );
 
     payload
+}
+
+fn apply_simple_reasoning_to_model(model: &mut Model, options: Option<&SimpleStreamOptions>) {
+    if !model.reasoning {
+        return;
+    }
+    if let Some(reasoning) = options.and_then(|simple| simple.reasoning.clone()) {
+        model.reasoning_effort = Some(reasoning);
+    }
+}
+
+fn thinking_level_to_effort(model: &Model, level: &crate::types::ThinkingLevel) -> &'static str {
+    let is_openai = model.name.to_lowercase().contains("openai")
+        || model.provider.to_lowercase().contains("openai")
+        || model.id.to_lowercase().starts_with("gpt-");
+    if !is_openai && level == &crate::types::ThinkingLevel::Xhigh {
+        return "high";
+    }
+
+    match level {
+        crate::types::ThinkingLevel::Minimal => "minimal",
+        crate::types::ThinkingLevel::Low => "low",
+        crate::types::ThinkingLevel::Medium => "medium",
+        crate::types::ThinkingLevel::High => "high",
+        crate::types::ThinkingLevel::Xhigh => "xhigh",
+    }
 }
 
 fn convert_responses_messages(context: &Context) -> Value {
@@ -801,48 +844,6 @@ fn update_usage_from_openai_responses(usage: &mut Usage, value: &Value) {
     usage.total_tokens = total_tokens;
 }
 
-fn empty_assistant_message(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        role: "assistant".to_string(),
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        usage: Usage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: 0,
-            cost: Cost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                total: 0.0,
-            },
-        },
-        stop_reason: StopReason::Stop,
-        error_message: None,
-        timestamp: now_millis(),
-    }
-}
-
-fn join_url(base_url: &str, path: &str) -> String {
-    if base_url.ends_with('/') {
-        format!("{base_url}{path}")
-    } else {
-        format!("{base_url}/{path}")
-    }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn is_provider_http_404(error: &PiAiError) -> bool {
     error.code == PiAiErrorCode::ProviderHttp && error.message.contains("HTTP 404")
 }
@@ -850,7 +851,60 @@ fn is_provider_http_404(error: &PiAiError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Cost, ThinkingLevel};
     use std::io::{self, Read};
+
+    fn sample_model() -> Model {
+        Model {
+            id: "gpt-5.3-codex".to_string(),
+            name: "gpt-5.3-codex".to_string(),
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning: true,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+        }
+    }
+
+    fn sample_context() -> Context {
+        Context {
+            system_prompt: Some("You are helpful.".to_string()),
+            messages: vec![Message::User {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: 0,
+            }],
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn openai_responses_payload_injects_reasoning_with_default_medium() {
+        let model = sample_model();
+        let context = sample_context();
+
+        let payload = build_openai_responses_payload(&model, &context, None);
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn openai_responses_payload_uses_configured_reasoning_effort() {
+        let mut model = sample_model();
+        model.reasoning_effort = Some(ThinkingLevel::High);
+        let context = sample_context();
+
+        let payload = build_openai_responses_payload(&model, &context, None);
+        assert_eq!(payload["reasoning"]["effort"], "high");
+    }
 
     #[test]
     fn process_sse_data_events_stops_reading_after_done_event() {
@@ -950,5 +1004,12 @@ mod tests {
                 "[DONE]".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn openai_client_is_reused_across_requests() {
+        let first = shared_http_client("https://api.openai.com/v1");
+        let second = shared_http_client("https://api.openai.com/v1");
+        assert!(std::ptr::eq(first, second));
     }
 }

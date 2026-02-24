@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
+use pixy_ai::PiAiError;
 use serde_json::{Value, json};
 
 use super::common::{
     format_diff_stat_line, get_required_string, line_change_counts, resolve_to_cwd, text_result,
+    tool_execution_failed,
 };
 
 pub fn create_write_tool(cwd: impl AsRef<Path>) -> AgentTool {
@@ -40,7 +42,7 @@ impl AgentToolExecutor for WriteToolExecutor {
     }
 }
 
-fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String> {
+fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, PiAiError> {
     let path = get_required_string(&args, "path")?;
     let content = get_required_string(&args, "content")?;
     let absolute_path = resolve_to_cwd(cwd, &path);
@@ -50,12 +52,13 @@ fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, String
         Err(_) => String::new(),
     };
     if let Some(parent) = absolute_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create parent directories: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            tool_execution_failed(format!("Failed to create parent directories: {error}"))
+        })?;
     }
 
     fs::write(&absolute_path, &content)
-        .map_err(|error| format!("Failed to write {path}: {error}"))?;
+        .map_err(|error| tool_execution_failed(format!("Failed to write {path}: {error}")))?;
     let (insertions, deletions) = line_change_counts(&previous_content, &content);
     Ok(text_result(
         format_diff_stat_line(&path, &previous_content, &content),

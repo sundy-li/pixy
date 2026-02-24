@@ -1,19 +1,27 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::AssistantMessageEventStream;
+use crate::error::PiAiError;
 use crate::types::{Api, Context, Model, SimpleStreamOptions, StreamOptions};
 
-pub type StreamResult<T> = Result<T, String>;
+pub type ApiProviderFuture = Pin<Box<dyn Future<Output = Result<(), PiAiError>> + Send>>;
 
 pub type ApiStreamFunction = Arc<
-    dyn Fn(Model, Context, Option<StreamOptions>) -> StreamResult<AssistantMessageEventStream>
+    dyn Fn(Model, Context, Option<StreamOptions>, AssistantMessageEventStream) -> ApiProviderFuture
         + Send
         + Sync,
 >;
 
 pub type ApiStreamSimpleFunction = Arc<
-    dyn Fn(Model, Context, Option<SimpleStreamOptions>) -> StreamResult<AssistantMessageEventStream>
+    dyn Fn(
+            Model,
+            Context,
+            Option<SimpleStreamOptions>,
+            AssistantMessageEventStream,
+        ) -> ApiProviderFuture
         + Send
         + Sync,
 >;
@@ -25,13 +33,15 @@ pub trait ApiProvider: Send + Sync {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> StreamResult<AssistantMessageEventStream>;
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture;
     fn stream_simple(
         &self,
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> StreamResult<AssistantMessageEventStream>;
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture;
 }
 
 pub type ApiProviderRef = Arc<dyn ApiProvider>;
@@ -53,8 +63,9 @@ impl ApiProvider for ClosureApiProvider {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> StreamResult<AssistantMessageEventStream> {
-        (self.stream)(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        (self.stream)(model, context, options, stream)
     }
 
     fn stream_simple(
@@ -62,8 +73,9 @@ impl ApiProvider for ClosureApiProvider {
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> StreamResult<AssistantMessageEventStream> {
-        (self.stream_simple)(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        (self.stream_simple)(model, context, options, stream)
     }
 }
 

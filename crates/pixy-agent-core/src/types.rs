@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pixy_ai::{
-    AssistantMessageEvent, AssistantMessageEventStream, Context, Message, Model,
+    AssistantMessageEvent, AssistantMessageEventStream, Context, Message, Model, PiAiError,
     SimpleStreamOptions, Tool, ToolResultContentBlock,
 };
 use serde_json::Value;
@@ -12,20 +12,78 @@ use tokio::sync::Notify;
 
 pub type AgentMessage = Message;
 
-pub type StreamFn = Arc<
-    dyn Fn(
+pub trait StreamExecutor: Send + Sync {
+    fn stream(
+        &self,
+        model: Model,
+        context: Context,
+        options: Option<SimpleStreamOptions>,
+    ) -> Result<AssistantMessageEventStream, PiAiError>;
+}
+
+impl<F> StreamExecutor for F
+where
+    F: Fn(
             Model,
             Context,
             Option<SimpleStreamOptions>,
-        ) -> Result<AssistantMessageEventStream, String>
+        ) -> Result<AssistantMessageEventStream, PiAiError>
         + Send
-        + Sync,
->;
+        + Sync
+        + 'static,
+{
+    fn stream(
+        &self,
+        model: Model,
+        context: Context,
+        options: Option<SimpleStreamOptions>,
+    ) -> Result<AssistantMessageEventStream, PiAiError> {
+        (self)(model, context, options)
+    }
+}
 
-pub type ConvertToLlmFn = Arc<dyn Fn(Vec<AgentMessage>) -> Vec<Message> + Send + Sync>;
-pub type MessageQueueFn = Arc<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
+pub type StreamFn = Arc<dyn StreamExecutor>;
 
-pub type ToolFuture = Pin<Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>>;
+pub trait MessageConverter: Send + Sync {
+    fn convert(&self, messages: Vec<AgentMessage>) -> Vec<Message>;
+}
+
+#[derive(Default)]
+pub struct IdentityMessageConverter;
+
+impl MessageConverter for IdentityMessageConverter {
+    fn convert(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
+        messages
+    }
+}
+
+impl<F> MessageConverter for F
+where
+    F: Fn(Vec<AgentMessage>) -> Vec<Message> + Send + Sync + 'static,
+{
+    fn convert(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
+        (self)(messages)
+    }
+}
+
+pub type ConvertToLlmFn = Arc<dyn MessageConverter>;
+
+pub trait MessageQueue: Send + Sync {
+    fn poll(&self) -> Vec<AgentMessage>;
+}
+
+impl<F> MessageQueue for F
+where
+    F: Fn() -> Vec<AgentMessage> + Send + Sync + 'static,
+{
+    fn poll(&self) -> Vec<AgentMessage> {
+        (self)()
+    }
+}
+
+pub type MessageQueueFn = Arc<dyn MessageQueue>;
+
+pub type ToolFuture = Pin<Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>>;
 
 pub trait AgentToolExecutor: Send + Sync {
     fn execute(&self, tool_call_id: String, args: Value) -> ToolFuture;

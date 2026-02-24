@@ -5,6 +5,7 @@ mod error;
 mod event_stream;
 mod providers;
 mod stream;
+mod transport_retry;
 mod types;
 mod validation;
 
@@ -14,9 +15,13 @@ pub use api_registry::{
     unregister_api_providers,
 };
 pub use error::{PiAiError, PiAiErrorCode};
-pub use event_stream::{AssistantMessageEventStream, EventStream};
-pub use providers::{register_builtin_api_providers, reset_api_providers};
+pub use event_stream::{AssistantMessageEventStream, AssistantStreamWriter, EventStream};
+pub use providers::{ReliableProvider, register_builtin_api_providers, reset_api_providers};
 pub use stream::{complete, complete_simple, stream, stream_simple};
+pub use transport_retry::{
+    DEFAULT_TRANSPORT_RETRY_COUNT, set_transport_retry_count, transport_retry_count,
+    transport_retry_count_with_override,
+};
 pub use types::{
     Api, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Cost, DoneReason,
     ErrorReason, Message, Model, Provider, SimpleStreamOptions, StopReason, StreamOptions,

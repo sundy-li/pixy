@@ -8,7 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use pixy_ai::{
-    AssistantContentBlock, Context, Cost, Message, Model, StreamOptions, Tool, UserContent, stream,
+    AssistantContentBlock, AssistantMessageEvent, Context, Cost, Message, Model, StreamOptions,
+    Tool, UserContent, stream,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -250,6 +251,17 @@ fn collect_text(content: &[AssistantContentBlock]) -> String {
         .join("")
 }
 
+fn collect_thinking(content: &[AssistantContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 #[test]
 fn openai_fixture_matches_expected_contract() {
     let fixture = read_fixture("openai-tooluse.json");
@@ -265,6 +277,7 @@ fn openai_fixture_matches_expected_contract() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");
@@ -300,6 +313,141 @@ fn openai_fixture_matches_expected_contract() {
 }
 
 #[test]
+fn openai_completions_reasoning_content_maps_to_thinking_blocks() {
+    let chunks = vec![
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "I should inspect files first." },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }),
+    ];
+    let base_url = spawn_sse_server(sse_body(&chunks, true));
+    let model = sample_model("openai-completions", base_url);
+    let context = sample_context();
+    let event_stream = stream(
+        model,
+        context,
+        Some(StreamOptions {
+            api_key: Some("test-key".to_string()),
+            temperature: None,
+            max_tokens: None,
+            headers: None,
+            transport_retry_count: None,
+        }),
+    )
+    .expect("stream should start");
+
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+    let (message, saw_thinking_delta) = runtime.block_on(async {
+        let mut saw_thinking_delta = false;
+        while let Some(event) = event_stream.next().await {
+            if matches!(event, AssistantMessageEvent::ThinkingDelta { .. }) {
+                saw_thinking_delta = true;
+            }
+        }
+
+        let message = event_stream
+            .result()
+            .await
+            .expect("stream should produce final message");
+        (message, saw_thinking_delta)
+    });
+
+    assert!(saw_thinking_delta, "expected ThinkingDelta event");
+    assert_eq!(collect_text(&message.content), "");
+    assert_eq!(
+        collect_thinking(&message.content),
+        "I should inspect files first."
+    );
+}
+
+#[test]
+fn openai_completions_reasoning_snapshot_chunks_do_not_duplicate_thinking() {
+    let chunks = vec![
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "**Analyzing code path**" },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "**Analyzing code path**\nNeed to inspect files." },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "**Analyzing code path**\nNeed to inspect files." },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }),
+    ];
+    let base_url = spawn_sse_server(sse_body(&chunks, true));
+    let model = sample_model("openai-completions", base_url);
+    let context = sample_context();
+    let event_stream = stream(
+        model,
+        context,
+        Some(StreamOptions {
+            api_key: Some("test-key".to_string()),
+            temperature: None,
+            max_tokens: None,
+            headers: None,
+            transport_retry_count: None,
+        }),
+    )
+    .expect("stream should start");
+
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+    let (message, thinking_deltas) = runtime.block_on(async {
+        let mut thinking_deltas = Vec::new();
+        while let Some(event) = event_stream.next().await {
+            if let AssistantMessageEvent::ThinkingDelta { delta, .. } = event {
+                thinking_deltas.push(delta);
+            }
+        }
+
+        let message = event_stream
+            .result()
+            .await
+            .expect("stream should produce final message");
+        (message, thinking_deltas)
+    });
+
+    assert_eq!(
+        collect_thinking(&message.content),
+        "**Analyzing code path**\nNeed to inspect files."
+    );
+    assert_eq!(
+        thinking_deltas,
+        vec![
+            "**Analyzing code path**".to_string(),
+            "\nNeed to inspect files.".to_string()
+        ]
+    );
+}
+
+#[test]
 fn anthropic_fixture_matches_expected_contract() {
     let fixture = read_fixture("anthropic-tooluse.json");
     let base_url = spawn_sse_server(sse_body(&fixture.chunks, false));
@@ -314,6 +462,7 @@ fn anthropic_fixture_matches_expected_contract() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");
@@ -445,6 +594,7 @@ fn openai_responses_stream_events_are_parsed_to_text_and_tool_call() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");
@@ -540,6 +690,7 @@ fn openai_responses_tool_arguments_resolve_when_arg_events_only_have_item_id() {
             temperature: None,
             max_tokens: None,
             headers: None,
+            transport_retry_count: None,
         }),
     )
     .expect("stream should start");
@@ -601,6 +752,7 @@ fn openai_responses_404_falls_back_to_completions_and_caches_base_url() {
                 temperature: None,
                 max_tokens: None,
                 headers: None,
+                transport_retry_count: None,
             }),
         )
         .expect("stream should start");

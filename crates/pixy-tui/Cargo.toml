@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
 pixy-agent-core = { path = "../pixy-agent-core" }

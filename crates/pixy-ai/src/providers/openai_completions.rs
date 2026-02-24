@@ -3,16 +3,15 @@ use std::env;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
-use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 use tracing::info;
 
-use crate::api_registry::{ApiProvider, StreamResult};
+use super::common::{empty_assistant_message, join_url, shared_http_client};
+use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Cost, DoneReason,
-    Message, Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent,
-    UserContentBlock,
+    AssistantContentBlock, AssistantMessageEvent, Context, DoneReason, Message, Model,
+    SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent, UserContentBlock,
 };
 use crate::{ApiProviderRef, AssistantMessageEventStream};
 
@@ -28,8 +27,9 @@ impl ApiProvider for OpenAICompletionsProvider {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_openai_completions(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(async move { run_openai_completions(model, context, options, stream).await })
     }
 
     fn stream_simple(
@@ -37,8 +37,11 @@ impl ApiProvider for OpenAICompletionsProvider {
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        stream_simple_openai_completions(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        Box::pin(
+            async move { run_simple_openai_completions(model, context, options, stream).await },
+        )
     }
 }
 
@@ -46,40 +49,44 @@ pub(super) fn provider() -> ApiProviderRef {
     Arc::new(OpenAICompletionsProvider)
 }
 
-pub fn stream_openai_completions(
+pub async fn run_openai_completions(
     model: Model,
     context: Context,
     options: Option<StreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
-    let api_key = resolve_api_key(&model.provider, options.as_ref())
-        .map_err(|error| error.as_compact_json())?;
-    let stream = AssistantMessageEventStream::new();
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
+    let api_key = resolve_api_key(&model.provider, options.as_ref())?;
 
     let mut output = empty_assistant_message(&model);
     let payload = build_openai_payload(&model, &context, options.as_ref());
     let endpoint = join_url(&model.base_url, "chat/completions");
-    let client = Client::new();
+    let client = shared_http_client(&model.base_url);
 
     info!("OpenAI completions payload: {}", payload);
 
-    let execution = (|| -> Result<(), PiAiError> {
-        let response = client
-            .post(endpoint)
+    let execution = async {
+        let mut request = client
+            .post(endpoint.as_str())
             .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .map_err(|error| {
-                PiAiError::new(
-                    PiAiErrorCode::ProviderTransport,
-                    format!("OpenAI transport failed: {error}"),
-                )
-            })?;
+            .header("Content-Type", "application/json");
+
+        if let Some(headers) = options.as_ref().and_then(|stream| stream.headers.as_ref()) {
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+        }
+        let response = request.json(&payload).send().await.map_err(|error| {
+            PiAiError::new(
+                PiAiErrorCode::ProviderTransport,
+                format!("OpenAI transport failed: {error}"),
+            )
+        })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response
                 .text()
+                .await
                 .unwrap_or_else(|_| "unable to read error body".to_string());
             return Err(PiAiError::new(
                 PiAiErrorCode::ProviderHttp,
@@ -92,10 +99,17 @@ pub fn stream_openai_completions(
         });
 
         let mut text_block_index: Option<usize> = None;
+        let mut thinking_block_index: Option<usize> = None;
         let mut tool_arg_buffers: HashMap<usize, String> = HashMap::new();
         let mut tool_block_indices: HashMap<usize, usize> = HashMap::new();
-        let mut response = response;
-        process_sse_data_events(&mut response, |data| {
+        let body = response.text().await.map_err(|error| {
+            PiAiError::new(
+                PiAiErrorCode::ProviderTransport,
+                format!("OpenAI stream read failed: {error}"),
+            )
+        })?;
+        let mut reader = std::io::Cursor::new(body.into_bytes());
+        process_sse_data_events(&mut reader, |data| {
             info!("OpenAI completions data: {}", data);
             if data == "[DONE]" {
                 return Ok(true);
@@ -129,37 +143,77 @@ pub fn stream_openai_completions(
                 output.stop_reason = map_openai_stop_reason(finish_reason);
             }
 
-            if let Some(content_delta) = choice
-                .get("delta")
-                .and_then(Value::as_object)
+            let delta = choice.get("delta").and_then(Value::as_object);
+            if let Some(reasoning_delta) = delta
+                .and_then(|delta| delta.get("reasoning_content"))
+                .and_then(Value::as_str)
+            {
+                let idx = if let Some(idx) = thinking_block_index {
+                    idx
+                } else {
+                    let new_index = output.content.len();
+                    output.content.push(AssistantContentBlock::Thinking {
+                        thinking: String::new(),
+                        thinking_signature: None,
+                    });
+                    stream.push(AssistantMessageEvent::ThinkingStart {
+                        content_index: new_index,
+                        partial: output.clone(),
+                    });
+                    thinking_block_index = Some(new_index);
+                    new_index
+                };
+
+                let emitted_delta =
+                    if let Some(AssistantContentBlock::Thinking { thinking, .. }) =
+                        output.content.get_mut(idx)
+                    {
+                        merge_stream_delta(thinking, reasoning_delta)
+                    } else {
+                        None
+                    };
+
+                if let Some(delta_to_emit) = emitted_delta {
+                    stream.push(AssistantMessageEvent::ThinkingDelta {
+                        content_index: idx,
+                        delta: delta_to_emit,
+                        partial: output.clone(),
+                    });
+                }
+            }
+
+            if let Some(content_delta) = delta
                 .and_then(|delta| delta.get("content"))
                 .and_then(Value::as_str)
             {
-                if !content_delta.is_empty() {
-                    let idx = if let Some(idx) = text_block_index {
-                        idx
-                    } else {
-                        let new_index = output.content.len();
-                        output.content.push(AssistantContentBlock::Text {
-                            text: String::new(),
-                            text_signature: None,
-                        });
-                        stream.push(AssistantMessageEvent::TextStart {
-                            content_index: new_index,
-                            partial: output.clone(),
-                        });
-                        text_block_index = Some(new_index);
-                        new_index
-                    };
+                let idx = if let Some(idx) = text_block_index {
+                    idx
+                } else {
+                    let new_index = output.content.len();
+                    output.content.push(AssistantContentBlock::Text {
+                        text: String::new(),
+                        text_signature: None,
+                    });
+                    stream.push(AssistantMessageEvent::TextStart {
+                        content_index: new_index,
+                        partial: output.clone(),
+                    });
+                    text_block_index = Some(new_index);
+                    new_index
+                };
 
-                    if let Some(AssistantContentBlock::Text { text, .. }) =
-                        output.content.get_mut(idx)
-                    {
-                        text.push_str(content_delta);
-                    }
+                let emitted_delta = if let Some(AssistantContentBlock::Text { text, .. }) =
+                    output.content.get_mut(idx)
+                {
+                    merge_stream_delta(text, content_delta)
+                } else {
+                    None
+                };
+
+                if let Some(delta_to_emit) = emitted_delta {
                     stream.push(AssistantMessageEvent::TextDelta {
                         content_index: idx,
-                        delta: content_delta.to_string(),
+                        delta: delta_to_emit,
                         partial: output.clone(),
                     });
                 }
@@ -176,6 +230,14 @@ pub fn stream_openai_completions(
                     stream.push(AssistantMessageEvent::TextEnd {
                         content_index: text_idx,
                         content: text,
+                        partial: output.clone(),
+                    });
+                }
+                if let Some(thinking_idx) = thinking_block_index.take() {
+                    let thinking = extract_thinking_block(&output.content, thinking_idx);
+                    stream.push(AssistantMessageEvent::ThinkingEnd {
+                        content_index: thinking_idx,
+                        content: thinking,
                         partial: output.clone(),
                     });
                 }
@@ -260,6 +322,14 @@ pub fn stream_openai_completions(
                 partial: output.clone(),
             });
         }
+        if let Some(thinking_idx) = thinking_block_index.take() {
+            let thinking = extract_thinking_block(&output.content, thinking_idx);
+            stream.push(AssistantMessageEvent::ThinkingEnd {
+                content_index: thinking_idx,
+                content: thinking,
+                partial: output.clone(),
+            });
+        }
 
         let mut ordered_tool_indices = tool_block_indices.values().copied().collect::<Vec<_>>();
         ordered_tool_indices.sort_unstable();
@@ -308,7 +378,8 @@ pub fn stream_openai_completions(
             message: output.clone(),
         });
         Ok(())
-    })();
+    }
+    .await;
 
     if let Err(error) = execution {
         output.stop_reason = StopReason::Error;
@@ -319,18 +390,19 @@ pub fn stream_openai_completions(
         });
     }
 
-    Ok(stream)
+    Ok(())
 }
 
-pub fn stream_simple_openai_completions(
+pub async fn run_simple_openai_completions(
     model: Model,
     context: Context,
     options: Option<SimpleStreamOptions>,
-) -> StreamResult<AssistantMessageEventStream> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
     let mut model = model;
     apply_simple_reasoning_to_model(&mut model, options.as_ref());
     let stream_options = options.map(|simple| simple.stream);
-    stream_openai_completions(model, context, stream_options)
+    run_openai_completions(model, context, stream_options, stream).await
 }
 
 fn build_openai_payload(
@@ -606,33 +678,6 @@ fn parse_partial_json(buffer: &str) -> Value {
     serde_json::from_str::<Value>(buffer).unwrap_or_else(|_| Value::Object(Map::new()))
 }
 
-fn empty_assistant_message(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        role: "assistant".to_string(),
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        usage: Usage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: 0,
-            cost: Cost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                total: 0.0,
-            },
-        },
-        stop_reason: StopReason::Stop,
-        error_message: None,
-        timestamp: now_millis(),
-    }
-}
-
 fn extract_text_block(content: &[AssistantContentBlock], index: usize) -> String {
     content
         .get(index)
@@ -641,6 +686,45 @@ fn extract_text_block(content: &[AssistantContentBlock], index: usize) -> String
             _ => None,
         })
         .unwrap_or_default()
+}
+
+fn extract_thinking_block(content: &[AssistantContentBlock], index: usize) -> String {
+    content
+        .get(index)
+        .and_then(|block| match block {
+            AssistantContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn merge_stream_delta(current: &mut String, incoming: &str) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+
+    if current.is_empty() {
+        current.push_str(incoming);
+        return Some(incoming.to_string());
+    }
+
+    if incoming.starts_with(current.as_str()) {
+        let appended = &incoming[current.len()..];
+        if appended.is_empty() {
+            return None;
+        }
+        *current = incoming.to_string();
+        return Some(appended.to_string());
+    }
+
+    // Some providers may replay a long trailing segment on retry/resume boundaries.
+    // Ignore only long tails to avoid dropping legitimate tiny repeats (e.g. "ha" + "ha").
+    if incoming.len() >= 16 && current.ends_with(incoming) {
+        return None;
+    }
+
+    current.push_str(incoming);
+    Some(incoming.to_string())
 }
 
 fn update_usage_from_openai(usage: &mut Usage, value: &Value) {
@@ -666,25 +750,10 @@ fn update_usage_from_openai(usage: &mut Usage, value: &Value) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
-fn join_url(base_url: &str, path: &str) -> String {
-    if base_url.ends_with('/') {
-        format!("{base_url}{path}")
-    } else {
-        format!("{base_url}/{path}")
-    }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ThinkingLevel;
+    use crate::types::{Cost, ThinkingLevel};
     use std::io::{self, Read};
 
     fn sample_model() -> Model {
@@ -838,5 +907,38 @@ mod tests {
                 "[DONE]".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn merge_stream_delta_supports_incremental_and_snapshot_chunks() {
+        let mut value = String::new();
+
+        assert_eq!(
+            merge_stream_delta(&mut value, "Ana"),
+            Some("Ana".to_string())
+        );
+        assert_eq!(value, "Ana");
+
+        assert_eq!(
+            merge_stream_delta(&mut value, "Analyzing"),
+            Some("lyzing".to_string())
+        );
+        assert_eq!(value, "Analyzing");
+
+        assert_eq!(merge_stream_delta(&mut value, "Analyzing"), None);
+        assert_eq!(value, "Analyzing");
+
+        assert_eq!(
+            merge_stream_delta(&mut value, " code path"),
+            Some(" code path".to_string())
+        );
+        assert_eq!(value, "Analyzing code path");
+    }
+
+    #[test]
+    fn openai_client_is_reused_across_requests() {
+        let first = shared_http_client("https://api.openai.com/v1");
+        let second = shared_http_client("https://api.openai.com/v1");
+        assert!(std::ptr::eq(first, second));
     }
 }

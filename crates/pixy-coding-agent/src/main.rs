@@ -1,17 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser};
 use pixy_ai::{
-    AssistantContentBlock, Cost, Message, Model, SimpleStreamOptions, StopReason,
-    ToolResultContentBlock,
+    AssistantContentBlock, Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Message, Model,
+    SimpleStreamOptions, StopReason, ToolResultContentBlock,
 };
 use pixy_coding_agent::{
     AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, LoadSkillsOptions, SessionManager,
-    Skill, create_coding_tools, load_skills,
+    Skill, SkillSource, create_coding_tools, load_skills,
 };
 use pixy_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
@@ -20,6 +21,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod system_prompt;
+
+const RESUME_PICKER_LIMIT: usize = 10;
 
 #[derive(Parser, Debug)]
 #[command(name = "pixy", version, about = "pixy interactive CLI")]
@@ -123,6 +126,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         .map(|path| resolve_path(&cwd, path))
         .unwrap_or_else(default_agent_dir);
     let local_config = load_agent_local_config(&agent_dir)?;
+    pixy_ai::set_transport_retry_count(resolve_transport_retry_count(&local_config.settings));
     let runtime = resolve_runtime_config(&args, &local_config)?;
     let discovered_skills = load_runtime_skills(&args, &local_config, &cwd, &agent_dir);
 
@@ -171,6 +175,8 @@ async fn run(args: ChatArgs) -> Result<(), String> {
                 )
             })
             .unwrap_or(false);
+        let startup_resource_lines =
+            build_startup_resource_lines(&cwd, &agent_dir, &discovered_skills);
         let mut tui_options = TuiOptions {
             app_name: "pixy".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -181,6 +187,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
             theme,
             input_history_path: Some(agent_dir.join("input_history.jsonl")),
             enable_mouse_capture,
+            startup_resource_lines,
             ..TuiOptions::default()
         };
         if let Some(keybindings) = load_tui_keybindings(&agent_dir) {
@@ -233,6 +240,117 @@ fn format_token_window(value: u32) -> String {
         format!("{}k", formatted.trim_end_matches('0').trim_end_matches('.'))
     } else {
         value.to_string()
+    }
+}
+
+fn build_startup_resource_lines(cwd: &Path, agent_dir: &Path, skills: &[Skill]) -> Vec<String> {
+    let mut lines = vec![];
+    let contexts = collect_startup_context_files(cwd, agent_dir);
+    if !contexts.is_empty() {
+        lines.push("[Context]".to_string());
+        lines.extend(
+            contexts
+                .iter()
+                .map(|path| format!("  {}", format_display_path(path))),
+        );
+    }
+
+    let mut user_skills = vec![];
+    let mut project_skills = vec![];
+    let mut path_skills = vec![];
+    for skill in skills {
+        let rendered = format_display_path(&skill.file_path);
+        match skill.source {
+            SkillSource::User => user_skills.push(rendered),
+            SkillSource::Project => project_skills.push(rendered),
+            SkillSource::Path => path_skills.push(rendered),
+        }
+    }
+
+    for group in [&mut user_skills, &mut project_skills, &mut path_skills] {
+        group.sort();
+        group.dedup();
+    }
+
+    let has_skills =
+        !user_skills.is_empty() || !project_skills.is_empty() || !path_skills.is_empty();
+    if has_skills {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[Skills]".to_string());
+        append_skill_group(&mut lines, "user", &user_skills);
+        append_skill_group(&mut lines, "project", &project_skills);
+        append_skill_group(&mut lines, "path", &path_skills);
+    }
+
+    lines
+}
+
+fn append_skill_group(lines: &mut Vec<String>, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    lines.push(format!("  {label}"));
+    lines.extend(values.iter().map(|value| format!("    {value}")));
+}
+
+fn collect_startup_context_files(cwd: &Path, agent_dir: &Path) -> Vec<PathBuf> {
+    let mut contexts = vec![];
+    let mut seen = HashSet::<PathBuf>::new();
+
+    if let Some(global_context) = find_context_file_in_dir(agent_dir) {
+        push_unique_path(&mut contexts, &mut seen, global_context);
+    }
+
+    let mut ancestor_contexts = vec![];
+    let mut current = cwd.to_path_buf();
+    loop {
+        if let Some(context_file) = find_context_file_in_dir(&current) {
+            push_unique_path(&mut ancestor_contexts, &mut seen, context_file);
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    ancestor_contexts.reverse();
+    contexts.extend(ancestor_contexts);
+
+    contexts
+}
+
+fn push_unique_path(out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if seen.insert(key) {
+        out.push(path);
+    }
+}
+
+fn find_context_file_in_dir(dir: &Path) -> Option<PathBuf> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn format_display_path(path: &Path) -> String {
+    let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    let Ok(stripped) = path.strip_prefix(&home_dir) else {
+        return path.display().to_string();
+    };
+    if stripped.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        format!("~/{}", stripped.display())
     }
 }
 
@@ -325,11 +443,28 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
         }
 
         if input.starts_with("/resume") {
-            let target = input
+            let explicit_target = input
                 .strip_prefix("/resume")
                 .map(str::trim)
-                .filter(|value| !value.is_empty());
-            match session.resume(target) {
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let target = if let Some(target) = explicit_target {
+                Some(target)
+            } else {
+                match prompt_resume_target_selection(session, RESUME_PICKER_LIMIT) {
+                    Ok(Some(path)) => Some(path.display().to_string()),
+                    Ok(None) => {
+                        println!("resume cancelled");
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("resume failed: {error}");
+                        continue;
+                    }
+                }
+            };
+
+            match session.resume(target.as_deref()) {
                 Ok(path) => println!("resumed: {}", path.display()),
                 Err(error) => eprintln!("resume failed: {error}"),
             }
@@ -344,7 +479,7 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
                     "  /continue  continue from current context without adding a user message"
                 );
                 println!(
-                    "  /resume [session]  resume from latest history session or a specific session file"
+                    "  /resume [session]  choose from recent sessions (or pass a session file directly)"
                 );
                 println!("  /session   print current session file path");
                 println!("  /help      show this help");
@@ -371,6 +506,90 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
             }
         }
     }
+}
+
+fn prompt_resume_target_selection(
+    session: &AgentSession,
+    limit: usize,
+) -> Result<Option<PathBuf>, String> {
+    let candidates = session.recent_resumable_sessions(limit)?;
+    if candidates.is_empty() {
+        return Err("No historical sessions available to resume".to_string());
+    }
+
+    println!("recent sessions:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!(
+            "  {}. {}",
+            index + 1,
+            format_resume_candidate_name(candidate)
+        );
+    }
+    println!(
+        "  0. latest ({})",
+        format_resume_candidate_name(&candidates[0])
+    );
+
+    loop {
+        print!(
+            "select session [0-{}, Enter=0, q=cancel]: ",
+            candidates.len()
+        );
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("stdout flush failed: {error}"))?;
+
+        let mut selection = String::new();
+        io::stdin()
+            .read_line(&mut selection)
+            .map_err(|error| format!("stdin read failed: {error}"))?;
+
+        match resolve_resume_picker_selection(&candidates, &selection) {
+            Ok(value) => return Ok(value),
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+}
+
+fn format_resume_candidate_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn resolve_resume_picker_selection(
+    candidates: &[PathBuf],
+    raw_input: &str,
+) -> Result<Option<PathBuf>, String> {
+    if candidates.is_empty() {
+        return Err("No historical sessions available to resume".to_string());
+    }
+
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(Some(candidates[0].clone()));
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "q" | "quit" | "cancel") {
+        return Ok(None);
+    }
+
+    let choice = trimmed.parse::<usize>().map_err(|_| {
+        format!(
+            "Invalid selection '{trimmed}'. Enter a number between 0 and {}, or q to cancel.",
+            candidates.len()
+        )
+    })?;
+    if choice == 0 || choice > candidates.len() {
+        return Err(format!(
+            "Invalid selection '{trimmed}'. Enter a number between 1 and {}, or q to cancel.",
+            candidates.len()
+        ));
+    }
+
+    Ok(Some(candidates[choice - 1].clone()))
 }
 
 async fn run_prompt_streaming_cli(
@@ -433,6 +652,8 @@ struct CliStreamRenderer<W: Write> {
     show_tool_results: bool,
     saw_updates: bool,
     assistant_delta_open: bool,
+    thinking_line_open: bool,
+    thinking_visual_lines: usize,
 }
 
 impl<W: Write> CliStreamRenderer<W> {
@@ -442,6 +663,8 @@ impl<W: Write> CliStreamRenderer<W> {
             show_tool_results,
             saw_updates: false,
             assistant_delta_open: false,
+            thinking_line_open: false,
+            thinking_visual_lines: 0,
         }
     }
 
@@ -456,16 +679,47 @@ impl<W: Write> CliStreamRenderer<W> {
                 if delta.is_empty() {
                     return Ok(());
                 }
+                if self.thinking_line_open {
+                    writeln!(self.writer)
+                        .map_err(|error| format!("stdout write failed: {error}"))?;
+                    self.thinking_line_open = false;
+                }
                 write!(self.writer, "{delta}")
                     .and_then(|_| self.writer.flush())
                     .map_err(|error| format!("stdout write failed: {error}"))?;
                 self.assistant_delta_open = true;
             }
             AgentSessionStreamUpdate::AssistantLine(line) => {
-                if self.assistant_delta_open {
+                if is_thinking_line(&line) {
+                    if self.assistant_delta_open {
+                        writeln!(self.writer)
+                            .map_err(|error| format!("stdout write failed: {error}"))?;
+                        self.assistant_delta_open = false;
+                    }
+                    if self.thinking_line_open {
+                        self.clear_thinking_block()?;
+                    }
+                    if !line.is_empty() {
+                        write!(self.writer, "{line}")
+                            .and_then(|_| self.writer.flush())
+                            .map_err(|error| format!("stdout write failed: {error}"))?;
+                    }
+                    if !line.is_empty() {
+                        self.thinking_visual_lines = estimate_visual_line_count(&line);
+                        self.thinking_line_open = true;
+                    } else {
+                        self.thinking_visual_lines = 0;
+                        self.thinking_line_open = false;
+                    }
+                    return Ok(());
+                }
+
+                if self.assistant_delta_open || self.thinking_line_open {
                     writeln!(self.writer)
                         .map_err(|error| format!("stdout write failed: {error}"))?;
                     self.assistant_delta_open = false;
+                    self.thinking_line_open = false;
+                    self.thinking_visual_lines = 0;
                 }
                 if !line.is_empty() {
                     writeln!(self.writer, "{line}")
@@ -476,10 +730,12 @@ impl<W: Write> CliStreamRenderer<W> {
                 if !self.show_tool_results {
                     return Ok(());
                 }
-                if self.assistant_delta_open {
+                if self.assistant_delta_open || self.thinking_line_open {
                     writeln!(self.writer)
                         .map_err(|error| format!("stdout write failed: {error}"))?;
                     self.assistant_delta_open = false;
+                    self.thinking_line_open = false;
+                    self.thinking_visual_lines = 0;
                 }
                 writeln!(self.writer, "{line}")
                     .map_err(|error| format!("stdout write failed: {error}"))?;
@@ -489,9 +745,24 @@ impl<W: Write> CliStreamRenderer<W> {
     }
 
     fn finish(&mut self) -> Result<(), String> {
-        if self.assistant_delta_open {
+        if self.assistant_delta_open || self.thinking_line_open {
             writeln!(self.writer).map_err(|error| format!("stdout write failed: {error}"))?;
             self.assistant_delta_open = false;
+            self.thinking_line_open = false;
+            self.thinking_visual_lines = 0;
+        }
+        Ok(())
+    }
+
+    fn clear_thinking_block(&mut self) -> Result<(), String> {
+        let lines = self.thinking_visual_lines.max(1);
+        for idx in 0..lines {
+            write!(self.writer, "\r\x1b[2K")
+                .map_err(|error| format!("stdout write failed: {error}"))?;
+            if idx + 1 < lines {
+                write!(self.writer, "\x1b[1A")
+                    .map_err(|error| format!("stdout write failed: {error}"))?;
+            }
         }
         Ok(())
     }
@@ -500,6 +771,33 @@ impl<W: Write> CliStreamRenderer<W> {
     fn into_inner(self) -> W {
         self.writer
     }
+}
+
+fn is_thinking_line(line: &str) -> bool {
+    line.starts_with("[thinking]")
+}
+
+fn estimate_visual_line_count(text: &str) -> usize {
+    let width = terminal_columns().max(1) as usize;
+    let mut total = 0usize;
+    for segment in text.split('\n') {
+        let chars = segment.chars().count();
+        let rows = if chars == 0 {
+            1
+        } else {
+            ((chars - 1) / width) + 1
+        };
+        total += rows;
+    }
+    total.max(1)
+}
+
+fn terminal_columns() -> u16 {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(80)
 }
 
 fn render_messages(messages: &[Message], show_tool_results: bool) {
@@ -579,11 +877,19 @@ fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn default_agent_dir() -> PathBuf {
+fn default_pixy_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pixy/agent")
+        .join(".pixy")
+}
+
+fn default_pixy_config_path() -> PathBuf {
+    default_pixy_dir().join("pixy.toml")
+}
+
+fn default_agent_dir() -> PathBuf {
+    default_pixy_dir().join("agent")
 }
 
 fn resolve_tui_theme_name(
@@ -667,6 +973,10 @@ fn load_tui_keybindings(agent_dir: &Path) -> Option<TuiKeyBindings> {
         keybindings.continue_run = bindings;
         changed = true;
     }
+    if let Some(bindings) = object.get("dequeue").and_then(parse_keybinding_values) {
+        keybindings.dequeue = bindings;
+        changed = true;
+    }
     if let Some(bindings) = object.get("newline").and_then(parse_keybinding_values) {
         keybindings.newline = bindings;
         changed = true;
@@ -692,34 +1002,34 @@ fn parse_keybinding_values(value: &serde_json::Value) -> Option<Vec<KeyBinding>>
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct AgentSettingsFile {
-    #[serde(rename = "defaultProvider")]
     default_provider: Option<String>,
-    #[serde(rename = "defaultModel")]
-    default_model: Option<String>,
     theme: Option<String>,
-    #[serde(default)]
+    transport_retry_count: Option<usize>,
     skills: Vec<String>,
-    #[serde(default)]
     env: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct ModelsFile {
-    #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct ProviderConfig {
+    provider: Option<String>,
+    kind: Option<String>,
     api: Option<String>,
-    #[serde(rename = "baseUrl")]
     base_url: Option<String>,
-    #[serde(rename = "apiKey")]
     api_key: Option<String>,
-    #[serde(default)]
+    default_model: Option<String>,
+    weight: u8,
     models: Vec<ProviderModelConfig>,
+}
+
+fn default_provider_weight() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -738,6 +1048,54 @@ struct ProviderModelConfig {
     max_tokens: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlFile {
+    #[serde(default)]
+    llm: PixyTomlLlm,
+    theme: Option<String>,
+    #[serde(default)]
+    transport_retry_count: Option<usize>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlLlm {
+    #[serde(default)]
+    default_provider: Option<String>,
+    #[serde(default)]
+    providers: Vec<PixyTomlProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlProvider {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    api: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default = "default_provider_weight")]
+    weight: u8,
+    #[serde(default)]
+    reasoning: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<pixy_ai::ThinkingLevel>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AgentLocalConfig {
     settings: AgentSettingsFile,
@@ -751,20 +1109,128 @@ struct ResolvedRuntimeConfig {
     api_key: Option<String>,
 }
 
-fn load_agent_local_config(agent_dir: &Path) -> Result<AgentLocalConfig, String> {
-    let settings_path = agent_dir.join("settings.json");
-    let models_path = agent_dir.join("models.json");
-
-    let settings = read_json_if_exists::<AgentSettingsFile>(&settings_path)?;
-    let models = read_json_if_exists::<ModelsFile>(&models_path)?;
-
-    Ok(AgentLocalConfig {
-        settings: settings.unwrap_or_default(),
-        models: models.unwrap_or_default(),
-    })
+#[derive(Debug, Clone)]
+pub struct LLMRouter {
+    slots: Vec<Slot>,
 }
 
-fn read_json_if_exists<T>(path: &Path) -> Result<Option<T>, String>
+#[derive(Debug, Clone)]
+struct Slot {
+    provider: String,
+    weight: u8,
+}
+
+impl LLMRouter {
+    fn from_provider_configs(providers: &HashMap<String, ProviderConfig>) -> Result<Self, String> {
+        let mut slots = Vec::with_capacity(providers.len());
+        for (provider, config) in providers {
+            if !is_chat_provider(config) {
+                continue;
+            }
+            if config.weight >= 100 {
+                return Err(format!(
+                    "Provider '{provider}' has invalid weight {}, expected value < 100",
+                    config.weight
+                ));
+            }
+            slots.push(Slot {
+                provider: provider.clone(),
+                weight: config.weight,
+            });
+        }
+        slots.sort_by(|left, right| left.provider.cmp(&right.provider));
+        Ok(Self { slots })
+    }
+
+    fn select_provider(&self, seed: u64) -> Option<String> {
+        let total_weight: u64 = self.slots.iter().map(|slot| slot.weight as u64).sum();
+        if total_weight == 0 {
+            return None;
+        }
+
+        let mut cursor = seed % total_weight;
+        for slot in &self.slots {
+            let weight = slot.weight as u64;
+            if weight == 0 {
+                continue;
+            }
+            if cursor < weight {
+                return Some(slot.provider.clone());
+            }
+            cursor -= weight;
+        }
+        None
+    }
+}
+
+fn load_agent_local_config(_agent_dir: &Path) -> Result<AgentLocalConfig, String> {
+    let config_path = default_pixy_config_path();
+    let config = read_toml_if_exists::<PixyTomlFile>(&config_path)?;
+    Ok(config
+        .map(convert_pixy_toml_to_local_config)
+        .unwrap_or_default())
+}
+
+fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
+    let mut providers = HashMap::new();
+    for provider in config.llm.providers {
+        if provider.name.trim().is_empty() {
+            continue;
+        }
+
+        let provider_key = provider.name.trim().to_string();
+        let model_id = provider.model.clone().map(|value| value.trim().to_string());
+        let provider_model =
+            model_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .map(|id| ProviderModelConfig {
+                    id,
+                    api: provider.api.clone(),
+                    base_url: provider.base_url.clone(),
+                    reasoning: provider.reasoning,
+                    reasoning_effort: provider.reasoning_effort.clone(),
+                    context_window: provider.context_window,
+                    max_tokens: provider.max_tokens,
+                });
+
+        let provider_config = ProviderConfig {
+            provider: provider
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            kind: provider.kind,
+            api: provider.api,
+            base_url: provider.base_url,
+            api_key: provider.api_key,
+            default_model: model_id.filter(|id| !id.is_empty()),
+            weight: provider.weight,
+            models: provider_model.into_iter().collect(),
+        };
+        providers.insert(provider_key, provider_config);
+    }
+
+    AgentLocalConfig {
+        settings: AgentSettingsFile {
+            default_provider: config.llm.default_provider,
+            theme: config.theme,
+            transport_retry_count: config.transport_retry_count,
+            skills: config.skills,
+            env: config.env,
+        },
+        models: ModelsFile { providers },
+    }
+}
+
+fn resolve_transport_retry_count(settings: &AgentSettingsFile) -> usize {
+    settings
+        .transport_retry_count
+        .unwrap_or(DEFAULT_TRANSPORT_RETRY_COUNT)
+}
+
+fn read_toml_if_exists<T>(path: &Path) -> Result<Option<T>, String>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -774,7 +1240,7 @@ where
 
     let content = std::fs::read_to_string(path)
         .map_err(|error| format!("read {} failed: {error}", path.display()))?;
-    let parsed = serde_json::from_str::<T>(&content)
+    let parsed = toml::from_str::<T>(&content)
         .map_err(|error| format!("parse {} failed: {error}", path.display()))?;
     Ok(Some(parsed))
 }
@@ -783,27 +1249,66 @@ fn resolve_runtime_config(
     args: &ChatArgs,
     local: &AgentLocalConfig,
 ) -> Result<ResolvedRuntimeConfig, String> {
+    resolve_runtime_config_with_seed(args, local, runtime_router_seed())
+}
+
+fn runtime_router_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn resolve_runtime_config_with_seed(
+    args: &ChatArgs,
+    local: &AgentLocalConfig,
+    router_seed: u64,
+) -> Result<ResolvedRuntimeConfig, String> {
     let cli_model_parts = split_provider_model(args.model.as_deref());
-    let settings_model_parts = split_provider_model(local.settings.default_model.as_deref());
+    let explicit_provider = first_non_empty([args.provider.clone(), cli_model_parts.0.clone()]);
+    let routed_provider = if explicit_provider.is_none() {
+        resolve_weighted_provider_selection(local, router_seed)?
+    } else {
+        None
+    };
+    let settings_provider = local
+        .settings
+        .default_provider
+        .clone()
+        .filter(|value| value.trim() != "*");
 
     let provider = first_non_empty([
-        args.provider.clone(),
-        cli_model_parts.0.clone(),
-        local.settings.default_provider.clone(),
-        settings_model_parts.0.clone(),
+        explicit_provider,
+        routed_provider,
+        settings_provider,
         infer_single_provider(local),
         Some("openai".to_string()),
     ])
     .ok_or_else(|| "Unable to resolve provider".to_string())?;
 
+    let provider_config = local.models.providers.get(&provider);
+    if let Some(config) = provider_config {
+        if config.weight >= 100 {
+            return Err(format!(
+                "Provider '{provider}' has invalid weight {}, expected value < 100",
+                config.weight
+            ));
+        }
+        if !is_chat_provider(config) {
+            let kind = config.kind.as_deref().unwrap_or("unknown");
+            return Err(format!(
+                "Provider '{provider}' has kind '{kind}', expected 'chat' for coding sessions"
+            ));
+        }
+    }
+    let provider_name = resolve_provider_name(&provider, provider_config);
     let model_id = first_non_empty([
         cli_model_parts.1.clone(),
-        settings_model_parts.1.clone(),
-        default_model_for_provider(&provider),
+        provider_config_default_model(provider_config),
+        default_model_for_provider(&provider_name),
     ])
     .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
 
-    let provider_config = local.models.providers.get(&provider);
     let selected_model_cfg = provider_config.and_then(|provider_config| {
         provider_config
             .models
@@ -815,14 +1320,24 @@ fn resolve_runtime_config(
         args.api.clone(),
         selected_model_cfg.and_then(|model| model.api.clone()),
         provider_config.and_then(|provider| provider.api.clone()),
-        infer_api_for_provider(&provider),
+        infer_api_for_provider(&provider_name),
     ])
     .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
 
+    let cli_base_url = args
+        .base_url
+        .as_ref()
+        .and_then(|value| resolve_config_value(value, &local.settings.env));
+    let model_base_url = selected_model_cfg
+        .and_then(|model| model.base_url.as_ref())
+        .and_then(|value| resolve_config_value(value, &local.settings.env));
+    let provider_base_url = provider_config
+        .and_then(|provider| provider.base_url.as_ref())
+        .and_then(|value| resolve_config_value(value, &local.settings.env));
     let base_url = first_non_empty([
-        args.base_url.clone(),
-        selected_model_cfg.and_then(|model| model.base_url.clone()),
-        provider_config.and_then(|provider| provider.base_url.clone()),
+        cli_base_url,
+        model_base_url,
+        provider_base_url,
         default_base_url_for_api(&api),
     ])
     .ok_or_else(|| format!("Unable to resolve base URL for api '{api}'"))?;
@@ -839,19 +1354,30 @@ fn resolve_runtime_config(
     let api_key = provider_config
         .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
         .and_then(|value| resolve_config_value(value, &local.settings.env))
-        .or_else(|| infer_api_key_from_settings(&provider, &local.settings.env))
-        .or_else(|| std::env::var(primary_env_key_for_provider(&provider)).ok());
+        .or_else(|| infer_api_key_from_settings(&provider_name, &local.settings.env))
+        .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
+
+    let reasoning = selected_model_cfg
+        .and_then(|cfg| cfg.reasoning)
+        .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
+    let reasoning_effort = selected_model_cfg
+        .and_then(|cfg| cfg.reasoning_effort.clone())
+        .or_else(|| {
+            if reasoning {
+                Some(pixy_ai::ThinkingLevel::Medium)
+            } else {
+                None
+            }
+        });
 
     let model = Model {
         id: model_id.clone(),
         name: model_id,
         api,
-        provider,
+        provider: provider_name.clone(),
         base_url,
-        reasoning: selected_model_cfg
-            .and_then(|cfg| cfg.reasoning)
-            .unwrap_or(false),
-        reasoning_effort: selected_model_cfg.and_then(|cfg| cfg.reasoning_effort.clone()),
+        reasoning,
+        reasoning_effort,
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,
@@ -872,7 +1398,7 @@ fn resolve_runtime_config(
                 .map(|entry| {
                     model_from_config(
                         entry,
-                        &model.provider,
+                        &provider_name,
                         &model.api,
                         &model.base_url,
                         model.context_window,
@@ -899,12 +1425,71 @@ fn resolve_runtime_config(
     })
 }
 
+fn resolve_weighted_provider_selection(
+    local: &AgentLocalConfig,
+    router_seed: u64,
+) -> Result<Option<String>, String> {
+    let use_weighted_provider = local
+        .settings
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|provider| provider == "*");
+    if !use_weighted_provider {
+        return Ok(None);
+    }
+
+    let router = LLMRouter::from_provider_configs(&local.models.providers)?;
+    let provider = router.select_provider(router_seed).ok_or_else(|| {
+        "default_provider='*' requires at least one chat provider with non-zero weight in ~/.pixy/pixy.toml".to_string()
+    })?;
+    Ok(Some(provider))
+}
+
+fn provider_config_default_model(provider_config: Option<&ProviderConfig>) -> Option<String> {
+    provider_config.and_then(|config| {
+        first_non_empty([
+            config.default_model.clone(),
+            config.models.first().map(|entry| entry.id.clone()),
+        ])
+    })
+}
+
+fn resolve_provider_name(provider_key: &str, provider_config: Option<&ProviderConfig>) -> String {
+    provider_config
+        .and_then(|config| config.provider.clone())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| provider_key.to_string())
+}
+
 fn infer_single_provider(local: &AgentLocalConfig) -> Option<String> {
-    if local.models.providers.len() == 1 {
-        local.models.providers.keys().next().cloned()
+    let chat_providers = local
+        .models
+        .providers
+        .iter()
+        .filter(|(_, config)| is_chat_provider(config))
+        .map(|(provider, _)| provider.clone())
+        .collect::<Vec<_>>();
+    if chat_providers.len() == 1 {
+        chat_providers.into_iter().next()
     } else {
         None
     }
+}
+
+fn is_chat_provider(config: &ProviderConfig) -> bool {
+    config
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .map_or(true, |kind| kind.eq_ignore_ascii_case("chat"))
 }
 
 fn model_from_config(
@@ -924,6 +1509,16 @@ fn model_from_config(
         .clone()
         .or_else(|| default_base_url_for_api(&api))
         .unwrap_or_else(|| default_base_url.to_string());
+    let reasoning = config
+        .reasoning
+        .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
+    let reasoning_effort = config.reasoning_effort.clone().or_else(|| {
+        if reasoning {
+            Some(pixy_ai::ThinkingLevel::Medium)
+        } else {
+            None
+        }
+    });
 
     Model {
         id: config.id.clone(),
@@ -931,8 +1526,8 @@ fn model_from_config(
         api,
         provider: provider.to_string(),
         base_url,
-        reasoning: config.reasoning.unwrap_or(false),
-        reasoning_effort: config.reasoning_effort.clone(),
+        reasoning,
+        reasoning_effort,
         input: vec!["text".to_string()],
         cost: Cost {
             input: 0.0,
@@ -944,6 +1539,16 @@ fn model_from_config(
         context_window: config.context_window.unwrap_or(default_context_window),
         max_tokens: config.max_tokens.unwrap_or(default_max_tokens),
     }
+}
+
+fn default_reasoning_enabled_for_api(api: &str) -> bool {
+    matches!(
+        api,
+        "openai-responses"
+            | "openai-completions"
+            | "openai-codex-responses"
+            | "azure-openai-responses"
+    )
 }
 
 fn dedupe_models(models: &mut Vec<Model>) {
@@ -1006,9 +1611,9 @@ fn infer_api_for_provider(provider: &str) -> Option<String> {
 
 fn default_model_for_provider(provider: &str) -> Option<String> {
     match provider {
-        "openai" | "openai-completions" => Some("gpt-4.1-mini".to_string()),
+        "openai" | "openai-completions" => Some("gpt-5.3-codex".to_string()),
         "openai-responses" | "azure-openai" | "azure-openai-responses" => {
-            Some("gpt-4.1-mini".to_string())
+            Some("gpt-5.3-codex".to_string())
         }
         "openai-codex-responses" | "codex" => Some("codex-mini-latest".to_string()),
         "anthropic" | "anthropic-messages" => Some("claude-3-5-sonnet-latest".to_string()),
@@ -1147,8 +1752,8 @@ mod tests {
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: Some("anthropic".to_string()),
-                default_model: Some("claude-opus-4-6".to_string()),
                 theme: None,
+                transport_retry_count: None,
                 skills: vec![],
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
@@ -1159,9 +1764,13 @@ mod tests {
                 providers: HashMap::from([(
                     "anthropic".to_string(),
                     ProviderConfig {
+                        provider: None,
+                        kind: None,
                         api: None,
                         base_url: Some("https://custom.anthropic.local".to_string()),
                         api_key: Some("model-json-token".to_string()),
+                        default_model: Some("claude-opus-4-6".to_string()),
+                        weight: 1,
                         models: vec![],
                     },
                 )]),
@@ -1175,6 +1784,257 @@ mod tests {
         assert_eq!(resolved.model.id, "claude-opus-4-6");
         assert_eq!(resolved.model.base_url, "https://custom.anthropic.local");
         assert_eq!(resolved.api_key.as_deref(), Some("model-json-token"));
+    }
+
+    #[test]
+    fn wildcard_default_provider_selects_provider_by_weight() {
+        let args = test_chat_args();
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("*".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([
+                    (
+                        "openai".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("openai-responses".to_string()),
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("gpt-5.3-codex".to_string()),
+                            weight: 80,
+                            models: vec![],
+                        },
+                    ),
+                    (
+                        "anthropic".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("anthropic-messages".to_string()),
+                            base_url: Some("https://api.anthropic.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("claude-3-5-sonnet-latest".to_string()),
+                            weight: 20,
+                            models: vec![],
+                        },
+                    ),
+                ]),
+            },
+        };
+
+        let weighted_anthropic = resolve_runtime_config_with_seed(&args, &local, 10)
+            .expect("runtime config should resolve");
+        assert_eq!(weighted_anthropic.model.provider, "anthropic");
+
+        let weighted_openai = resolve_runtime_config_with_seed(&args, &local, 90)
+            .expect("runtime config should resolve");
+        assert_eq!(weighted_openai.model.provider, "openai");
+    }
+
+    #[test]
+    fn wildcard_default_provider_rejects_invalid_provider_weight() {
+        let args = test_chat_args();
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("*".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        provider: None,
+                        kind: None,
+                        api: Some("openai-responses".to_string()),
+                        base_url: Some("https://api.openai.com/v1".to_string()),
+                        api_key: None,
+                        default_model: Some("gpt-5.3-codex".to_string()),
+                        weight: 100,
+                        models: vec![],
+                    },
+                )]),
+            },
+        };
+
+        let error = resolve_runtime_config_with_seed(&args, &local, 0)
+            .expect_err("invalid weight should be rejected");
+        assert!(error.contains("expected value < 100"));
+    }
+
+    #[test]
+    fn fixed_provider_rejects_invalid_provider_weight() {
+        let mut args = test_chat_args();
+        args.provider = Some("openai".to_string());
+
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile::default(),
+            models: ModelsFile {
+                providers: HashMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        provider: None,
+                        kind: None,
+                        api: Some("openai-responses".to_string()),
+                        base_url: Some("https://api.openai.com/v1".to_string()),
+                        api_key: None,
+                        default_model: Some("gpt-5.3-codex".to_string()),
+                        weight: 100,
+                        models: vec![],
+                    },
+                )]),
+            },
+        };
+
+        let error = resolve_runtime_config_with_seed(&args, &local, 0)
+            .expect_err("invalid weight should be rejected");
+        assert!(error.contains("expected value < 100"));
+    }
+
+    #[test]
+    fn explicit_provider_bypasses_weighted_router_validation() {
+        let mut args = test_chat_args();
+        args.provider = Some("openai".to_string());
+        args.model = Some("gpt-5.3-codex".to_string());
+
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("*".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([
+                    (
+                        "openai".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("openai-responses".to_string()),
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("gpt-5.3-codex".to_string()),
+                            weight: 10,
+                            models: vec![],
+                        },
+                    ),
+                    (
+                        "anthropic".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("anthropic-messages".to_string()),
+                            base_url: Some("https://api.anthropic.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("claude-3-5-sonnet-latest".to_string()),
+                            weight: 100,
+                            models: vec![],
+                        },
+                    ),
+                ]),
+            },
+        };
+
+        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+            .expect("runtime config should resolve");
+        assert_eq!(resolved.model.provider, "openai");
+        assert_eq!(resolved.model.id, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn fixed_default_provider_bypasses_weighted_router() {
+        let args = test_chat_args();
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("openai".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([
+                    (
+                        "openai".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("openai-responses".to_string()),
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("gpt-5.3-codex".to_string()),
+                            weight: 1,
+                            models: vec![],
+                        },
+                    ),
+                    (
+                        "anthropic".to_string(),
+                        ProviderConfig {
+                            provider: None,
+                            kind: None,
+                            api: Some("anthropic-messages".to_string()),
+                            base_url: Some("https://api.anthropic.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("claude-3-5-sonnet-latest".to_string()),
+                            weight: 99,
+                            models: vec![],
+                        },
+                    ),
+                ]),
+            },
+        };
+
+        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+            .expect("runtime config should resolve");
+        assert_eq!(resolved.model.provider, "openai");
+    }
+
+    #[test]
+    fn resolve_runtime_config_uses_first_provider_model_when_default_model_missing() {
+        let args = test_chat_args();
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("openai".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        provider: None,
+                        kind: None,
+                        api: Some("openai-responses".to_string()),
+                        base_url: Some("https://api.openai.com/v1".to_string()),
+                        api_key: None,
+                        default_model: None,
+                        weight: 1,
+                        models: vec![
+                            ProviderModelConfig {
+                                id: "gpt-4.1".to_string(),
+                                api: None,
+                                base_url: None,
+                                reasoning: None,
+                                reasoning_effort: None,
+                                context_window: None,
+                                max_tokens: None,
+                            },
+                            ProviderModelConfig {
+                                id: "gpt-5.3-codex".to_string(),
+                                api: None,
+                                base_url: None,
+                                reasoning: None,
+                                reasoning_effort: None,
+                                context_window: None,
+                                max_tokens: None,
+                            },
+                        ],
+                    },
+                )]),
+            },
+        };
+
+        let resolved =
+            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+        assert_eq!(resolved.model.id, "gpt-4.1");
     }
 
     #[test]
@@ -1204,8 +2064,8 @@ mod tests {
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: Some("anthropic".to_string()),
-                default_model: Some("claude-opus-4-6".to_string()),
                 theme: None,
+                transport_retry_count: None,
                 skills: vec![],
                 env: HashMap::new(),
             },
@@ -1246,8 +2106,8 @@ mod tests {
         let local = AgentLocalConfig {
             settings: AgentSettingsFile {
                 default_provider: None,
-                default_model: None,
                 theme: None,
+                transport_retry_count: None,
                 skills: vec![],
                 env: HashMap::from([(
                     "ANTHROPIC_AUTH_TOKEN".to_string(),
@@ -1263,11 +2123,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_base_url_can_be_resolved_from_settings_env() {
+        let mut args = test_chat_args();
+        args.provider = Some("openai".to_string());
+        args.model = Some("gpt-5.3-codex".to_string());
+
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                env: HashMap::from([(
+                    "LLM_BASE_URL".to_string(),
+                    "https://codex.databend.cloud".to_string(),
+                )]),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        provider: Some("openai".to_string()),
+                        kind: Some("chat".to_string()),
+                        api: Some("openai-responses".to_string()),
+                        base_url: Some("$LLM_BASE_URL".to_string()),
+                        api_key: None,
+                        default_model: Some("gpt-5.3-codex".to_string()),
+                        weight: 1,
+                        models: vec![],
+                    },
+                )]),
+            },
+        };
+
+        let resolved =
+            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+        assert_eq!(resolved.model.base_url, "https://codex.databend.cloud");
+    }
+
+    #[test]
     fn resolve_runtime_config_builds_model_catalog_with_selected_model_first() {
         let args = ChatArgs {
             api: None,
             provider: Some("openai".to_string()),
-            model: Some("gpt-4.1-mini".to_string()),
+            model: Some("gpt-5.3-codex".to_string()),
             base_url: None,
             context_window: None,
             max_tokens: None,
@@ -1292,9 +2188,13 @@ mod tests {
                 providers: HashMap::from([(
                     "openai".to_string(),
                     ProviderConfig {
+                        provider: None,
+                        kind: None,
                         api: Some("openai-completions".to_string()),
                         base_url: Some("https://api.openai.com/v1".to_string()),
                         api_key: None,
+                        default_model: None,
+                        weight: 1,
                         models: vec![
                             ProviderModelConfig {
                                 id: "gpt-4.1".to_string(),
@@ -1306,7 +2206,7 @@ mod tests {
                                 max_tokens: None,
                             },
                             ProviderModelConfig {
-                                id: "gpt-4.1-mini".to_string(),
+                                id: "gpt-5.3-codex".to_string(),
                                 api: None,
                                 base_url: None,
                                 reasoning: None,
@@ -1323,7 +2223,7 @@ mod tests {
         let resolved =
             resolve_runtime_config(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model_catalog.len(), 2);
-        assert_eq!(resolved.model_catalog[0].id, "gpt-4.1-mini");
+        assert_eq!(resolved.model_catalog[0].id, "gpt-5.3-codex");
         assert_eq!(resolved.model_catalog[1].id, "gpt-4.1");
     }
 
@@ -1343,7 +2243,8 @@ mod tests {
   "selectModel": "ctrl+k",
   "expandTools": ["invalid", "ctrl+e"],
   "toggleThinking": "ctrl+y",
-  "followUp": "alt+enter"
+  "followUp": "alt+enter",
+  "dequeue": "alt+up"
 }"#,
         )
         .expect("write keybindings");
@@ -1391,6 +2292,10 @@ mod tests {
         assert_eq!(
             bindings.continue_run,
             vec![parse_key_id("alt+enter").expect("parse alt+enter")]
+        );
+        assert_eq!(
+            bindings.dequeue,
+            vec![parse_key_id("alt+up").expect("parse alt+up")]
         );
     }
 
@@ -1484,6 +2389,55 @@ mod tests {
     }
 
     #[test]
+    fn cli_stream_renderer_updates_thinking_line_in_place() {
+        let mut renderer = CliStreamRenderer::new(Vec::<u8>::new(), true);
+
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(
+                "[thinking] a".to_string(),
+            ))
+            .expect("thinking line succeeds");
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(
+                "[thinking] ab".to_string(),
+            ))
+            .expect("thinking update succeeds");
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(String::new()))
+            .expect("flush line succeeds");
+        renderer.finish().expect("finish succeeds");
+
+        let output = String::from_utf8(renderer.into_inner()).expect("utf-8 output");
+        assert_eq!(output, "[thinking] a\r\u{1b}[2K[thinking] ab\n");
+    }
+
+    #[test]
+    fn cli_stream_renderer_replaces_multiline_thinking_block() {
+        let mut renderer = CliStreamRenderer::new(Vec::<u8>::new(), true);
+
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(
+                "[thinking] line1\nline2".to_string(),
+            ))
+            .expect("initial multiline thinking succeeds");
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(
+                "[thinking] line1\nline2 updated".to_string(),
+            ))
+            .expect("multiline thinking update succeeds");
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantLine(String::new()))
+            .expect("flush line succeeds");
+        renderer.finish().expect("finish succeeds");
+
+        let output = String::from_utf8(renderer.into_inner()).expect("utf-8 output");
+        assert_eq!(
+            output,
+            "[thinking] line1\nline2\r\u{1b}[2K\u{1b}[1A\r\u{1b}[2K[thinking] line1\nline2 updated\n"
+        );
+    }
+
+    #[test]
     fn resolve_runtime_config_supports_google_provider_inference() {
         let args = ChatArgs {
             api: None,
@@ -1518,6 +2472,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_config_defaults_reasoning_to_medium_when_unconfigured() {
+        let args = ChatArgs {
+            api: None,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.3-codex".to_string()),
+            base_url: None,
+            context_window: None,
+            max_tokens: None,
+            agent_dir: None,
+            cwd: None,
+            session_dir: None,
+            session_file: None,
+            system_prompt: Some("test".to_string()),
+            prompt: None,
+            continue_first: false,
+            no_tools: false,
+            skills: vec![],
+            no_skills: false,
+            hide_tool_results: false,
+            no_tui: false,
+            theme: None,
+        };
+        let local = AgentLocalConfig::default();
+
+        let resolved =
+            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+        assert!(resolved.model.reasoning);
+        assert_eq!(
+            resolved.model.reasoning_effort,
+            Some(pixy_ai::ThinkingLevel::Medium)
+        );
+    }
+
+    #[test]
     fn default_agent_dir_uses_pixy_home_directory() {
         unsafe {
             std::env::set_var("HOME", "/tmp/pixy-home");
@@ -1526,6 +2514,126 @@ mod tests {
             default_agent_dir(),
             PathBuf::from("/tmp/pixy-home/.pixy/agent")
         );
+    }
+
+    #[test]
+    fn load_agent_local_config_reads_pixy_toml() {
+        let dir = tempdir().expect("tempdir");
+        let pixy_dir = dir.path().join(".pixy");
+        std::fs::create_dir_all(&pixy_dir).expect("create .pixy");
+        std::fs::write(
+            pixy_dir.join("pixy.toml"),
+            r#"
+theme = "light"
+transport_retry_count = 7
+skills = ["./skills"]
+
+[env]
+OPENAI_KEY = "sk-test"
+
+[llm]
+default_provider = "*"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_KEY"
+model = "gpt-5.3-codex"
+weight = 30
+"#,
+        )
+        .expect("write pixy.toml");
+
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        let local = load_agent_local_config(Path::new(".")).expect("load config");
+        assert_eq!(local.settings.theme.as_deref(), Some("light"));
+        assert_eq!(local.settings.transport_retry_count, Some(7));
+        assert_eq!(local.settings.default_provider.as_deref(), Some("*"));
+        assert_eq!(
+            local.settings.env.get("OPENAI_KEY").map(String::as_str),
+            Some("sk-test")
+        );
+
+        let provider = local
+            .models
+            .providers
+            .get("openai")
+            .expect("openai provider exists");
+        assert_eq!(provider.provider.as_deref(), Some("openai"));
+        assert_eq!(provider.kind.as_deref(), Some("chat"));
+        assert_eq!(provider.default_model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(provider.weight, 30);
+        assert_eq!(provider.models.len(), 1);
+        assert_eq!(provider.models[0].id, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn wildcard_router_ignores_embedding_provider_kind() {
+        let args = test_chat_args();
+        let local = AgentLocalConfig {
+            settings: AgentSettingsFile {
+                default_provider: Some("*".to_string()),
+                ..AgentSettingsFile::default()
+            },
+            models: ModelsFile {
+                providers: HashMap::from([
+                    (
+                        "embed".to_string(),
+                        ProviderConfig {
+                            provider: Some("openai".to_string()),
+                            kind: Some("embedding".to_string()),
+                            api: Some("openai-responses".to_string()),
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("text-embedding-3-small".to_string()),
+                            weight: 99,
+                            models: vec![],
+                        },
+                    ),
+                    (
+                        "chat".to_string(),
+                        ProviderConfig {
+                            provider: Some("openai".to_string()),
+                            kind: Some("chat".to_string()),
+                            api: Some("openai-responses".to_string()),
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            api_key: None,
+                            default_model: Some("gpt-5.3-codex".to_string()),
+                            weight: 1,
+                            models: vec![],
+                        },
+                    ),
+                ]),
+            },
+        };
+
+        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+            .expect("runtime config should resolve");
+        assert_eq!(resolved.model.provider, "openai");
+        assert_eq!(resolved.model.id, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn resolve_transport_retry_count_defaults_to_five() {
+        assert_eq!(
+            resolve_transport_retry_count(&AgentSettingsFile::default()),
+            DEFAULT_TRANSPORT_RETRY_COUNT
+        );
+    }
+
+    #[test]
+    fn resolve_transport_retry_count_reads_settings_value() {
+        let settings = AgentSettingsFile {
+            transport_retry_count: Some(2),
+            ..AgentSettingsFile::default()
+        };
+        assert_eq!(resolve_transport_retry_count(&settings), 2);
     }
 
     #[test]
@@ -1611,9 +2719,13 @@ description: default discovered skill
                 providers: HashMap::from([(
                     "openai".to_string(),
                     ProviderConfig {
+                        provider: None,
+                        kind: None,
                         api: Some("openai-completions".to_string()),
                         base_url: Some("https://api.openai.com/v1".to_string()),
                         api_key: None,
+                        default_model: None,
+                        weight: 1,
                         models: vec![ProviderModelConfig {
                             id: "gpt-4.1".to_string(),
                             api: None,
@@ -1635,5 +2747,117 @@ description: default discovered skill
             resolved.model.reasoning_effort,
             Some(pixy_ai::ThinkingLevel::High)
         );
+    }
+
+    #[test]
+    fn collect_startup_context_files_prefers_agents_and_orders_scopes() {
+        let dir = tempdir().expect("temp dir");
+        let agent_dir = dir.path().join(".pixy/agent");
+        let project_root = dir.path().join("repo");
+        let nested = project_root.join("nested/workspace");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        std::fs::write(agent_dir.join("AGENTS.md"), "global").expect("write global agents");
+        std::fs::write(agent_dir.join("CLAUDE.md"), "global claude").expect("write global claude");
+        std::fs::write(project_root.join("AGENTS.md"), "project").expect("write project agents");
+        std::fs::write(nested.join("CLAUDE.md"), "nested").expect("write nested claude");
+
+        let contexts = collect_startup_context_files(&nested, &agent_dir);
+        assert_eq!(
+            contexts,
+            vec![
+                agent_dir.join("AGENTS.md"),
+                project_root.join("AGENTS.md"),
+                nested.join("CLAUDE.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_startup_resource_lines_lists_context_and_grouped_skills() {
+        let dir = tempdir().expect("temp dir");
+        let agent_dir = dir.path().join(".pixy/agent");
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(cwd.join("AGENTS.md"), "project").expect("write project agents");
+
+        let skills = vec![
+            Skill {
+                name: "project-skill".to_string(),
+                description: "project".to_string(),
+                file_path: cwd.join(".agents/skills/project/SKILL.md"),
+                base_dir: cwd.join(".agents/skills/project"),
+                source: pixy_coding_agent::SkillSource::Project,
+                disable_model_invocation: false,
+            },
+            Skill {
+                name: "path-skill".to_string(),
+                description: "path".to_string(),
+                file_path: cwd.join("custom/path-skill/SKILL.md"),
+                base_dir: cwd.join("custom/path-skill"),
+                source: pixy_coding_agent::SkillSource::Path,
+                disable_model_invocation: false,
+            },
+            Skill {
+                name: "user-skill".to_string(),
+                description: "user".to_string(),
+                file_path: agent_dir.join("skills/user/SKILL.md"),
+                base_dir: agent_dir.join("skills/user"),
+                source: pixy_coding_agent::SkillSource::User,
+                disable_model_invocation: false,
+            },
+        ];
+
+        let lines = build_startup_resource_lines(&cwd, &agent_dir, &skills);
+        assert!(lines.contains(&"[Context]".to_string()));
+        assert!(lines.contains(&"[Skills]".to_string()));
+        assert!(lines.contains(&"  user".to_string()));
+        assert!(lines.contains(&"  project".to_string()));
+        assert!(lines.contains(&"  path".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with(".agents/skills/project/SKILL.md")),
+            "project skill path should be rendered"
+        );
+    }
+
+    #[test]
+    fn resolve_resume_picker_selection_defaults_to_latest() {
+        let candidates = vec![PathBuf::from("/tmp/session-a.jsonl")];
+        let selected = resolve_resume_picker_selection(&candidates, "")
+            .expect("selection should parse")
+            .expect("selection should not cancel");
+        assert_eq!(selected, candidates[0]);
+    }
+
+    #[test]
+    fn resolve_resume_picker_selection_supports_numeric_choice() {
+        let candidates = vec![
+            PathBuf::from("/tmp/session-a.jsonl"),
+            PathBuf::from("/tmp/session-b.jsonl"),
+        ];
+        let selected = resolve_resume_picker_selection(&candidates, "2")
+            .expect("selection should parse")
+            .expect("selection should not cancel");
+        assert_eq!(selected, candidates[1]);
+    }
+
+    #[test]
+    fn resolve_resume_picker_selection_supports_cancel() {
+        let candidates = vec![PathBuf::from("/tmp/session-a.jsonl")];
+        let selected =
+            resolve_resume_picker_selection(&candidates, "q").expect("selection should parse");
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn resolve_resume_picker_selection_rejects_out_of_range_choice() {
+        let candidates = vec![PathBuf::from("/tmp/session-a.jsonl")];
+        let error =
+            resolve_resume_picker_selection(&candidates, "2").expect_err("selection should fail");
+        assert!(error.contains("between 1 and 1"));
     }
 }

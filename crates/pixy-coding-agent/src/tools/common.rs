@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pixy_agent_core::AgentToolResult;
-use pixy_ai::ToolResultContentBlock;
+use pixy_ai::{PiAiError, PiAiErrorCode, ToolResultContentBlock};
 use serde_json::Value;
 
-pub(super) const DEFAULT_MAX_LINES: usize = 1024;
-pub(super) const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+pub(super) const DEFAULT_MAX_LINES: usize = 4096;
+pub(super) const DEFAULT_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) enum TruncatedBy {
@@ -152,14 +152,14 @@ pub(super) fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
-pub(super) fn get_required_string(args: &Value, key: &str) -> Result<String, String> {
+pub(super) fn get_required_string(args: &Value, key: &str) -> Result<String, PiAiError> {
     args.get(key)
         .and_then(Value::as_str)
         .map(|value| value.to_string())
-        .ok_or_else(|| format!("Missing or invalid `{key}`"))
+        .ok_or_else(|| invalid_tool_args(format!("Missing or invalid `{key}`")))
 }
 
-pub(super) fn get_optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+pub(super) fn get_optional_usize(args: &Value, key: &str) -> Result<Option<usize>, PiAiError> {
     match args.get(key) {
         None => Ok(None),
         Some(value) if value.is_null() => Ok(None),
@@ -167,30 +167,38 @@ pub(super) fn get_optional_usize(args: &Value, key: &str) -> Result<Option<usize
             if let Some(raw) = value.as_u64() {
                 return usize::try_from(raw)
                     .map(Some)
-                    .map_err(|_| format!("`{key}` is too large"));
+                    .map_err(|_| invalid_tool_args(format!("`{key}` is too large")));
             }
             if let Some(raw) = value.as_i64() {
                 if raw < 0 {
-                    return Err(format!("`{key}` must be >= 0"));
+                    return Err(invalid_tool_args(format!("`{key}` must be >= 0")));
                 }
                 return usize::try_from(raw as u64)
                     .map(Some)
-                    .map_err(|_| format!("`{key}` is too large"));
+                    .map_err(|_| invalid_tool_args(format!("`{key}` is too large")));
             }
-            Err(format!("Missing or invalid `{key}`"))
+            Err(invalid_tool_args(format!("Missing or invalid `{key}`")))
         }
     }
 }
 
-pub(super) fn get_optional_f64(args: &Value, key: &str) -> Result<Option<f64>, String> {
+pub(super) fn get_optional_f64(args: &Value, key: &str) -> Result<Option<f64>, PiAiError> {
     match args.get(key) {
         None => Ok(None),
         Some(value) if value.is_null() => Ok(None),
         Some(value) => value
             .as_f64()
             .map(Some)
-            .ok_or_else(|| format!("Missing or invalid `{key}`")),
+            .ok_or_else(|| invalid_tool_args(format!("Missing or invalid `{key}`"))),
     }
+}
+
+pub(super) fn invalid_tool_args(message: impl Into<String>) -> PiAiError {
+    PiAiError::new(PiAiErrorCode::ToolArgumentsInvalid, message.into())
+}
+
+pub(super) fn tool_execution_failed(message: impl Into<String>) -> PiAiError {
+    PiAiError::new(PiAiErrorCode::ToolExecutionFailed, message.into())
 }
 
 pub(super) fn text_result(text: String, details: Value) -> AgentToolResult {

@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::api_registry::ApiProvider;
+use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{Context, Model, SimpleStreamOptions, StreamOptions};
 use crate::{ApiProviderRef, AssistantMessageEventStream};
 
-use super::openai_completions::{stream_openai_completions, stream_simple_openai_completions};
-use super::openai_responses::{stream_openai_responses, stream_simple_openai_responses};
+use super::openai_completions::{run_openai_completions, run_simple_openai_completions};
+use super::openai_responses::{run_openai_responses, run_simple_openai_responses};
 
 struct OpenAICompatProvider {
     api: &'static str,
@@ -23,11 +23,15 @@ impl ApiProvider for OpenAICompatProvider {
         model: Model,
         context: Context,
         options: Option<StreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        if self.api == "openai-responses" {
-            return stream_openai_responses_with_fallback(model, context, options);
-        }
-        stream_openai_responses(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        let api = self.api;
+        Box::pin(async move {
+            if api == "openai-responses" {
+                return run_openai_responses_with_fallback(model, context, options, stream).await;
+            }
+            run_openai_responses(model, context, options, stream).await
+        })
     }
 
     fn stream_simple(
@@ -35,11 +39,16 @@ impl ApiProvider for OpenAICompatProvider {
         model: Model,
         context: Context,
         options: Option<SimpleStreamOptions>,
-    ) -> Result<AssistantMessageEventStream, String> {
-        if self.api == "openai-responses" {
-            return stream_simple_openai_responses_with_fallback(model, context, options);
-        }
-        stream_simple_openai_responses(model, context, options)
+        stream: AssistantMessageEventStream,
+    ) -> ApiProviderFuture {
+        let api = self.api;
+        Box::pin(async move {
+            if api == "openai-responses" {
+                return run_simple_openai_responses_with_fallback(model, context, options, stream)
+                    .await;
+            }
+            run_simple_openai_responses(model, context, options, stream).await
+        })
     }
 }
 
@@ -59,45 +68,76 @@ pub(super) fn openai_codex_responses_provider() -> ApiProviderRef {
     provider_for_api("openai-codex-responses")
 }
 
-fn stream_openai_responses_with_fallback(
+async fn run_openai_responses_with_fallback(
     model: Model,
     context: Context,
     options: Option<StreamOptions>,
-) -> Result<AssistantMessageEventStream, String> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
     if cached_responses_fallback(&model.base_url) {
-        return stream_openai_completions(as_openai_completions_model(model), context, options);
+        return run_openai_completions(
+            as_openai_completions_model(model),
+            context,
+            options,
+            stream,
+        )
+        .await;
     }
 
     let base_url = model.base_url.clone();
-    match stream_openai_responses(model.clone(), context.clone(), options.clone()) {
-        Ok(stream) => Ok(stream),
+    match run_openai_responses(
+        model.clone(),
+        context.clone(),
+        options.clone(),
+        stream.clone(),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
         Err(error) if is_responses_404_error(&error) => {
             cache_responses_fallback(&base_url);
-            stream_openai_completions(as_openai_completions_model(model), context, options)
+            run_openai_completions(as_openai_completions_model(model), context, options, stream)
+                .await
         }
         Err(error) => Err(error),
     }
 }
 
-fn stream_simple_openai_responses_with_fallback(
+async fn run_simple_openai_responses_with_fallback(
     model: Model,
     context: Context,
     options: Option<SimpleStreamOptions>,
-) -> Result<AssistantMessageEventStream, String> {
+    stream: AssistantMessageEventStream,
+) -> Result<(), PiAiError> {
     if cached_responses_fallback(&model.base_url) {
-        return stream_simple_openai_completions(
+        return run_simple_openai_completions(
             as_openai_completions_model(model),
             context,
             options,
-        );
+            stream,
+        )
+        .await;
     }
 
     let base_url = model.base_url.clone();
-    match stream_simple_openai_responses(model.clone(), context.clone(), options.clone()) {
-        Ok(stream) => Ok(stream),
+    match run_simple_openai_responses(
+        model.clone(),
+        context.clone(),
+        options.clone(),
+        stream.clone(),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
         Err(error) if is_responses_404_error(&error) => {
             cache_responses_fallback(&base_url);
-            stream_simple_openai_completions(as_openai_completions_model(model), context, options)
+            run_simple_openai_completions(
+                as_openai_completions_model(model),
+                context,
+                options,
+                stream,
+            )
+            .await
         }
         Err(error) => Err(error),
     }
@@ -131,9 +171,6 @@ fn as_openai_completions_model(mut model: Model) -> Model {
     model
 }
 
-fn is_responses_404_error(error: &str) -> bool {
-    if let Ok(parsed) = serde_json::from_str::<PiAiError>(error) {
-        return parsed.code == PiAiErrorCode::ProviderHttp && parsed.message.contains("HTTP 404");
-    }
-    error.contains("HTTP 404")
+fn is_responses_404_error(error: &PiAiError) -> bool {
+    error.code == PiAiErrorCode::ProviderHttp && error.message.contains("HTTP 404")
 }

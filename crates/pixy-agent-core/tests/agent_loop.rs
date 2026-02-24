@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pixy_agent_core::{
-    AgentAbortController, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
+    AgentAbortController, AgentContext, AgentEvent, AgentLoopConfig, AgentLoopError, AgentMessage,
     AgentRetryConfig, AgentTool, AgentToolResult, agent_loop, agent_loop_continue,
+    try_agent_loop_continue,
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    Context, Cost, DoneReason, Message, Model, StopReason, ToolResultContentBlock, Usage,
-    UserContent,
+    Context, Cost, DoneReason, Message, Model, PiAiError, PiAiErrorCode, StopReason,
+    ToolResultContentBlock, Usage, UserContent,
 };
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -87,6 +88,38 @@ fn done_stream(message: AssistantMessage, reason: DoneReason) -> AssistantMessag
     });
     stream.push(AssistantMessageEvent::Done { reason, message });
     stream
+}
+
+fn provider_transport_error(message: &str) -> PiAiError {
+    PiAiError::new(PiAiErrorCode::ProviderTransport, message)
+}
+
+fn default_stream_fn() -> pixy_agent_core::StreamFn {
+    Arc::new(
+        |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            let message = assistant_message(
+                vec![AssistantContentBlock::Text {
+                    text: "ok".to_string(),
+                    text_signature: None,
+                }],
+                StopReason::Stop,
+                1_700_000_000_010,
+            );
+            Ok(done_stream(message, DoneReason::Stop))
+        },
+    )
+}
+
+fn default_loop_config() -> AgentLoopConfig {
+    AgentLoopConfig {
+        model: sample_model("test-api"),
+        fallback_models: vec![],
+        convert_to_llm: Arc::new(|messages| messages),
+        stream_fn: default_stream_fn(),
+        retry: AgentRetryConfig::default(),
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+    }
 }
 
 async fn collect_events_and_result(
@@ -211,34 +244,38 @@ async fn agent_loop_executes_tool_calls_and_continues() {
         },
     );
 
-    let tool = AgentTool {
-        name: "read_file".to_string(),
-        label: "Read File".to_string(),
-        description: "Read a file from disk".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }),
-        execute: Arc::new(
-            |_tool_call_id: String,
-             _args: Value|
-             -> Pin<Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>> {
-                Box::pin(async move {
-                    Ok(AgentToolResult {
-                        content: vec![ToolResultContentBlock::Text {
-                            text: "file-content".to_string(),
-                            text_signature: None,
-                        }],
-                        details: json!({"bytes": 12}),
-                    })
-                })
-            },
-        ),
-    };
+    let tool =
+        AgentTool {
+            name: "read_file".to_string(),
+            label: "Read File".to_string(),
+            description: "Read a file from disk".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            execute:
+                Arc::new(
+                    |_tool_call_id: String,
+                     _args: Value|
+                     -> Pin<
+                        Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>,
+                    > {
+                        Box::pin(async move {
+                            Ok(AgentToolResult {
+                                content: vec![ToolResultContentBlock::Text {
+                                    text: "file-content".to_string(),
+                                    text_signature: None,
+                                }],
+                                details: json!({"bytes": 12}),
+                            })
+                        })
+                    },
+                ),
+        };
 
     let prompts = vec![user_message("read file", 1_700_000_000_000)];
     let context = AgentContext {
@@ -325,6 +362,52 @@ async fn agent_loop_continue_reuses_existing_context_messages() {
     assert_eq!(result.len(), 1, "continue should only return new messages");
 }
 
+#[test]
+fn try_agent_loop_continue_rejects_empty_context() {
+    let context = AgentContext {
+        system_prompt: "You are helpful".to_string(),
+        messages: vec![],
+        tools: vec![],
+    };
+    let config = default_loop_config();
+
+    let error = match try_agent_loop_continue(context, config, None) {
+        Ok(_) => panic!("context must be invalid"),
+        Err(error) => error,
+    };
+    assert_eq!(error, AgentLoopError::EmptyContext);
+    assert_eq!(error.to_string(), "Cannot continue: no messages in context");
+}
+
+#[test]
+fn try_agent_loop_continue_rejects_assistant_tail_context() {
+    let context = AgentContext {
+        system_prompt: "You are helpful".to_string(),
+        messages: vec![Message::Assistant {
+            content: vec![],
+            api: "test-api".to_string(),
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            usage: sample_usage(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1_700_000_000_010,
+        }],
+        tools: vec![],
+    };
+    let config = default_loop_config();
+
+    let error = match try_agent_loop_continue(context, config, None) {
+        Ok(_) => panic!("context must be invalid"),
+        Err(error) => error,
+    };
+    assert_eq!(error, AgentLoopError::CannotContinueFromAssistant);
+    assert_eq!(
+        error.to_string(),
+        "Cannot continue from message role: assistant"
+    );
+}
+
 #[tokio::test]
 async fn agent_loop_skips_remaining_tool_calls_when_steering_arrives() {
     let stream_fn_calls = Arc::new(AtomicUsize::new(0));
@@ -367,39 +450,38 @@ async fn agent_loop_skips_remaining_tool_calls_when_steering_arrives() {
         },
     );
 
-    let make_tool =
-        |name: &'static str| AgentTool {
-            name: name.to_string(),
-            label: name.to_string(),
-            description: format!("Execute tool {name}"),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "value": { "type": "integer" }
-                },
-                "required": ["value"],
-                "additionalProperties": false
-            }),
-            execute:
-                Arc::new(
-                    move |_tool_call_id: String,
-                          _args: Value|
-                          -> Pin<
-                        Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>,
-                    > {
-                        let tool_name = name.to_string();
-                        Box::pin(async move {
-                            Ok(AgentToolResult {
-                                content: vec![ToolResultContentBlock::Text {
-                                    text: format!("{tool_name}-ok"),
-                                    text_signature: None,
-                                }],
-                                details: json!({}),
-                            })
+    let make_tool = |name: &'static str| AgentTool {
+        name: name.to_string(),
+        label: name.to_string(),
+        description: format!("Execute tool {name}"),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "value": { "type": "integer" }
+            },
+            "required": ["value"],
+            "additionalProperties": false
+        }),
+        execute:
+            Arc::new(
+                move |_tool_call_id: String,
+                      _args: Value|
+                      -> Pin<
+                    Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>,
+                > {
+                    let tool_name = name.to_string();
+                    Box::pin(async move {
+                        Ok(AgentToolResult {
+                            content: vec![ToolResultContentBlock::Text {
+                                text: format!("{tool_name}-ok"),
+                                text_signature: None,
+                            }],
+                            details: json!({}),
                         })
-                    },
-                ),
-        };
+                    })
+                },
+            ),
+    };
 
     let steering_polls = Arc::new(AtomicUsize::new(0));
     let steering_polls_in_callback = steering_polls.clone();
@@ -618,35 +700,39 @@ async fn agent_loop_abort_signal_interrupts_tool_execution() {
         },
     );
 
-    let tool = AgentTool {
-        name: "long_tool".to_string(),
-        label: "Long Tool".to_string(),
-        description: "Long running tool".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "value": { "type": "integer" }
-            },
-            "required": ["value"],
-            "additionalProperties": false
-        }),
-        execute: Arc::new(
-            |_tool_call_id: String,
-             _args: Value|
-             -> Pin<Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>> {
-                Box::pin(async move {
-                    sleep(Duration::from_millis(250)).await;
-                    Ok(AgentToolResult {
-                        content: vec![ToolResultContentBlock::Text {
-                            text: "done".to_string(),
-                            text_signature: None,
-                        }],
-                        details: json!({}),
-                    })
-                })
-            },
-        ),
-    };
+    let tool =
+        AgentTool {
+            name: "long_tool".to_string(),
+            label: "Long Tool".to_string(),
+            description: "Long running tool".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "integer" }
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            }),
+            execute:
+                Arc::new(
+                    |_tool_call_id: String,
+                     _args: Value|
+                     -> Pin<
+                        Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>,
+                    > {
+                        Box::pin(async move {
+                            sleep(Duration::from_millis(250)).await;
+                            Ok(AgentToolResult {
+                                content: vec![ToolResultContentBlock::Text {
+                                    text: "done".to_string(),
+                                    text_signature: None,
+                                }],
+                                details: json!({}),
+                            })
+                        })
+                    },
+                ),
+        };
 
     let prompts = vec![user_message("run", 1_700_000_000_000)];
     let context = AgentContext {
@@ -705,7 +791,7 @@ async fn agent_loop_retries_stream_creation_errors_with_backoff() {
         move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
             let attempt = attempts_in_fn.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
-                return Err("temporary upstream failure".to_string());
+                return Err(provider_transport_error("temporary upstream failure"));
             }
             let message = assistant_message(
                 vec![AssistantContentBlock::Text {
@@ -782,7 +868,7 @@ async fn agent_loop_retries_with_model_fallback() {
                 .expect("attempted models lock")
                 .push(model.id.clone());
             if model.id == "primary" {
-                return Err("primary model unavailable".to_string());
+                return Err(provider_transport_error("primary model unavailable"));
             }
 
             let mut message = assistant_message(
@@ -867,7 +953,7 @@ async fn agent_loop_emits_metrics_with_retry_and_tool_duration() {
         move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
             let attempt = attempts_in_fn.fetch_add(1, Ordering::SeqCst);
             match attempt {
-                0 => Err("temporary upstream failure".to_string()),
+                0 => Err(provider_transport_error("temporary upstream failure")),
                 1 => {
                     let tool_call_msg = assistant_message(
                         vec![AssistantContentBlock::ToolCall {
@@ -896,32 +982,36 @@ async fn agent_loop_emits_metrics_with_retry_and_tool_duration() {
         },
     );
 
-    let tool = AgentTool {
-        name: "measure_tool".to_string(),
-        label: "Measure Tool".to_string(),
-        description: "Sleep a little and return".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        execute: Arc::new(
-            |_tool_call_id: String,
-             _args: Value|
-             -> Pin<Box<dyn Future<Output = Result<AgentToolResult, String>> + Send>> {
-                Box::pin(async move {
-                    sleep(Duration::from_millis(5)).await;
-                    Ok(AgentToolResult {
-                        content: vec![ToolResultContentBlock::Text {
-                            text: "ok".to_string(),
-                            text_signature: None,
-                        }],
-                        details: json!({}),
-                    })
-                })
-            },
-        ),
-    };
+    let tool =
+        AgentTool {
+            name: "measure_tool".to_string(),
+            label: "Measure Tool".to_string(),
+            description: "Sleep a little and return".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            execute:
+                Arc::new(
+                    |_tool_call_id: String,
+                     _args: Value|
+                     -> Pin<
+                        Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>,
+                    > {
+                        Box::pin(async move {
+                            sleep(Duration::from_millis(5)).await;
+                            Ok(AgentToolResult {
+                                content: vec![ToolResultContentBlock::Text {
+                                    text: "ok".to_string(),
+                                    text_signature: None,
+                                }],
+                                details: json!({}),
+                            })
+                        })
+                    },
+                ),
+        };
 
     let config = AgentLoopConfig {
         model: sample_model("test-api"),

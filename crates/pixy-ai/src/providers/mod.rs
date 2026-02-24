@@ -1,20 +1,25 @@
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use crate::ApiProviderRef;
 use crate::api_registry::{clear_api_providers, register_api_provider};
 
 mod anthropic;
 mod bedrock_converse_stream;
+mod common;
 mod google_gemini_cli;
 mod google_generative_ai;
 mod google_vertex;
 mod openai_compat;
 mod openai_completions;
 mod openai_responses;
+mod reliable;
+
+pub use reliable::ReliableProvider;
 
 const BUILTIN_SOURCE_ID: &str = "pixy-ai-builtins";
 
 fn register_builtin_provider(provider: ApiProviderRef) {
+    let provider = Arc::new(reliable::ReliableProvider::wrap(provider));
     register_api_provider(provider, Some(BUILTIN_SOURCE_ID.to_string()));
 }
 

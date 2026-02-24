@@ -28,6 +28,11 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::HashMap<String, String>>,
+    #[serde(
+        rename = "transportRetryCount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_retry_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
