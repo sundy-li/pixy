@@ -1303,6 +1303,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixy-main"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pixy-coding-agent",
+ "pixy-gateway",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pixy-tui"
 version = "0.1.0"
 dependencies = [

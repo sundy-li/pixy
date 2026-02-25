@@ -9,13 +9,14 @@ use pixy_agent_core::{
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessageEvent, Context as LlmContext, Message, Model,
-    StopReason, ToolResultContentBlock, Usage, UserContent, UserContentBlock,
+    SimpleStreamOptions, StopReason, ToolResultContentBlock, Usage, UserContent, UserContentBlock,
 };
 use serde_json::Value;
 
 use crate::{
-    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, SessionContext, SessionManager,
-    bash_command::normalize_nested_bash_lc,
+    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, ResolvedRuntime, RuntimeLoadOptions,
+    SessionContext, SessionManager, bash_command::normalize_nested_bash_lc, build_system_prompt,
+    create_coding_tools,
 };
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
@@ -745,6 +746,69 @@ impl AgentSession {
 
         Ok(summary)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionCreateOptions {
+    pub runtime: RuntimeLoadOptions,
+    pub custom_system_prompt: Option<String>,
+    pub no_tools: bool,
+}
+
+pub struct CreatedSession {
+    pub session: AgentSession,
+    pub runtime: ResolvedRuntime,
+}
+
+pub fn create_session(
+    cwd: &Path,
+    session_manager: SessionManager,
+    options: SessionCreateOptions,
+) -> Result<CreatedSession, String> {
+    let runtime = options.runtime.resolve_runtime(cwd)?;
+    let session = create_session_from_runtime(
+        cwd,
+        session_manager,
+        &runtime,
+        options.custom_system_prompt.as_deref(),
+        options.no_tools,
+    );
+    Ok(CreatedSession { session, runtime })
+}
+
+pub fn create_session_from_runtime(
+    cwd: &Path,
+    session_manager: SessionManager,
+    runtime: &ResolvedRuntime,
+    custom_system_prompt: Option<&str>,
+    no_tools: bool,
+) -> AgentSession {
+    let tools = if no_tools {
+        vec![]
+    } else {
+        create_coding_tools(cwd)
+    };
+    let runtime_api_key = runtime.api_key.clone();
+    let stream_fn = Arc::new(
+        move |model: Model, context: pixy_ai::Context, options: Option<SimpleStreamOptions>| {
+            let mut resolved_options = options.unwrap_or_default();
+            if resolved_options.stream.api_key.is_none() {
+                resolved_options.stream.api_key = runtime_api_key.clone();
+            }
+            pixy_ai::stream_simple(model, context, Some(resolved_options))
+        },
+    );
+    let config = AgentSessionConfig {
+        model: runtime.model.clone(),
+        system_prompt: build_system_prompt(custom_system_prompt, cwd, &tools, &runtime.skills),
+        stream_fn,
+        tools,
+    };
+    let mut session = AgentSession::new(session_manager, config);
+    if !runtime.model_catalog.is_empty() {
+        session.set_model_catalog(runtime.model_catalog.clone());
+    }
+    session
 }
 
 async fn collect_agent_loop_result(

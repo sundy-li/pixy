@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local};
-use pixy_ai::{AssistantContentBlock, Message, Model, SimpleStreamOptions, StopReason};
-use pixy_coding_agent::{AgentSession, AgentSessionConfig, SessionManager, create_coding_tools};
+use pixy_ai::{AssistantContentBlock, Message, Model, StopReason};
+use pixy_coding_agent::{
+    AgentSession, RuntimeLoadOptions, RuntimeOverrides, SessionCreateOptions, SessionManager,
+    create_session,
+};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -323,7 +325,7 @@ fn create_gateway_session(
     reuse_existing: bool,
 ) -> Result<AgentSession, String> {
     let manager = create_session_manager(cwd, session_root, channel_name, user_id, reuse_existing)?;
-    Ok(build_session_from_manager(cwd, model, api_key, manager))
+    build_session_from_manager(cwd, channel_name, model, api_key, manager)
 }
 
 fn create_session_manager(
@@ -401,13 +403,6 @@ fn is_new_session_command(input: &str) -> bool {
     false
 }
 
-fn build_gateway_system_prompt(cwd: &Path) -> String {
-    format!(
-        "{DEFAULT_PROMPT_INTRO}\n\nCurrent working directory: {}",
-        cwd.display()
-    )
-}
-
 fn sanitize_session_segment(segment: &str) -> String {
     let cleaned = segment
         .chars()
@@ -437,28 +432,31 @@ fn route_file_prefix(channel_name: &str, user_id: &str) -> String {
 
 fn build_session_from_manager(
     cwd: &Path,
+    channel_name: &str,
     model: &Model,
     api_key: Option<String>,
     manager: SessionManager,
-) -> AgentSession {
-    let tools = create_coding_tools(cwd);
-    let stream_api_key = api_key.clone();
-    let stream_fn = Arc::new(
-        move |model: Model, context: pixy_ai::Context, options: Option<SimpleStreamOptions>| {
-            let mut resolved_options = options.unwrap_or_default();
-            if resolved_options.stream.api_key.is_none() {
-                resolved_options.stream.api_key = stream_api_key.clone();
-            }
-            pixy_ai::stream_simple(model, context, Some(resolved_options))
+) -> Result<AgentSession, String> {
+    let created = create_session(
+        cwd,
+        manager,
+        SessionCreateOptions {
+            runtime: gateway_session_runtime_options(model, api_key),
+            custom_system_prompt: Some(gateway_session_prompt(channel_name)),
+            no_tools: false,
         },
-    );
-    let config = AgentSessionConfig {
-        model: model.clone(),
-        system_prompt: build_gateway_system_prompt(cwd),
-        stream_fn,
-        tools,
-    };
-    AgentSession::new(manager, config)
+    )?;
+    Ok(created.session)
+}
+
+fn gateway_session_prompt(channel_name: &str) -> String {
+    DEFAULT_PROMPT_INTRO.replace("{channel}", channel_name)
+}
+
+fn gateway_session_runtime_options(model: &Model, api_key: Option<String>) -> RuntimeLoadOptions {
+    let mut options = crate::config::gateway_runtime_load_options();
+    options.overrides = RuntimeOverrides::from_fixed_model(model.clone(), api_key);
+    options
 }
 
 #[cfg(test)]
@@ -481,6 +479,45 @@ mod tests {
                 total: 0.0,
             },
         }
+    }
+
+    fn sample_model() -> Model {
+        Model {
+            id: "gpt-5.3-codex".to_string(),
+            name: "gpt-5.3-codex".to_string(),
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning: true,
+            reasoning_effort: Some(pixy_ai::ThinkingLevel::Medium),
+            input: vec!["text".to_string()],
+            cost: pixy_ai::Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+        }
+    }
+
+    #[test]
+    fn gateway_session_runtime_options_enable_skill_loading() {
+        let model = sample_model();
+        let options = gateway_session_runtime_options(&model, Some("test-key".to_string()));
+        assert!(options.load_skills);
+        assert!(options.include_default_skills);
+        assert_eq!(options.overrides.fixed_model, Some(model));
+        assert_eq!(options.overrides.fixed_api_key.as_deref(), Some("test-key"));
+    }
+
+    #[test]
+    fn gateway_session_prompt_replaces_channel_placeholder() {
+        let prompt = gateway_session_prompt("telegram");
+        assert!(prompt.contains("help users from telegram"));
+        assert!(!prompt.contains("{channel}"));
     }
 
     #[test]
@@ -571,25 +608,7 @@ mod tests {
 
     #[test]
     fn startup_log_lines_include_runtime_overview_and_channels() {
-        let model = Model {
-            id: "gpt-5.3-codex".to_string(),
-            name: "gpt-5.3-codex".to_string(),
-            api: "openai-responses".to_string(),
-            provider: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            reasoning: true,
-            reasoning_effort: Some(pixy_ai::ThinkingLevel::Medium),
-            input: vec!["text".to_string()],
-            cost: pixy_ai::Cost {
-                input: 0.0,
-                output: 0.0,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                total: 0.0,
-            },
-            context_window: 200_000,
-            max_tokens: 8_192,
-        };
+        let model = sample_model();
         let lines = startup_log_lines(
             Path::new("/workspace"),
             Path::new("/sessions"),

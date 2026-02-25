@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pixy"
+name = "pixy-cli"
 path = "src/main.rs"
 
 [dependencies]

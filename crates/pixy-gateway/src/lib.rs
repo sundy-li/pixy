@@ -21,7 +21,7 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_LOG_ROTATE_SIZE_MB: u64 = 100;
 const DEFAULT_LOG_STDOUT: bool = false;
-pub const DEFAULT_PROMPT_INTRO: &str = "You are pixy, an expert coding assistant and coding agent harness running via pixy gateway service. You must help users from all trusted channels, you can help users by reading files, executing commands, editing code, and writing new files.";
+pub const DEFAULT_PROMPT_INTRO: &str = "You are pixy, an expert coding assistant and coding agent harness running via pixy gateway service. You must help users from {channel}, you can help users by reading files, executing commands, editing code, and writing new files.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayCommand {

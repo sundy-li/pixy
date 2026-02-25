@@ -1,0 +1,36 @@
+name: Package Manifests
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (for example: v0.1.0)"
+        required: true
+        type: string
+      repo:
+        description: "GitHub repository owner/name"
+        required: false
+        default: "sundy-li/pixy"
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate manifests
+        run: |
+          ./scripts/generate-package-manifests.sh \
+            --version "${{ github.event.inputs.version }}" \
+            --repo "${{ github.event.inputs.repo }}"
+
+      - name: Upload manifests artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixy-package-manifests-${{ github.event.inputs.version }}
+          path: |
+            packaging/homebrew/pixy.rb
+            packaging/scoop/pixy.json

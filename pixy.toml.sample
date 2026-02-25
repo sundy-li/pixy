@@ -1,5 +1,5 @@
 # Pixy configuration sample
-# Copy to ~/.pixy/pixy.toml and replace keys/models as needed.
+# Copy to ~/.pixy/pixy.toml and replace API keys/models as needed.
 
 theme = "dark"
 transport_retry_count = 5
@@ -14,20 +14,17 @@ FEISHU_APP_SECRET = "replace-with-feishu-secret"
 FEISHU_VERIFICATION_TOKEN = "replace-with-feishu-verification-token"
 
 [log]
-# Log directory for pixy and pixy-gateway.
+# Log directory for pixy and gateway.
 path = "~/.pixy/logs/"
-# Default log level when RUST_LOG is not set.
 level = "info"
-# Rotate log file when size exceeds this value (MB).
 rotate_size_mb = 100
-# Also print logs to stdout.
 stdout = false
 
 [llm]
-# Use "*" to route by provider weights.
-# Set to a provider `name` (for example: "openai") to pin a fixed provider.
-default_provider = "*"
+# "*" routes by provider weights; use a provider name to pin.
+default_provider = "openai"
 
+# Minimal default provider.
 [[llm.providers]]
 name = "openai"
 kind = "chat"
@@ -36,12 +33,13 @@ api = "openai-responses"
 base_url = "https://api.openai.com/v1"
 api_key = "$OPENAI_API_KEY"
 model = "gpt-5.3-codex"
-weight = 70
+weight = 100
 reasoning = true
 reasoning_effort = "high"
 context_window = 200000
 max_tokens = 8192
 
+# Optional secondary provider for weighted routing.
 [[llm.providers]]
 name = "anthropic"
 kind = "chat"
@@ -50,10 +48,9 @@ api = "anthropic-messages"
 base_url = "https://api.anthropic.com/v1"
 api_key = "$ANTHROPIC_API_KEY"
 model = "claude-3-5-sonnet-latest"
-weight = 30
+weight = 0
 
-# Embedding providers can coexist in config,
-# but they are ignored by coding-session chat routing.
+# Embedding providers can coexist, but are ignored by chat session routing.
 [[llm.providers]]
 name = "openai_embedding"
 kind = "embedding"
@@ -91,6 +88,5 @@ app_secret = "$FEISHU_APP_SECRET"
 verification_token = "$FEISHU_VERIFICATION_TOKEN"
 # Optional per-channel proxy, supports http/socks5.
 # proxy_url = "http://127.0.0.1:7890"
-# Channel queue poll interval (webhook events are buffered then dispatched by runtime loop).
 poll_interval_ms = 100
 allowed_user_ids = ["replace-with-feishu-open-id"]

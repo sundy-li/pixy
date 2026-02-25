@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use crate::{Skill, SkillSource, format_skills_for_prompt};
 use chrono::Local;
 use pixy_agent_core::AgentTool;
-use pixy_coding_agent::{Skill, SkillSource, format_skills_for_prompt};
 
 const DEFAULT_PROMPT_INTRO: &str = "You are pixy, an expert coding assistant and coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
@@ -26,7 +26,7 @@ fn build_system_prompt_with_now(
     skills: &[Skill],
     now_text: &str,
 ) -> String {
-    let mut prompt = build_default_prompt(custom_prompt, selected_tools);
+    let mut prompt = build_default_prompt(custom_prompt, cwd, selected_tools);
     let has_read_tool = selected_tools.contains(&"read");
     if has_read_tool {
         let skills_prompt = format_skills_for_prompt(skills);
@@ -50,6 +50,7 @@ fn build_system_prompt_with_now(
         "<context>\nCurrent date and time: {now_text}\n</context>\n\n<workspace_context>\nCurrent working directory: {}\n</workspace_context>",
         cwd.display()
     ));
+
     prompt
 }
 
@@ -157,8 +158,12 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn build_default_prompt(custom_prompt: Option<&str>, selected_tools: &[&str]) -> String {
-    let prompt = custom_prompt.unwrap_or(DEFAULT_PROMPT_INTRO);
+fn build_default_prompt(
+    custom_prompt: Option<&str>,
+    cwd: &Path,
+    selected_tools: &[&str],
+) -> String {
+    let prompt = resolve_prompt_body(custom_prompt, cwd);
     let tool_lines: Vec<String> = selected_tools
         .iter()
         .copied()
@@ -194,6 +199,35 @@ Guidelines:\n\
     ];
 
     sections.join("\n\n")
+}
+
+fn resolve_prompt_body(custom_prompt: Option<&str>, cwd: &Path) -> String {
+    let Some(raw_prompt) = custom_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_PROMPT_INTRO.to_string();
+    };
+
+    let prompt_path = if Path::new(raw_prompt).is_absolute() {
+        PathBuf::from(raw_prompt)
+    } else {
+        cwd.join(raw_prompt)
+    };
+    if !prompt_path.is_file() {
+        return raw_prompt.to_string();
+    }
+
+    match std::fs::read_to_string(&prompt_path) {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!(
+                "warning: could not read custom prompt file {}: {error}",
+                prompt_path.display()
+            );
+            raw_prompt.to_string()
+        }
+    }
 }
 
 fn tool_description(name: &str) -> Option<&'static str> {
@@ -264,7 +298,7 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use pixy_coding_agent::{Skill, SkillSource};
+    use crate::{Skill, SkillSource};
     use tempfile::tempdir;
 
     use super::build_system_prompt_with_now;

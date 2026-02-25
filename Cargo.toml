@@ -4,6 +4,7 @@ members = [
     "crates/pixy-agent-core",
     "crates/pixy-coding-agent",
     "crates/pixy-gateway",
+    "crates/pixy-main",
     "crates/pixy-tui",
 ]
 resolver = "2"
@@ -12,3 +13,22 @@ resolver = "2"
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = "fat"          # Maximum cross-crate optimization for smaller binaries
+codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM)
+strip = true         # Remove debug symbols
+panic = "abort"      # Reduce binary size
+
+[profile.release-fast]
+inherits = "release"
+codegen-units = 8     
+
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

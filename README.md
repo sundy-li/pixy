@@ -1,61 +1,150 @@
 # pixy
 
-`pixy` is a Rust coding-agent workspace inspired by [`pi-mono`](https://github.com/badlogic/pi-mono).
+`pixy` is a Rust coding-agent runtime inspired by [`pi-mono`](https://github.com/badlogic/pi-mono).
 
-## Workspace Layout
+## Quick Install (Linux / macOS / Windows)
 
-- `crates/pixy-ai`: provider abstraction, streaming protocol, built-in provider adapters.
-- `crates/pixy-agent-core`: agent loop, tool execution, retries/fallback, metrics events.
-- `crates/pixy-coding-agent`: CLI binary (`pixy`), session manager, tools, skills integration.
-- `crates/pixy-tui`: TUI rendering, keybindings, themes, transcript behavior.
-
-## Quick Start
-
-### Prerequisites
-
-- Rust stable toolchain.
-- At least one provider credential (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`).
-- Initialize the config: `mkdir -p  ~/.pixy && cp pixy.toml.sample ~/.pixy/pixy.toml`
-
-
-### Run Interactive TUI
+### Option A (recommended): one-liner installer (Linux / macOS)
 
 ```bash
-cargo run -p pixy-coding-agent --bin pixy
+curl -fsSL https://raw.githubusercontent.com/sundy-li/pixy/main/scripts/install.sh | bash
 ```
 
-### Run One Prompt (Non-interactive)
+> Security note: for production or restricted environments, review `scripts/install.sh` before running the one-liner.
 
-```bash
-cargo run -p pixy-coding-agent --bin pixy -- --prompt "Summarize this repository structure."
+### Option B (recommended on Windows PowerShell): one-liner installer
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/sundy-li/pixy/main/scripts/install.ps1 -UseBasicParsing | iex"
 ```
 
-### Run in REPL Mode (No TUI)
+> Windows one-liner currently installs `x86_64` release assets only.
+
+### Option C: clone and run local installer
 
 ```bash
-cargo run -p pixy-coding-agent --bin pixy -- --no-tui
+git clone https://github.com/sundy-li/pixy.git
+cd pixy
+./scripts/install.sh
 ```
 
-### Show CLI Help
-
-```bash
-cargo run -p pixy-coding-agent --bin pixy -- --help
+```powershell
+git clone https://github.com/sundy-li/pixy.git
+cd pixy
+powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install.ps1
 ```
 
-## Gateway (Telegram + Feishu)
+Installer defaults:
+- installs latest release from `sundy-li/pixy`
+- installs binary to `~/.local/bin/pixy`
+- verifies release checksum via `SHA256SUMS`
 
-Run gateway in foreground:
+Common overrides:
 
 ```bash
-cargo run -p pixy-coding-agent --bin pixy -- gateway start
+PIXY_VERSION=v0.1.0 ./scripts/install.sh
+PIXY_INSTALL_DIR=/usr/local/bin ./scripts/install.sh
+PIXY_REPO=sundy-li/pixy ./scripts/install.sh
 ```
 
-Run gateway daemon / lifecycle:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install.ps1 -Version v0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install.ps1 -InstallDir "$env:USERPROFILE\\bin"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install.ps1 -Repo sundy-li/pixy
+```
+
+## Bootstrap + Onboard
+
+`bootstrap.sh` can install pixy, initialize config, and optionally onboard provider settings in one flow.
 
 ```bash
-cargo run -p pixy-coding-agent --bin pixy -- gateway start --daemon
-cargo run -p pixy-coding-agent --bin pixy -- gateway restart
-cargo run -p pixy-coding-agent --bin pixy -- gateway stop
+./scripts/bootstrap.sh --onboard --provider openai --api-key "sk-..."
+```
+
+```bash
+./scripts/bootstrap.sh --version v0.1.0 --conf-dir ~/.pixy --onboard --provider anthropic --api-key "sk-ant-..."
+```
+
+Manual onboarding only:
+
+```bash
+./scripts/onboard.sh --provider openai --api-key "sk-..." --force
+```
+
+## Quick Start (30 seconds)
+
+1. Create config directory and copy sample:
+
+```bash
+mkdir -p ~/.pixy
+cp pixy.toml.sample ~/.pixy/pixy.toml
+```
+
+2. Edit `~/.pixy/pixy.toml` and set your API key(s).
+
+3. Verify installation:
+
+```bash
+pixy --help
+pixy doctor
+```
+
+4. Start interactive chat:
+
+```bash
+pixy
+```
+
+Run one prompt:
+
+```bash
+pixy --prompt "Summarize this repository structure."
+```
+
+Run REPL without TUI:
+
+```bash
+pixy --no-tui
+```
+
+## Minimal `pixy.toml`
+
+Use this as the smallest chat setup:
+
+```toml
+[env]
+OPENAI_API_KEY = "sk-..."
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"
+model = "gpt-5.3-codex"
+weight = 1
+```
+
+Full sample: [`pixy.toml.sample`](./pixy.toml.sample)
+
+## Gateway Quick Setup (Telegram / Feishu)
+
+Start gateway in foreground:
+
+```bash
+pixy gateway start
+```
+
+Daemon lifecycle:
+
+```bash
+pixy gateway start --daemon
+pixy gateway restart
+pixy gateway stop
 ```
 
 Gateway runtime files:
@@ -66,132 +155,81 @@ Gateway runtime files:
   gateway.state.json
 ```
 
-Gateway channels are configured in the same `~/.pixy/pixy.toml` file:
+`gateway.channels` are configured in `~/.pixy/pixy.toml`.
+- Telegram uses polling (`getUpdates`)
+- Feishu uses webhook route: `/webhook/feishu/{channel_name}`
+- `/new` in chat resets routed session context
 
-```toml
-[gateway]
-enabled = true
-bind = "0.0.0.0:8080"
-request_timeout_ms = 20000
+## Upgrade / Uninstall
 
-[[gateway.channels]]
-name = "tg-main"
-kind = "telegram"
-mode = "polling"
-bot_token = "$TELEGRAM_BOT_TOKEN"
-# proxy_url = "socks5://127.0.0.1:7891"
-poll_interval_ms = 1500
-update_limit = 50
-allowed_user_ids = ["123456789"]
+Upgrade to latest:
 
-[[gateway.channels]]
-name = "feishu-main"
-kind = "feishu"
-mode = "webhook"
-app_id = "$FEISHU_APP_ID"
-app_secret = "$FEISHU_APP_SECRET"
-verification_token = "$FEISHU_VERIFICATION_TOKEN"
-# proxy_url = "http://127.0.0.1:7890"
-poll_interval_ms = 100
-allowed_user_ids = ["ou_xxx"]
+```bash
+./scripts/install.sh
 ```
 
-Notes:
-- Telegram uses polling (`getUpdates`) and supports `typing...` status while processing.
-- Feishu uses webhook subscription; configure callback URL as `http://<gateway-bind>/webhook/feishu/{channel_name}`.
-- `allowed_user_ids` is required and currently only private chat is processed.
-- Send `/new` in channel chat to reset that user's routed session context.
-- Gateway session files are partitioned by month: `~/.pixy/agent/sessions/<YYYY>/<MM>/...`.
+Upgrade to a fixed version:
 
-## Built-in Coding Tools
-
-- `list_directory`: list directory entries under workspace path (directories end with `/`).
-- `read`: read UTF-8 file content with optional `offset` and `limit`.
-- `bash`: execute shell commands in workspace.
-- `edit`: replace a unique text fragment in an existing file.
-- `write`: create or overwrite files.
-
-## Session Commands (REPL)
-
-- `/continue`: continue from current context without adding a user message.
-- `/new`: force start a new session and clear current conversation context.
-- `/resume [session]`: show recent sessions and choose one to resume (TUI opens a picker with task summary + updated time, Enter to confirm; or pass a specific session file).
-- `/session`: print current session file path.
-- `/help`: show command help.
-- `/exit` or `/quit`: quit.
-
-## Runtime Files and Directories
-
-Default runtime data lives under `~/.pixy`:
-
-```text
-~/.pixy/
-  pixy.toml
-  agent/
-    keybindings.json
-    input_history.jsonl
-    sessions/
+```bash
+PIXY_VERSION=v0.1.0 ./scripts/install.sh
 ```
 
-- Default conf dir: `~/.pixy` (override with `--conf-dir <path>`)
-- Default agent dir: `<conf_dir>/agent`
-- Default sessions dir: `<conf_dir>/agent/sessions`
-- Default log files (configurable via `[log].path`): `<conf_dir>/logs/pixy.log`, `<conf_dir>/logs/gateway.log`
+Uninstall:
 
-## Configuration
-
-### `pixy.toml`
-
-Example [pixy.toml.sample](./pixy.toml.sample)
-
-Notes:
-- `pixy` and `pixy-gateway` support `--conf-dir <path>`; default is `~/.pixy`.
-- `api_key` supports `$ENV_KEY`: it resolves from `[env]` in `pixy.toml` first, then falls back to process environment variables.
-- `default_provider = "*"` routes by provider `weight`.
-- `weight` is provider-level and must be `< 100`. `0` means that provider is never selected by weighted routing.
-- Only providers with `kind = "chat"` participate in session routing and requests; `embedding` providers are ignored.
-- `reasoning` / `reasoning_effort` / `context_window` / `max_tokens` are runtime model parameters.
-
-### `[log]` section
-
-`pixy.toml` supports a top-level `[log]` section for both `pixy` and `pixy-gateway`:
-
-```toml
-[log]
-path = "~/.pixy/logs/"
-level = "info"
-rotate_size_mb = 100
-stdout = false
+```bash
+rm -f ~/.local/bin/pixy
 ```
 
-- `path`: log directory (default `<conf_dir>/logs`, where `conf_dir` defaults to `~/.pixy`)
-- `level`: default filter when `RUST_LOG` is unset
-- `rotate_size_mb`: size-based rotation threshold per log file
-- `stdout`: whether logs are also emitted to stdout
+```powershell
+Remove-Item "$env:USERPROFILE\\.local\\bin\\pixy.exe" -Force
+```
+
+## Troubleshooting
+
+- `pixy: command not found`
+  - Ensure install dir is in PATH (default `~/.local/bin`).
+- checksum error
+  - Re-run installer and verify network/proxy settings.
+- cannot connect provider
+  - Check `api_key`, `base_url`, and network reachability.
+- runtime/config issues
+  - Run `pixy doctor` for a local environment report.
 
 ## Development
 
-### Format
+### Workspace layout
+
+- `crates/pixy-main`: unified `pixy` command dispatcher (`pixy cli`, `pixy gateway`)
+- `crates/pixy-coding-agent`: coding agent runtime and `pixy-cli` binary
+- `crates/pixy-gateway`: gateway runtime
+- `crates/pixy-ai`: provider abstraction and streaming protocol
+- `crates/pixy-agent-core`: agent loop, tools, retries/fallback
+- `crates/pixy-tui`: terminal UI
+
+### Run from source
 
 ```bash
-cargo fmt
+cargo run -p pixy-main --bin pixy
+cargo run -p pixy-main --bin pixy -- --help
+cargo run -p pixy-main --bin pixy -- gateway start
 ```
 
-### Test (single crate)
+### Tests
 
 ```bash
-cargo nextest run -p pixy-coding-agent
-```
-
-### Test (workspace)
-
-```bash
+cargo c
+cargo nextest run -p pixy-coding-agent -p pixy-main -p pixy-gateway
 cargo nextest run
 ```
 
-### Optional `just` shortcuts
+### Package manager manifests
+
+Generate Homebrew/Scoop manifests from a release tag:
 
 ```bash
-just dev-cli
-just cli
+./scripts/generate-package-manifests.sh --version v0.1.0
 ```
+
+Generated files:
+- `packaging/homebrew/pixy.rb`
+- `packaging/scoop/pixy.json`
