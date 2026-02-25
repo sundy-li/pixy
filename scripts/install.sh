@@ -120,7 +120,7 @@ curl -fL --retry 3 --connect-timeout 10 -o "${TMP_DIR}/SHA256SUMS" "$SUMS_URL"
 
 EXPECTED_SUM="$(awk -v name="$ASSET" '{
   file=$2
-  sub(/^\\.\\//, "", file)
+  sub(/^\.\//, "", file)
   if (file == name) {
     print $1
   }

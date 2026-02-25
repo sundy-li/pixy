@@ -85,7 +85,7 @@ try {
     Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile $sumsPath
 
     $sumLine = Get-Content $sumsPath | Where-Object {
-        $_ -match ("^([a-fA-F0-9]{64})\\s+(\\./)?" + [regex]::Escape($asset) + "$")
+        $_ -match ("^([a-fA-F0-9]{64})\s+(\./)?" + [regex]::Escape($asset) + "$")
     } | Select-Object -First 1
 
     if (-not $sumLine) {
