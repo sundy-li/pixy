@@ -92,7 +92,10 @@ try {
         throw "Checksum entry not found for $asset"
     }
 
-    $expected = ($sumLine -split "\\s+")[0].ToLowerInvariant()
+    if ($sumLine -notmatch "^([a-fA-F0-9]{64})\s+") {
+        throw "Invalid checksum line format for $asset"
+    }
+    $expected = $matches[1].ToLowerInvariant()
     $actual = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     if ($expected -ne $actual) {
