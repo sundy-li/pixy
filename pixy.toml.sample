@@ -8,6 +8,20 @@ skills = ["~/.agents/skills"]
 [env]
 OPENAI_API_KEY = "sk-..."
 ANTHROPIC_API_KEY = "sk-ant-..."
+TELEGRAM_BOT_TOKEN = "1234567890:replace-with-telegram-bot-token"
+FEISHU_APP_ID = "cli_xxx"
+FEISHU_APP_SECRET = "replace-with-feishu-secret"
+FEISHU_VERIFICATION_TOKEN = "replace-with-feishu-verification-token"
+
+[log]
+# Log directory for pixy and pixy-gateway.
+path = "~/.pixy/logs/"
+# Default log level when RUST_LOG is not set.
+level = "info"
+# Rotate log file when size exceeds this value (MB).
+rotate_size_mb = 100
+# Also print logs to stdout.
+stdout = false
 
 [llm]
 # Use "*" to route by provider weights.
@@ -49,3 +63,34 @@ base_url = "https://api.openai.com/v1"
 api_key = "$OPENAI_API_KEY"
 model = "text-embedding-3-small"
 weight = 0
+
+[gateway]
+enabled = true
+bind = "0.0.0.0:8080"
+request_timeout_ms = 20000
+
+[[gateway.channels]]
+name = "tg-main"
+kind = "telegram"
+enabled = true
+bot_token = "$TELEGRAM_BOT_TOKEN"
+# Optional per-channel proxy, supports http/socks5.
+# proxy_url = "socks5://127.0.0.1:7891"
+mode = "polling"
+poll_interval_ms = 1500
+update_limit = 50
+allowed_user_ids = ["replace-with-telegram-user-id"]
+
+[[gateway.channels]]
+name = "feishu-main"
+kind = "feishu"
+enabled = false
+mode = "webhook"
+app_id = "$FEISHU_APP_ID"
+app_secret = "$FEISHU_APP_SECRET"
+verification_token = "$FEISHU_VERIFICATION_TOKEN"
+# Optional per-channel proxy, supports http/socks5.
+# proxy_url = "http://127.0.0.1:7890"
+# Channel queue poll interval (webhook events are buffered then dispatched by runtime loop).
+poll_interval_ms = 100
+allowed_user_ids = ["replace-with-feishu-open-id"]

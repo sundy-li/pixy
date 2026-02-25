@@ -352,7 +352,10 @@ fn is_key_token(token: &str) -> bool {
         return true;
     }
 
-    matches!(normalized.as_str(), "up" | "down" | "pageup" | "pagedown")
+    matches!(
+        normalized.as_str(),
+        "/" | "up" | "down" | "pageup" | "pagedown"
+    )
 }
 
 fn is_compound_key_token(normalized: &str) -> bool {

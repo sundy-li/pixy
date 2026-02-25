@@ -557,6 +557,10 @@ impl SessionManager {
         Some(&self.session_file)
     }
 
+    pub fn cwd(&self) -> &str {
+        &self.header.cwd
+    }
+
     pub fn latest_model_change(&self) -> Option<(String, String)> {
         self.current_path_entries()
             .iter()

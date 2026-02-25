@@ -632,9 +632,7 @@ impl TuiApp {
         let mut lines = self
             .queued_follow_ups
             .iter()
-            .map(|queued| {
-                format!("Steering: {}", summarize_steering_message(queued))
-            })
+            .map(|queued| format!("Steering: {}", summarize_steering_message(queued)))
             .collect::<Vec<_>>();
         lines.push(format!(
             "↳ {} to edit all queued messages",
@@ -1613,6 +1611,12 @@ async fn handle_slash_command<B: TuiBackend>(
                 .unwrap_or_else(|| "session: (none)".to_string());
             Ok(true)
         }
+        "/new" => {
+            app.status = backend
+                .new_session()?
+                .unwrap_or_else(|| "new session is not supported by this backend".to_string());
+            Ok(true)
+        }
         command if command.starts_with("/resume") => {
             resume::handle_slash_resume_command(command, backend, app)
         }
@@ -2041,7 +2045,8 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     let footer_height = status_bar_height().min(frame.area().height.saturating_sub(1).max(1));
     let desired_steering_height = steering_panel_height(app);
     let steering_height = desired_steering_height.min(
-        frame.area()
+        frame
+            .area()
             .height
             .saturating_sub(footer_height)
             .saturating_sub(1),
@@ -2078,7 +2083,10 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         .block(
             Block::default()
                 .borders(Borders::NONE)
-                .title(transcript_title(options.app_name.as_str(), options.version.as_str())),
+                .title(transcript_title(
+                    options.app_name.as_str(),
+                    options.version.as_str(),
+                )),
         )
         .style(options.theme.transcript_style());
     frame.render_widget(transcript, transcript_area);
@@ -2175,7 +2183,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             Line::from(""),
             Line::from("Slash Commands"),
             Line::from(format!(
-                "  /continue ({continue_key}) /resume [session] /session /help /exit"
+                "  /new /continue ({continue_key}) /resume [session] /session /help /exit"
             )),
             Line::from("  Ctrl+A / Ctrl+E move cursor"),
             Line::from("  Ctrl+W / Ctrl+U delete backward"),
@@ -2330,7 +2338,12 @@ fn input_cursor_row_col(
     (row, col)
 }
 
-fn input_area_height(app: &TuiApp, frame_area: Rect, input_prompt: &str, footer_height: u16) -> u16 {
+fn input_area_height(
+    app: &TuiApp,
+    frame_area: Rect,
+    input_prompt: &str,
+    footer_height: u16,
+) -> u16 {
     // Input block has top+bottom borders only.
     let inner_width = frame_area.width as usize;
     let display_input = format!("{input_prompt}{}", app.input);

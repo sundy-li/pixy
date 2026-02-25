@@ -3,6 +3,7 @@ members = [
     "crates/pixy-ai",
     "crates/pixy-agent-core",
     "crates/pixy-coding-agent",
+    "crates/pixy-gateway",
     "crates/pixy-tui",
 ]
 resolver = "2"

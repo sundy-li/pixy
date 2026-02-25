@@ -63,5 +63,8 @@ pub trait TuiBackend {
     fn resume_session(&mut self, _session_ref: Option<&str>) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn new_session(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     fn session_file(&self) -> Option<PathBuf>;
 }

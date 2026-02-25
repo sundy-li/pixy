@@ -101,6 +101,11 @@ impl TuiBackend for AgentSession {
             .map(|path| Some(format!("session: {}", path.display())))
     }
 
+    fn new_session(&mut self) -> Result<Option<String>, String> {
+        AgentSession::start_new_session(self)
+            .map(|path| Some(format!("session: {}", path.display())))
+    }
+
     fn session_file(&self) -> Option<PathBuf> {
         AgentSession::session_file(self).cloned()
     }

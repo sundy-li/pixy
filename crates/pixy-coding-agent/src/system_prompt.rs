@@ -26,11 +26,7 @@ fn build_system_prompt_with_now(
     skills: &[Skill],
     now_text: &str,
 ) -> String {
-    let mut prompt = if let Some(custom) = custom_prompt.and_then(normalize_custom_prompt) {
-        load_custom_prompt(custom, cwd)
-    } else {
-        build_default_prompt(selected_tools)
-    };
+    let mut prompt = build_default_prompt(custom_prompt, selected_tools);
     let has_read_tool = selected_tools.contains(&"read");
     if has_read_tool {
         let skills_prompt = format_skills_for_prompt(skills);
@@ -161,39 +157,8 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn normalize_custom_prompt(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn load_custom_prompt(custom_prompt: &str, cwd: &Path) -> String {
-    let path = Path::new(custom_prompt);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-
-    if candidate.is_file() {
-        match std::fs::read_to_string(&candidate) {
-            Ok(content) => return content,
-            Err(error) => {
-                eprintln!(
-                    "warning: could not read system prompt file {}: {error}",
-                    candidate.display()
-                );
-            }
-        }
-    }
-
-    custom_prompt.to_string()
-}
-
-fn build_default_prompt(selected_tools: &[&str]) -> String {
+fn build_default_prompt(custom_prompt: Option<&str>, selected_tools: &[&str]) -> String {
+    let prompt = custom_prompt.unwrap_or(DEFAULT_PROMPT_INTRO);
     let tool_lines: Vec<String> = selected_tools
         .iter()
         .copied()
@@ -209,7 +174,7 @@ fn build_default_prompt(selected_tools: &[&str]) -> String {
 
     let guidelines = build_guidelines(selected_tools);
     let sections = [
-        format!("<identity>\n{DEFAULT_PROMPT_INTRO}\n</identity>"),
+        format!("<identity>\n{prompt}\n</identity>"),
         "<runtime_contract>\n\
 1) Use available tools for concrete actions (file operations, shell commands, and log inspection).\n\
 2) Do not ask the user to manually run commands or edit files when tools can do it directly.\n\

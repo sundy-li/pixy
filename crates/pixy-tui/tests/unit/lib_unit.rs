@@ -26,6 +26,8 @@ struct TestBackend {
     resume_targets: Vec<Option<String>>,
     recent_sessions_result: Result<Option<Vec<ResumeCandidate>>, String>,
     recent_sessions_limits: Vec<usize>,
+    new_session_result: Result<Option<String>, String>,
+    new_session_calls: usize,
 }
 
 impl TuiBackend for TestBackend {
@@ -67,6 +69,11 @@ impl TuiBackend for TestBackend {
     fn resume_session(&mut self, session_ref: Option<&str>) -> Result<Option<String>, String> {
         self.resume_targets.push(session_ref.map(ToOwned::to_owned));
         self.resume_result.clone()
+    }
+
+    fn new_session(&mut self) -> Result<Option<String>, String> {
+        self.new_session_calls += 1;
+        self.new_session_result.clone()
     }
 
     fn recent_resumable_sessions(
@@ -720,9 +727,18 @@ fn tool_output_is_compacted_with_omitted_line_marker() {
 #[test]
 fn tool_call_groups_have_blank_line_separator() {
     let lines = vec![
-        TranscriptLine::new("• Ran edit crates/pixy-tui/src/lib.rs".to_string(), TranscriptLineKind::Tool),
-        TranscriptLine::new("crates/pixy-tui/src/lib.rs | 2 ++--".to_string(), TranscriptLineKind::Tool),
-        TranscriptLine::new("• Ran bash -lc 'cargo test -p pixy-tui'".to_string(), TranscriptLineKind::Tool),
+        TranscriptLine::new(
+            "• Ran edit crates/pixy-tui/src/lib.rs".to_string(),
+            TranscriptLineKind::Tool,
+        ),
+        TranscriptLine::new(
+            "crates/pixy-tui/src/lib.rs | 2 ++--".to_string(),
+            TranscriptLineKind::Tool,
+        ),
+        TranscriptLine::new(
+            "• Ran bash -lc 'cargo test -p pixy-tui'".to_string(),
+            TranscriptLineKind::Tool,
+        ),
         TranscriptLine::new("running 1 test".to_string(), TranscriptLineKind::Tool),
     ];
 
@@ -1038,6 +1054,19 @@ fn named_single_key_shortcuts_are_highlighted() {
 }
 
 #[test]
+fn slash_command_hint_token_is_highlighted() {
+    let line = TranscriptLine::new("Use / for commands".to_string(), TranscriptLineKind::Normal)
+        .to_line(40, TuiTheme::Dark);
+
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == "/" && span.style.fg == Some(Color::LightYellow)),
+        "slash command hint should use key token color"
+    );
+}
+
+#[test]
 fn parse_tool_name_extracts_name_from_tool_header() {
     assert_eq!(parse_tool_name("[tool:read:ok]"), Some("read"));
     assert_eq!(parse_tool_name("• Ran bash -lc 'cargo test'"), Some("bash"));
@@ -1084,6 +1113,8 @@ async fn slash_resume_command_updates_status_when_backend_supports_resume() {
         resume_targets: vec![],
         recent_sessions_result: Ok(None),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
 
@@ -1100,12 +1131,35 @@ async fn slash_resume_command_updates_status_when_backend_supports_resume() {
 }
 
 #[tokio::test]
+async fn slash_new_command_starts_new_session() {
+    let mut backend = TestBackend {
+        resume_result: Ok(None),
+        resume_targets: vec![],
+        recent_sessions_result: Ok(None),
+        recent_sessions_limits: vec![],
+        new_session_result: Ok(Some("session: /tmp/new-session.jsonl".to_string())),
+        new_session_calls: 0,
+    };
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+
+    let handled = handle_slash_command("/new", &mut backend, &mut app)
+        .await
+        .expect("/new should be handled");
+
+    assert!(handled);
+    assert_eq!(backend.new_session_calls, 1);
+    assert_eq!(app.status, "session: /tmp/new-session.jsonl");
+}
+
+#[tokio::test]
 async fn slash_resume_command_renders_resume_error() {
     let mut backend = TestBackend {
         resume_result: Err("boom".to_string()),
         resume_targets: vec![],
         recent_sessions_result: Ok(None),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
 
@@ -1143,6 +1197,8 @@ async fn slash_resume_without_target_lists_recent_sessions() {
             },
         ])),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
 
@@ -1175,6 +1231,8 @@ async fn slash_resume_numeric_selection_resumes_selected_candidate() {
             },
         ])),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
 
@@ -1202,6 +1260,8 @@ async fn slash_resume_numeric_selection_rejects_out_of_range_index() {
             updated_at: "2026-02-25 12:10".to_string(),
         }])),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
 
@@ -1228,6 +1288,8 @@ fn resume_picker_enter_resumes_selected_item() {
         resume_targets: vec![],
         recent_sessions_result: Ok(Some(vec![])),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.open_resume_picker(vec![
@@ -1268,6 +1330,8 @@ fn resume_picker_escape_cancels_picker() {
         resume_targets: vec![],
         recent_sessions_result: Ok(Some(vec![])),
         recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
     };
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.open_resume_picker(vec![ResumeCandidate {

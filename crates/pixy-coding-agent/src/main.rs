@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser};
+use clap::{Args, Parser, Subcommand};
 use pixy_ai::{
     AssistantContentBlock, Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Message, Model,
     SimpleStreamOptions, StopReason, ToolResultContentBlock,
@@ -23,12 +23,27 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 mod system_prompt;
 
 const RESUME_PICKER_LIMIT: usize = 10;
+const DEFAULT_CONF_DIR_NAME: &str = ".pixy";
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_LOG_ROTATE_SIZE_MB: u64 = 100;
+const DEFAULT_LOG_STDOUT: bool = false;
+static CONF_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(name = "pixy", version, about = "pixy interactive CLI")]
 struct Cli {
+    #[arg(long, global = true)]
+    conf_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<RootCommand>,
     #[command(flatten)]
     chat: ChatArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum RootCommand {
+    Cli(ChatArgs),
+    Gateway(GatewayArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -73,42 +88,291 @@ struct ChatArgs {
     theme: Option<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct GatewayArgs {
+    #[command(subcommand)]
+    command: GatewaySubcommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum GatewaySubcommand {
+    Start(GatewayStartArgs),
+    Stop,
+    Restart,
+    #[command(hide = true)]
+    Serve,
+}
+
+#[derive(Args, Debug, Clone)]
+struct GatewayStartArgs {
+    #[arg(long, default_value_t = false)]
+    daemon: bool,
+}
+
 #[tokio::main]
 async fn main() {
-    init_tracing();
     let cli = Cli::parse();
-    if let Err(error) = run(cli.chat).await {
+    init_conf_dir(cli.conf_dir.as_deref());
+    init_tracing();
+    let result = match cli.command {
+        Some(RootCommand::Cli(args)) => run(args).await,
+        Some(RootCommand::Gateway(args)) => run_gateway(args, cli.conf_dir.as_deref()).await,
+        None => run(cli.chat).await,
+    };
+    if let Err(error) = result {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+async fn run_gateway(args: GatewayArgs, conf_dir: Option<&Path>) -> Result<(), String> {
+    let mut command = Command::new("pixy-gateway");
+    for token in gateway_command_tokens(&args.command, conf_dir) {
+        command.arg(token);
+    }
+    let status = command
+        .status()
+        .map_err(|error| format!("failed to launch pixy-gateway: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pixy-gateway exited with status {status}"))
+    }
+}
+
+fn gateway_command_tokens(command: &GatewaySubcommand, conf_dir: Option<&Path>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Some(path) = conf_dir {
+        tokens.push("--conf-dir".to_string());
+        tokens.push(path.display().to_string());
+    }
+    match command {
+        GatewaySubcommand::Start(start) => {
+            tokens.push("start".to_string());
+            if start.daemon {
+                tokens.push("--daemon".to_string());
+            }
+            tokens
+        }
+        GatewaySubcommand::Stop => {
+            tokens.push("stop".to_string());
+            tokens
+        }
+        GatewaySubcommand::Restart => {
+            tokens.push("restart".to_string());
+            tokens
+        }
+        GatewaySubcommand::Serve => {
+            tokens.push("serve".to_string());
+            tokens
+        }
     }
 }
 
 fn init_tracing() {
     static TRACE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let log_dir = PathBuf::from(home).join(".pixy");
-    if let Err(error) = std::fs::create_dir_all(&log_dir) {
-        eprintln!(
-            "warning: failed to create log dir {}: {error}",
-            log_dir.display()
-        );
-        return;
-    }
-
-    let appender = tracing_appender::rolling::never(&log_dir, "pixy.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    let config = load_runtime_log_config("pixy.log");
+    let file_writer =
+        match SizeRotatingFileWriter::new(config.file_path.clone(), config.rotate_size_bytes) {
+            Ok(writer) => writer,
+            Err(error) => {
+                eprintln!("warning: failed to initialize tracing writer: {error}");
+                return;
+            }
+        };
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_writer);
     let _ = TRACE_GUARD.set(guard);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(non_blocking),
-        )
-        .try_init();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.level.clone()));
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(non_blocking);
+    let mut stdout_layer = tracing_subscriber::fmt::layer();
+    stdout_layer.set_ansi(false);
+
+    let init_result = if config.stdout {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stdout_layer)
+            .try_init()
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .try_init()
+    };
+    if let Err(error) = init_result {
+        eprintln!(
+            "warning: failed to initialize tracing subscriber for {}: {error}",
+            config.file_path.display()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlLogFile {
+    #[serde(default)]
+    log: PixyTomlLog,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlLog {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    rotate_size_mb: Option<u64>,
+    #[serde(default)]
+    stdout: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeLogConfig {
+    file_path: PathBuf,
+    level: String,
+    rotate_size_bytes: u64,
+    stdout: bool,
+}
+
+fn load_runtime_log_config(file_name: &str) -> RuntimeLogConfig {
+    let config_path = default_pixy_config_path();
+    let parsed = read_toml_if_exists::<PixyTomlLogFile>(&config_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    build_runtime_log_config(&parsed.log, &parsed.env, file_name)
+}
+
+#[cfg(test)]
+fn parse_runtime_log_config_from_toml(
+    content: &str,
+    file_name: &str,
+) -> Result<RuntimeLogConfig, String> {
+    let parsed: PixyTomlLogFile =
+        toml::from_str(content).map_err(|error| format!("parse log config failed: {error}"))?;
+    Ok(build_runtime_log_config(
+        &parsed.log,
+        &parsed.env,
+        file_name,
+    ))
+}
+
+fn build_runtime_log_config(
+    log: &PixyTomlLog,
+    env_map: &HashMap<String, String>,
+    file_name: &str,
+) -> RuntimeLogConfig {
+    let base_path = log
+        .path
+        .as_deref()
+        .and_then(|value| resolve_config_value(value, env_map))
+        .map(|value| expand_home_path(value.trim()))
+        .unwrap_or_else(default_log_dir);
+    let file_path = base_path.join(file_name);
+    let level = log
+        .level
+        .as_deref()
+        .and_then(|value| resolve_config_value(value, env_map))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
+    let rotate_size_mb = log
+        .rotate_size_mb
+        .unwrap_or(DEFAULT_LOG_ROTATE_SIZE_MB)
+        .max(1);
+
+    RuntimeLogConfig {
+        file_path,
+        level,
+        rotate_size_bytes: rotate_size_mb * 1024 * 1024,
+        stdout: log.stdout.unwrap_or(DEFAULT_LOG_STDOUT),
+    }
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return default_log_dir();
+    }
+    if trimmed == "~" {
+        return home_dir();
+    }
+    if let Some(suffix) = trimmed.strip_prefix("~/") {
+        return home_dir().join(suffix);
+    }
+    PathBuf::from(trimmed)
+}
+
+#[derive(Debug)]
+struct SizeRotatingFileWriter {
+    file_path: PathBuf,
+    rotated_path: PathBuf,
+    max_size_bytes: u64,
+}
+
+impl SizeRotatingFileWriter {
+    fn new(file_path: PathBuf, max_size_bytes: u64) -> Result<Self, String> {
+        let parent = file_path
+            .parent()
+            .ok_or_else(|| format!("invalid log file path {}", file_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("create log directory {} failed: {error}", parent.display())
+        })?;
+
+        let mut rotated_name = file_path
+            .file_name()
+            .map(|value| value.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("pixy.log"));
+        rotated_name.push(".1");
+        let rotated_path = file_path.with_file_name(rotated_name);
+
+        Ok(Self {
+            file_path,
+            rotated_path,
+            max_size_bytes,
+        })
+    }
+
+    fn maybe_rotate(&self, incoming_len: usize) -> io::Result<()> {
+        if self.max_size_bytes == 0 {
+            return Ok(());
+        }
+        let current_size = std::fs::metadata(&self.file_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current_size.saturating_add(incoming_len as u64) <= self.max_size_bytes {
+            return Ok(());
+        }
+        if self.rotated_path.exists() {
+            let _ = std::fs::remove_file(&self.rotated_path);
+        }
+        if self.file_path.exists() {
+            std::fs::rename(&self.file_path, &self.rotated_path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for SizeRotatingFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.maybe_rotate(buf.len())?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+        file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 async fn run(args: ChatArgs) -> Result<(), String> {
@@ -200,7 +464,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         run_continue_streaming_cli(&mut session, !args.hide_tool_results).await?;
     }
 
-    println!("commands: /continue, /resume [session], /session, /help, /exit");
+    println!("commands: /new, /continue, /resume [session], /session, /help, /exit");
     repl_loop(&mut session, !args.hide_tool_results).await
 }
 
@@ -442,6 +706,14 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
             continue;
         }
 
+        if is_new_session_command(input) {
+            match session.start_new_session() {
+                Ok(path) => println!("new session: {}", path.display()),
+                Err(error) => eprintln!("new session failed: {error}"),
+            }
+            continue;
+        }
+
         if input.starts_with("/resume") {
             let explicit_target = input
                 .strip_prefix("/resume")
@@ -475,6 +747,7 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
             "/exit" | "/quit" => return Ok(()),
             "/help" => {
                 println!("commands:");
+                println!("  /new       start a new session and reset current context");
                 println!(
                     "  /continue  continue from current context without adding a user message"
                 );
@@ -506,6 +779,10 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
             }
         }
     }
+}
+
+fn is_new_session_command(input: &str) -> bool {
+    input.trim() == "/new"
 }
 
 fn prompt_resume_target_selection(
@@ -877,11 +1154,55 @@ fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn default_pixy_dir() -> PathBuf {
+fn init_conf_dir(conf_dir: Option<&Path>) {
+    let resolved = conf_dir
+        .map(resolve_conf_dir_arg)
+        .unwrap_or_else(default_conf_dir);
+    let _ = CONF_DIR.set(resolved);
+}
+
+fn resolve_conf_dir_arg(path: &Path) -> PathBuf {
+    let expanded = expand_path_with_home(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
+    }
+}
+
+fn expand_path_with_home(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return home_dir().join(suffix);
+    }
+    path.to_path_buf()
+}
+
+fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pixy")
+}
+
+fn default_conf_dir() -> PathBuf {
+    home_dir().join(DEFAULT_CONF_DIR_NAME)
+}
+
+fn current_conf_dir() -> PathBuf {
+    CONF_DIR.get().cloned().unwrap_or_else(default_conf_dir)
+}
+
+fn default_log_dir() -> PathBuf {
+    current_conf_dir().join("logs")
+}
+
+fn default_pixy_dir() -> PathBuf {
+    current_conf_dir()
 }
 
 fn default_pixy_config_path() -> PathBuf {
@@ -1441,7 +1762,7 @@ fn resolve_weighted_provider_selection(
 
     let router = LLMRouter::from_provider_configs(&local.models.providers)?;
     let provider = router.select_provider(router_seed).ok_or_else(|| {
-        "default_provider='*' requires at least one chat provider with non-zero weight in ~/.pixy/pixy.toml".to_string()
+        "default_provider='*' requires at least one chat provider with non-zero weight in <conf_dir>/pixy.toml".to_string()
     })?;
     Ok(Some(provider))
 }
@@ -1723,6 +2044,71 @@ mod tests {
             no_tui: false,
             theme: None,
         }
+    }
+
+    #[test]
+    fn cli_accepts_explicit_cli_subcommand() {
+        let parsed = Cli::try_parse_from(["pixy", "cli", "--no-tui"]);
+        assert!(
+            parsed.is_ok(),
+            "pixy cli should be accepted as explicit CLI entrypoint"
+        );
+    }
+
+    #[test]
+    fn cli_accepts_gateway_start_daemon_subcommand() {
+        let parsed = Cli::try_parse_from(["pixy", "gateway", "start", "--daemon"]);
+        assert!(
+            parsed.is_ok(),
+            "pixy gateway start --daemon should be accepted"
+        );
+    }
+
+    #[test]
+    fn cli_accepts_conf_dir_global_flag() {
+        let parsed =
+            Cli::try_parse_from(["pixy", "--conf-dir", "/tmp/pixy-conf", "gateway", "start"]);
+        assert!(
+            parsed.is_ok(),
+            "pixy should accept --conf-dir as global flag"
+        );
+    }
+
+    #[test]
+    fn gateway_command_tokens_include_daemon_flag_when_requested() {
+        let tokens = gateway_command_tokens(
+            &GatewaySubcommand::Start(GatewayStartArgs { daemon: true }),
+            None,
+        );
+        assert_eq!(tokens, vec!["start".to_string(), "--daemon".to_string()]);
+    }
+
+    #[test]
+    fn gateway_command_tokens_encode_restart_subcommand() {
+        let tokens = gateway_command_tokens(&GatewaySubcommand::Restart, None);
+        assert_eq!(tokens, vec!["restart".to_string()]);
+    }
+
+    #[test]
+    fn gateway_command_tokens_include_conf_dir_when_provided() {
+        let conf_dir = Path::new("/tmp/pixy-conf");
+        let tokens = gateway_command_tokens(&GatewaySubcommand::Stop, Some(conf_dir));
+        assert_eq!(
+            tokens,
+            vec![
+                "--conf-dir".to_string(),
+                "/tmp/pixy-conf".to_string(),
+                "stop".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_repl_command_matches_exact_new_token() {
+        assert!(is_new_session_command("/new"));
+        assert!(is_new_session_command(" /new "));
+        assert!(!is_new_session_command("/new task"));
+        assert!(!is_new_session_command("new"));
     }
 
     #[test]
@@ -2571,6 +2957,46 @@ weight = 30
         assert_eq!(provider.weight, 30);
         assert_eq!(provider.models.len(), 1);
         assert_eq!(provider.models[0].id, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn parse_runtime_log_config_from_toml_reads_log_section() {
+        let config = parse_runtime_log_config_from_toml(
+            r#"
+[env]
+LOG_LEVEL = "debug"
+
+[log]
+path = "/tmp/pixy-logs"
+level = "$LOG_LEVEL"
+rotate_size_mb = 12
+stdout = true
+"#,
+            "pixy.log",
+        )
+        .expect("log config should parse");
+
+        assert_eq!(config.file_path, PathBuf::from("/tmp/pixy-logs/pixy.log"));
+        assert_eq!(config.level, "debug");
+        assert_eq!(config.rotate_size_bytes, 12 * 1024 * 1024);
+        assert!(config.stdout);
+    }
+
+    #[test]
+    fn parse_runtime_log_config_from_toml_uses_defaults_when_missing() {
+        let config = parse_runtime_log_config_from_toml(
+            r#"
+[llm]
+default_provider = "openai"
+"#,
+            "pixy.log",
+        )
+        .expect("config without log section should still parse");
+
+        assert!(config.file_path.ends_with(Path::new(".pixy/logs/pixy.log")));
+        assert_eq!(config.level, "info");
+        assert_eq!(config.rotate_size_bytes, 100 * 1024 * 1024);
+        assert!(!config.stdout);
     }
 
     #[test]

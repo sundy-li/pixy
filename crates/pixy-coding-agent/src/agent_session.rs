@@ -100,6 +100,29 @@ impl AgentSession {
         Ok(target_path)
     }
 
+    pub fn start_new_session(&mut self) -> Result<PathBuf, String> {
+        let current_session_path =
+            self.session_manager
+                .session_file()
+                .cloned()
+                .ok_or_else(|| {
+                    "Current session file unavailable; cannot start new session".to_string()
+                })?;
+        let session_dir = current_session_path.parent().ok_or_else(|| {
+            format!(
+                "Cannot determine session directory from {}",
+                current_session_path.display()
+            )
+        })?;
+        let manager = SessionManager::create(self.session_manager.cwd(), session_dir)?;
+        let new_path = manager
+            .session_file()
+            .cloned()
+            .ok_or_else(|| "session manager did not return session file path".to_string())?;
+        self.session_manager = manager;
+        Ok(new_path)
+    }
+
     pub fn recent_resumable_sessions(&self, limit: usize) -> Result<Vec<PathBuf>, String> {
         if limit == 0 {
             return Ok(vec![]);
