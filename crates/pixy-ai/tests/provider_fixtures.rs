@@ -282,7 +282,11 @@ fn fixture_files_resolve_from_crate_test_fixtures() {
         expected_suffix,
         path.display()
     );
-    assert!(path.is_file(), "fixture file should exist: {}", path.display());
+    assert!(
+        path.is_file(),
+        "fixture file should exist: {}",
+        path.display()
+    );
 }
 
 #[test]
