@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult, ToolFuture};
+use async_trait::async_trait;
+use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult};
 use pixy_ai::PiAiError;
 use serde_json::{Value, json};
 
@@ -35,10 +36,15 @@ struct WriteToolExecutor {
     cwd: PathBuf,
 }
 
+#[async_trait]
 impl AgentToolExecutor for WriteToolExecutor {
-    fn execute(&self, _tool_call_id: String, args: Value) -> ToolFuture {
+    async fn execute(
+        &self,
+        _tool_call_id: String,
+        args: Value,
+    ) -> Result<AgentToolResult, PiAiError> {
         let cwd = self.cwd.clone();
-        Box::pin(async move { execute_write_tool(&cwd, args) })
+        execute_write_tool(&cwd, args)
     }
 }
 

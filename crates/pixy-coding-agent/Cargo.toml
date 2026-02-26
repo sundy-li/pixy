@@ -9,6 +9,7 @@ name = "pixy-cli"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 pixy-ai = { path = "../pixy-ai" }

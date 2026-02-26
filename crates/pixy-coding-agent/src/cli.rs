@@ -1424,6 +1424,17 @@ fn terminal_columns() -> u16 {
 }
 
 fn render_messages(messages: &[Message], show_tool_results: bool) {
+    let mut stdout = io::stdout();
+    if let Err(error) = render_messages_to_writer(messages, show_tool_results, &mut stdout) {
+        eprintln!("[cli_error] failed to render messages: {error}");
+    }
+}
+
+fn render_messages_to_writer<W: Write>(
+    messages: &[Message],
+    show_tool_results: bool,
+    writer: &mut W,
+) -> io::Result<()> {
     for message in messages {
         match message {
             Message::Assistant {
@@ -1436,12 +1447,12 @@ fn render_messages(messages: &[Message], show_tool_results: bool) {
                     match block {
                         AssistantContentBlock::Text { text, .. } => {
                             if !text.trim().is_empty() {
-                                println!("{text}");
+                                writeln!(writer, "{text}")?;
                             }
                         }
                         AssistantContentBlock::Thinking { thinking, .. } => {
                             if !thinking.trim().is_empty() {
-                                println!("[thinking] {thinking}");
+                                writeln!(writer, "[thinking] {thinking}")?;
                             }
                         }
                         AssistantContentBlock::ToolCall { .. } => {}
@@ -1467,12 +1478,16 @@ fn render_messages(messages: &[Message], show_tool_results: bool) {
                     continue;
                 }
                 let status = if *is_error { "error" } else { "ok" };
-                println!("[tool:{tool_name}:{status}]");
-                for block in content {
-                    match block {
-                        ToolResultContentBlock::Text { text, .. } => println!("{text}"),
-                        ToolResultContentBlock::Image { .. } => {
-                            println!("(image tool result omitted)")
+                writeln!(writer, "[tool:{tool_name}:{status}]")?;
+                if should_render_tool_result_content(tool_name) {
+                    for block in content {
+                        match block {
+                            ToolResultContentBlock::Text { text, .. } => {
+                                writeln!(writer, "{text}")?
+                            }
+                            ToolResultContentBlock::Image { .. } => {
+                                writeln!(writer, "(image tool result omitted)")?
+                            }
                         }
                     }
                 }
@@ -1480,6 +1495,11 @@ fn render_messages(messages: &[Message], show_tool_results: bool) {
             Message::User { .. } => {}
         }
     }
+    Ok(())
+}
+
+fn should_render_tool_result_content(tool_name: &str) -> bool {
+    tool_name != "read"
 }
 
 fn stop_reason_label(reason: &StopReason) -> &'static str {
@@ -3154,6 +3174,51 @@ mod tests {
 
         let output = String::from_utf8(renderer.into_inner()).expect("utf-8 output");
         assert_eq!(output, "hi\n");
+    }
+
+    #[test]
+    fn render_messages_omits_read_tool_text_blocks() {
+        let messages = vec![Message::ToolResult {
+            tool_call_id: "call-read-1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ToolResultContentBlock::Text {
+                text: "secret file body".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            is_error: false,
+            timestamp: 1_700_000_000_010,
+        }];
+
+        let mut output = Vec::<u8>::new();
+        render_messages_to_writer(&messages, true, &mut output).expect("render succeeds");
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8"),
+            "[tool:read:ok]\n",
+            "read tool output body should be hidden in CLI message rendering"
+        );
+    }
+
+    #[test]
+    fn render_messages_keeps_non_read_tool_text_blocks() {
+        let messages = vec![Message::ToolResult {
+            tool_call_id: "call-write-1".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ToolResultContentBlock::Text {
+                text: "write diff stat".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            is_error: false,
+            timestamp: 1_700_000_000_020,
+        }];
+
+        let mut output = Vec::<u8>::new();
+        render_messages_to_writer(&messages, true, &mut output).expect("render succeeds");
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8"),
+            "[tool:write:ok]\nwrite diff stat\n"
+        );
     }
 
     #[test]

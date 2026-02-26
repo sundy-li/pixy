@@ -1015,18 +1015,24 @@ pub(crate) fn render_messages(messages: &[Message]) -> Vec<TranscriptLine> {
                     format!("• Ran {tool_name}")
                 };
                 lines.push(TranscriptLine::new(title, TranscriptLineKind::Tool));
-                for block in content {
-                    match block {
-                        ToolResultContentBlock::Text { text, .. } => {
-                            for tool_line in split_tool_output_lines(text) {
-                                lines
-                                    .push(TranscriptLine::new(tool_line, TranscriptLineKind::Tool));
+                if should_render_tool_result_content(tool_name) {
+                    for block in content {
+                        match block {
+                            ToolResultContentBlock::Text { text, .. } => {
+                                for tool_line in split_tool_output_lines(text) {
+                                    lines.push(TranscriptLine::new(
+                                        tool_line,
+                                        TranscriptLineKind::Tool,
+                                    ));
+                                }
+                            }
+                            ToolResultContentBlock::Image { .. } => {
+                                lines.push(TranscriptLine::new(
+                                    "(image tool result omitted)".to_string(),
+                                    TranscriptLineKind::Tool,
+                                ))
                             }
                         }
-                        ToolResultContentBlock::Image { .. } => lines.push(TranscriptLine::new(
-                            "(image tool result omitted)".to_string(),
-                            TranscriptLineKind::Tool,
-                        )),
                     }
                 }
             }
@@ -1078,6 +1084,10 @@ pub(crate) fn split_tool_output_lines(text: &str) -> Vec<String> {
 
 pub(crate) fn is_tool_run_line(line: &str) -> bool {
     line.starts_with("• Ran ")
+}
+
+fn should_render_tool_result_content(tool_name: &str) -> bool {
+    tool_name != "read"
 }
 
 fn stop_reason_label(reason: &StopReason) -> &'static str {

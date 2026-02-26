@@ -1255,6 +1255,73 @@ async fn agent_session_prompt_streaming_emits_text_delta_updates() {
 }
 
 #[tokio::test]
+async fn agent_session_prompt_streaming_hides_read_tool_result_text() {
+    let dir = tempdir().expect("tempdir");
+    let session_dir = dir.path().join("sessions");
+    std::fs::write(dir.path().join("note.txt"), "hello from file").expect("seed note");
+
+    let stream_call_count = Arc::new(AtomicUsize::new(0));
+    let stream_call_count_in_fn = stream_call_count.clone();
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            let call_index = stream_call_count_in_fn.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let msg = assistant_message(
+                    vec![AssistantContentBlock::ToolCall {
+                        id: "tool-read-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path":"note.txt"}),
+                        thought_signature: None,
+                    }],
+                    StopReason::ToolUse,
+                    1_700_000_000_010,
+                );
+                Ok(done_stream(msg, DoneReason::ToolUse))
+            } else {
+                let msg = assistant_message(
+                    vec![AssistantContentBlock::Text {
+                        text: "done".to_string(),
+                        text_signature: None,
+                    }],
+                    StopReason::Stop,
+                    1_700_000_000_020,
+                );
+                Ok(done_stream(msg, DoneReason::Stop))
+            }
+        },
+    );
+
+    let manager = SessionManager::create(dir.path().to_str().expect("cwd utf-8"), &session_dir)
+        .expect("create manager");
+    let config = AgentSessionConfig {
+        model: sample_model("test-api"),
+        system_prompt: "You are helpful".to_string(),
+        stream_fn,
+        tools: create_coding_tools(dir.path()),
+    };
+    let mut session = AgentSession::new(manager, config);
+
+    let mut updates = vec![];
+    session
+        .prompt_streaming("please read note", |update| updates.push(update))
+        .await
+        .expect("prompt streaming succeeds");
+
+    assert!(
+        updates
+            .iter()
+            .any(|update| matches!(update, AgentSessionStreamUpdate::ToolLine(line) if line == "• Ran read note.txt")),
+        "streaming updates should still include read tool run line"
+    );
+    assert!(
+        updates
+            .iter()
+            .all(|update| !matches!(update, AgentSessionStreamUpdate::ToolLine(line) if line.contains("hello from file"))),
+        "streaming updates should not include read tool output text"
+    );
+}
+
+#[tokio::test]
 async fn agent_session_continue_run_streaming_emits_updates() {
     let dir = tempdir().expect("tempdir");
     let session_dir = dir.path().join("sessions");

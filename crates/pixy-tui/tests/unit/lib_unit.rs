@@ -1152,6 +1152,26 @@ fn transcript_module_exposes_tool_helpers() {
 }
 
 #[test]
+fn transcript_render_messages_hides_read_tool_text_blocks() {
+    let messages = vec![Message::ToolResult {
+        tool_call_id: "call-read-1".to_string(),
+        tool_name: "read".to_string(),
+        content: vec![pixy_ai::ToolResultContentBlock::Text {
+            text: "secret file body".to_string(),
+            text_signature: None,
+        }],
+        details: None,
+        is_error: false,
+        timestamp: 1_700_000_000_010,
+    }];
+
+    let lines = render_messages(&messages);
+    assert_eq!(lines.len(), 1, "read tool should only render the run line");
+    assert_eq!(lines[0].text, "• Ran read");
+    assert_eq!(lines[0].kind, TranscriptLineKind::Tool);
+}
+
+#[test]
 fn apply_stream_update_normalizes_legacy_tool_header_to_ran_title() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.apply_stream_update(StreamUpdate::ToolLine("[tool:read:ok]".to_string()));

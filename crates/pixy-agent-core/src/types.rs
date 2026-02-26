@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use async_trait::async_trait;
 use pixy_ai::{
     AssistantMessageEvent, AssistantMessageEventStream, Context, Message, Model, PiAiError,
     SimpleStreamOptions, Tool, ToolResultContentBlock,
@@ -85,16 +86,26 @@ pub type MessageQueueFn = Arc<dyn MessageQueue>;
 
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>>;
 
+#[async_trait]
 pub trait AgentToolExecutor: Send + Sync {
-    fn execute(&self, tool_call_id: String, args: Value) -> ToolFuture;
+    async fn execute(
+        &self,
+        tool_call_id: String,
+        args: Value,
+    ) -> Result<AgentToolResult, PiAiError>;
 }
 
+#[async_trait]
 impl<F> AgentToolExecutor for F
 where
     F: Fn(String, Value) -> ToolFuture + Send + Sync + 'static,
 {
-    fn execute(&self, tool_call_id: String, args: Value) -> ToolFuture {
-        (self)(tool_call_id, args)
+    async fn execute(
+        &self,
+        tool_call_id: String,
+        args: Value,
+    ) -> Result<AgentToolResult, PiAiError> {
+        (self)(tool_call_id, args).await
     }
 }
 

@@ -895,16 +895,21 @@ async fn collect_agent_loop_result(
                         ) {
                             callback(update);
                         }
-                    } else if let Message::ToolResult { content, .. } = &message {
-                        for block in content {
-                            match block {
-                                ToolResultContentBlock::Text { text, .. } => {
-                                    callback(AgentSessionStreamUpdate::ToolLine(text.clone()))
-                                }
-                                ToolResultContentBlock::Image { .. } => {
-                                    callback(AgentSessionStreamUpdate::ToolLine(
-                                        "(image tool result omitted)".to_string(),
-                                    ))
+                    } else if let Message::ToolResult {
+                        tool_name, content, ..
+                    } = &message
+                    {
+                        if should_render_tool_result_content(tool_name) {
+                            for block in content {
+                                match block {
+                                    ToolResultContentBlock::Text { text, .. } => {
+                                        callback(AgentSessionStreamUpdate::ToolLine(text.clone()))
+                                    }
+                                    ToolResultContentBlock::Image { .. } => {
+                                        callback(AgentSessionStreamUpdate::ToolLine(
+                                            "(image tool result omitted)".to_string(),
+                                        ))
+                                    }
                                 }
                             }
                         }
@@ -942,15 +947,17 @@ fn render_messages_for_streaming(messages: &[AgentMessage]) -> Vec<AgentSessionS
                     format!("• Ran {tool_name}")
                 };
                 updates.push(AgentSessionStreamUpdate::ToolLine(title));
-                for block in content {
-                    match block {
-                        ToolResultContentBlock::Text { text, .. } => {
-                            updates.push(AgentSessionStreamUpdate::ToolLine(text.clone()));
-                        }
-                        ToolResultContentBlock::Image { .. } => {
-                            updates.push(AgentSessionStreamUpdate::ToolLine(
-                                "(image tool result omitted)".to_string(),
-                            ));
+                if should_render_tool_result_content(tool_name) {
+                    for block in content {
+                        match block {
+                            ToolResultContentBlock::Text { text, .. } => {
+                                updates.push(AgentSessionStreamUpdate::ToolLine(text.clone()));
+                            }
+                            ToolResultContentBlock::Image { .. } => {
+                                updates.push(AgentSessionStreamUpdate::ToolLine(
+                                    "(image tool result omitted)".to_string(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -959,6 +966,10 @@ fn render_messages_for_streaming(messages: &[AgentMessage]) -> Vec<AgentSessionS
         }
     }
     updates
+}
+
+fn should_render_tool_result_content(tool_name: &str) -> bool {
+    tool_name != "read"
 }
 
 fn format_tool_start_line(tool_name: &str, args: &Value) -> String {
