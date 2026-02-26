@@ -92,6 +92,7 @@ impl TuiTheme {
         let palette = self.palette();
         match kind {
             TranscriptLineKind::Normal => Style::default(),
+            TranscriptLineKind::Code => self.code_block_style(),
             TranscriptLineKind::UserInput => Style::default()
                 .fg(palette.colors.transcript_fg)
                 .bg(palette.colors.input_block_bg),
@@ -120,6 +121,53 @@ impl TuiTheme {
     pub(crate) fn key_token_style(self, base: Style) -> Style {
         base.fg(self.palette().colors.key_token_fg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    pub(crate) fn code_block_style(self) -> Style {
+        match self {
+            Self::Dark => Style::default()
+                .fg(Color::Rgb(229, 231, 235))
+                .bg(Color::Rgb(40, 44, 52)),
+            Self::Light => Style::default()
+                .fg(Color::Rgb(57, 57, 57))
+                .bg(Color::Rgb(243, 244, 246)),
+        }
+    }
+
+    pub(crate) fn code_keyword_style(self, base: Style) -> Style {
+        match self {
+            Self::Dark => base
+                .fg(Color::Rgb(129, 161, 193))
+                .add_modifier(Modifier::BOLD),
+            Self::Light => base
+                .fg(Color::Rgb(26, 95, 180))
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    pub(crate) fn code_string_style(self, base: Style) -> Style {
+        match self {
+            Self::Dark => base.fg(Color::Rgb(163, 190, 140)),
+            Self::Light => base.fg(Color::Rgb(34, 139, 34)),
+        }
+    }
+
+    pub(crate) fn code_comment_style(self, base: Style) -> Style {
+        match self {
+            Self::Dark => base
+                .fg(Color::Rgb(125, 130, 140))
+                .add_modifier(Modifier::ITALIC),
+            Self::Light => base
+                .fg(Color::Rgb(120, 124, 130))
+                .add_modifier(Modifier::ITALIC),
+        }
+    }
+
+    pub(crate) fn code_number_style(self, base: Style) -> Style {
+        match self {
+            Self::Dark => base.fg(Color::Rgb(208, 135, 112)),
+            Self::Light => base.fg(Color::Rgb(175, 82, 222)),
+        }
     }
 
     pub(crate) fn selection_colors(self) -> Option<(Color, Color)> {

@@ -24,10 +24,16 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{LoadSkillsOptions, load_skills};
 
 const RESUME_PICKER_LIMIT: usize = 10;
-const DEFAULT_CONF_DIR_NAME: &str = ".pixy";
+const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_LOG_ROTATE_SIZE_MB: u64 = 100;
 const DEFAULT_LOG_STDOUT: bool = false;
+const MARKDOWN_CODE_BASE_STYLE: &str = "\x1b[48;5;236m\x1b[38;5;252m";
+const MARKDOWN_CODE_KEYWORD_STYLE: &str = "\x1b[48;5;236m\x1b[38;5;111m";
+const MARKDOWN_CODE_STRING_STYLE: &str = "\x1b[48;5;236m\x1b[38;5;150m";
+const MARKDOWN_CODE_COMMENT_STYLE: &str = "\x1b[48;5;236m\x1b[38;5;245m";
+const MARKDOWN_CODE_NUMBER_STYLE: &str = "\x1b[48;5;236m\x1b[38;5;215m";
+const ANSI_STYLE_RESET: &str = "\x1b[0m";
 static CONF_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Parser, Debug)]
@@ -647,7 +653,7 @@ fn create_cli_session(
     };
 
     let runtime_options = RuntimeLoadOptions {
-        conf_dir: Some(current_conf_dir()),
+        conf_dir: Some(current_pixy_home_dir()),
         agent_dir: Some(agent_dir.to_path_buf()),
         load_skills: true,
         include_default_skills: !args.no_skills,
@@ -942,6 +948,7 @@ struct CliStreamRenderer<W: Write> {
     assistant_delta_open: bool,
     thinking_line_open: bool,
     thinking_visual_lines: usize,
+    markdown_renderer: MarkdownCodeBlockRenderer,
 }
 
 impl<W: Write> CliStreamRenderer<W> {
@@ -953,6 +960,7 @@ impl<W: Write> CliStreamRenderer<W> {
             assistant_delta_open: false,
             thinking_line_open: false,
             thinking_visual_lines: 0,
+            markdown_renderer: MarkdownCodeBlockRenderer::default(),
         }
     }
 
@@ -968,13 +976,10 @@ impl<W: Write> CliStreamRenderer<W> {
                     return Ok(());
                 }
                 if self.thinking_line_open {
-                    writeln!(self.writer)
-                        .map_err(|error| format!("stdout write failed: {error}"))?;
+                    self.write_assistant_chunk("\n")?;
                     self.thinking_line_open = false;
                 }
-                write!(self.writer, "{delta}")
-                    .and_then(|_| self.writer.flush())
-                    .map_err(|error| format!("stdout write failed: {error}"))?;
+                self.write_assistant_chunk(delta.as_str())?;
                 self.assistant_delta_open = true;
             }
             AgentSessionStreamUpdate::AssistantLine(line) => {
@@ -1003,15 +1008,14 @@ impl<W: Write> CliStreamRenderer<W> {
                 }
 
                 if self.assistant_delta_open || self.thinking_line_open {
-                    writeln!(self.writer)
-                        .map_err(|error| format!("stdout write failed: {error}"))?;
+                    self.write_assistant_chunk("\n")?;
                     self.assistant_delta_open = false;
                     self.thinking_line_open = false;
                     self.thinking_visual_lines = 0;
                 }
                 if !line.is_empty() {
-                    writeln!(self.writer, "{line}")
-                        .map_err(|error| format!("stdout write failed: {error}"))?;
+                    self.write_assistant_chunk(line.as_str())?;
+                    self.write_assistant_chunk("\n")?;
                 }
             }
             AgentSessionStreamUpdate::ToolLine(line) => {
@@ -1019,8 +1023,7 @@ impl<W: Write> CliStreamRenderer<W> {
                     return Ok(());
                 }
                 if self.assistant_delta_open || self.thinking_line_open {
-                    writeln!(self.writer)
-                        .map_err(|error| format!("stdout write failed: {error}"))?;
+                    self.write_assistant_chunk("\n")?;
                     self.assistant_delta_open = false;
                     self.thinking_line_open = false;
                     self.thinking_visual_lines = 0;
@@ -1034,11 +1037,15 @@ impl<W: Write> CliStreamRenderer<W> {
 
     fn finish(&mut self) -> Result<(), String> {
         if self.assistant_delta_open || self.thinking_line_open {
-            writeln!(self.writer).map_err(|error| format!("stdout write failed: {error}"))?;
+            self.write_assistant_chunk("\n")?;
             self.assistant_delta_open = false;
             self.thinking_line_open = false;
             self.thinking_visual_lines = 0;
         }
+        self.markdown_renderer
+            .finish(&mut self.writer)
+            .and_then(|_| self.writer.flush())
+            .map_err(|error| format!("stdout write failed: {error}"))?;
         Ok(())
     }
 
@@ -1055,9 +1062,337 @@ impl<W: Write> CliStreamRenderer<W> {
         Ok(())
     }
 
+    fn write_assistant_chunk(&mut self, chunk: &str) -> Result<(), String> {
+        self.markdown_renderer
+            .write_chunk(&mut self.writer, chunk)
+            .and_then(|_| self.writer.flush())
+            .map_err(|error| format!("stdout write failed: {error}"))
+    }
+
     #[cfg(test)]
     fn into_inner(self) -> W {
         self.writer
+    }
+}
+
+#[derive(Default)]
+struct MarkdownCodeBlockRenderer {
+    in_code_block: bool,
+    current_language: Option<String>,
+    pending_line: String,
+}
+
+impl MarkdownCodeBlockRenderer {
+    fn write_chunk<W: Write>(&mut self, writer: &mut W, chunk: &str) -> io::Result<()> {
+        let mut start = 0usize;
+        for (idx, ch) in chunk.char_indices() {
+            if ch != '\n' {
+                continue;
+            }
+            self.pending_line.push_str(&chunk[start..idx]);
+            self.flush_complete_line(writer, true)?;
+            start = idx + ch.len_utf8();
+        }
+        if start < chunk.len() {
+            self.pending_line.push_str(&chunk[start..]);
+            self.flush_partial_line(writer)?;
+        }
+        Ok(())
+    }
+
+    fn finish<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.pending_line.is_empty() {
+            return Ok(());
+        }
+        self.flush_pending_without_newline(writer)
+    }
+
+    fn flush_complete_line<W: Write>(
+        &mut self,
+        writer: &mut W,
+        append_newline: bool,
+    ) -> io::Result<()> {
+        let line = std::mem::take(&mut self.pending_line);
+        if let Some(language) = parse_markdown_fence(&line) {
+            if self.in_code_block {
+                self.in_code_block = false;
+                self.current_language = None;
+            } else {
+                self.in_code_block = true;
+                self.current_language = language;
+            }
+            return Ok(());
+        }
+        self.write_line(writer, line.as_str(), append_newline)
+    }
+
+    fn flush_pending_without_newline<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let line = std::mem::take(&mut self.pending_line);
+        if let Some(language) = parse_markdown_fence(&line) {
+            if self.in_code_block {
+                self.in_code_block = false;
+                self.current_language = None;
+            } else {
+                self.in_code_block = true;
+                self.current_language = language;
+            }
+            return Ok(());
+        }
+        self.write_line(writer, line.as_str(), false)
+    }
+
+    fn flush_partial_line<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.pending_line.is_empty() || line_might_be_markdown_fence(self.pending_line.as_str())
+        {
+            return Ok(());
+        }
+        let partial = std::mem::take(&mut self.pending_line);
+        self.write_line(writer, partial.as_str(), false)
+    }
+
+    fn write_line<W: Write>(
+        &self,
+        writer: &mut W,
+        line: &str,
+        append_newline: bool,
+    ) -> io::Result<()> {
+        if self.in_code_block {
+            write_highlighted_code_line(writer, line, self.current_language.as_deref())?;
+        } else {
+            write!(writer, "{line}")?;
+        }
+        if append_newline {
+            write!(writer, "\n")?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_markdown_fence(line: &str) -> Option<Option<String>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("```")?;
+    let language = rest
+        .split_whitespace()
+        .next()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase());
+    Some(language)
+}
+
+fn line_might_be_markdown_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    (trimmed.starts_with('`') && "```".starts_with(trimmed)) || trimmed.starts_with("```")
+}
+
+fn write_highlighted_code_line<W: Write>(
+    writer: &mut W,
+    line: &str,
+    language: Option<&str>,
+) -> io::Result<()> {
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        write!(writer, "{MARKDOWN_CODE_BASE_STYLE}{ANSI_STYLE_RESET}")?;
+        return Ok(());
+    }
+
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '/' {
+            let fragment = chars[idx..].iter().collect::<String>();
+            write!(writer, "{MARKDOWN_CODE_COMMENT_STYLE}{fragment}")?;
+            break;
+        }
+
+        if chars[idx] == '"' || chars[idx] == '\'' {
+            let quote = chars[idx];
+            let start = idx;
+            idx += 1;
+            let mut escaped = false;
+            while idx < chars.len() {
+                let ch = chars[idx];
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    idx += 1;
+                    continue;
+                }
+                idx += 1;
+                if ch == quote {
+                    break;
+                }
+            }
+            let fragment = chars[start..idx].iter().collect::<String>();
+            write!(writer, "{MARKDOWN_CODE_STRING_STYLE}{fragment}")?;
+            continue;
+        }
+
+        if chars[idx].is_ascii_digit() {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() {
+                let ch = chars[idx];
+                if ch.is_ascii_digit() || ch == '_' || ch == '.' {
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+            let fragment = chars[start..idx].iter().collect::<String>();
+            write!(writer, "{MARKDOWN_CODE_NUMBER_STYLE}{fragment}")?;
+            continue;
+        }
+
+        if is_identifier_start(chars[idx]) {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && is_identifier_continue(chars[idx]) {
+                idx += 1;
+            }
+            let token = chars[start..idx].iter().collect::<String>();
+            if is_code_keyword(token.as_str(), language) {
+                write!(writer, "{MARKDOWN_CODE_KEYWORD_STYLE}{token}")?;
+            } else {
+                write!(writer, "{MARKDOWN_CODE_BASE_STYLE}{token}")?;
+            }
+            continue;
+        }
+
+        let start = idx;
+        idx += 1;
+        while idx < chars.len()
+            && !is_identifier_start(chars[idx])
+            && !chars[idx].is_ascii_digit()
+            && chars[idx] != '"'
+            && chars[idx] != '\''
+            && !(idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '/')
+        {
+            idx += 1;
+        }
+        let fragment = chars[start..idx].iter().collect::<String>();
+        write!(writer, "{MARKDOWN_CODE_BASE_STYLE}{fragment}")?;
+    }
+
+    write!(writer, "{ANSI_STYLE_RESET}")?;
+    Ok(())
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_code_keyword(token: &str, language: Option<&str>) -> bool {
+    let normalized = token.to_ascii_lowercase();
+    match language.map(|value| value.to_ascii_lowercase()) {
+        Some(language) if matches!(language.as_str(), "python" | "py") => matches!(
+            normalized.as_str(),
+            "def"
+                | "class"
+                | "if"
+                | "elif"
+                | "else"
+                | "for"
+                | "while"
+                | "return"
+                | "import"
+                | "from"
+                | "try"
+                | "except"
+                | "finally"
+                | "with"
+                | "as"
+                | "lambda"
+                | "yield"
+                | "pass"
+                | "break"
+                | "continue"
+                | "raise"
+                | "async"
+                | "await"
+                | "true"
+                | "false"
+                | "none"
+        ),
+        Some(language)
+            if matches!(language.as_str(), "javascript" | "js" | "typescript" | "ts") =>
+        {
+            matches!(
+                normalized.as_str(),
+                "const"
+                    | "let"
+                    | "var"
+                    | "function"
+                    | "class"
+                    | "if"
+                    | "else"
+                    | "for"
+                    | "while"
+                    | "return"
+                    | "import"
+                    | "export"
+                    | "from"
+                    | "async"
+                    | "await"
+                    | "try"
+                    | "catch"
+                    | "finally"
+                    | "switch"
+                    | "case"
+                    | "break"
+                    | "continue"
+                    | "new"
+                    | "null"
+                    | "undefined"
+                    | "true"
+                    | "false"
+            )
+        }
+        _ => matches!(
+            normalized.as_str(),
+            "fn" | "let"
+                | "mut"
+                | "pub"
+                | "impl"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "use"
+                | "mod"
+                | "crate"
+                | "self"
+                | "super"
+                | "const"
+                | "static"
+                | "match"
+                | "if"
+                | "else"
+                | "loop"
+                | "while"
+                | "for"
+                | "in"
+                | "return"
+                | "break"
+                | "continue"
+                | "where"
+                | "as"
+                | "type"
+                | "async"
+                | "await"
+                | "move"
+                | "ref"
+                | "unsafe"
+                | "dyn"
+                | "true"
+                | "false"
+                | "none"
+        ),
     }
 }
 
@@ -1166,13 +1501,17 @@ fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
 }
 
 fn init_conf_dir(conf_dir: Option<&Path>) {
-    let resolved = conf_dir
-        .map(resolve_conf_dir_arg)
-        .unwrap_or_else(default_conf_dir);
+    let resolved = resolve_pixy_home_dir(conf_dir);
     let _ = CONF_DIR.set(resolved);
 }
 
-fn resolve_conf_dir_arg(path: &Path) -> PathBuf {
+fn resolve_pixy_home_dir(conf_dir: Option<&Path>) -> PathBuf {
+    conf_dir
+        .map(resolve_pixy_home_arg)
+        .unwrap_or_else(default_pixy_home_dir)
+}
+
+fn resolve_pixy_home_arg(path: &Path) -> PathBuf {
     let expanded = expand_path_with_home(path);
     if expanded.is_absolute() {
         expanded
@@ -1200,28 +1539,27 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn default_conf_dir() -> PathBuf {
-    home_dir().join(DEFAULT_CONF_DIR_NAME)
+fn default_pixy_home_dir() -> PathBuf {
+    home_dir().join(DEFAULT_PIXY_HOME_DIR_NAME)
 }
 
-fn current_conf_dir() -> PathBuf {
-    CONF_DIR.get().cloned().unwrap_or_else(default_conf_dir)
+fn current_pixy_home_dir() -> PathBuf {
+    CONF_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| resolve_pixy_home_dir(None))
 }
 
 fn default_log_dir() -> PathBuf {
-    current_conf_dir().join("logs")
-}
-
-fn default_pixy_dir() -> PathBuf {
-    current_conf_dir()
+    current_pixy_home_dir().join("logs")
 }
 
 fn default_pixy_config_path() -> PathBuf {
-    default_pixy_dir().join("pixy.toml")
+    current_pixy_home_dir().join("pixy.toml")
 }
 
 fn default_agent_dir() -> PathBuf {
-    default_pixy_dir().join("agent")
+    current_pixy_home_dir().join("agent")
 }
 
 fn resolve_tui_theme_name(
@@ -2865,6 +3203,40 @@ mod tests {
             output,
             "[thinking] line1\nline2\r\u{1b}[2K\u{1b}[1A\r\u{1b}[2K[thinking] line1\nline2 updated\n"
         );
+    }
+
+    #[test]
+    fn cli_stream_renderer_renders_fenced_code_blocks_with_markdown_style() {
+        let mut renderer = CliStreamRenderer::new(Vec::<u8>::new(), true);
+
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantTextDelta(
+                "Before\n```rust\nfn main() {\n".to_string(),
+            ))
+            .expect("delta write succeeds");
+        renderer
+            .on_update(AgentSessionStreamUpdate::AssistantTextDelta(
+                "    println!(\"hi\");\n}\n```\nAfter".to_string(),
+            ))
+            .expect("delta write succeeds");
+        renderer.finish().expect("finish succeeds");
+
+        let output = String::from_utf8(renderer.into_inner()).expect("utf-8 output");
+        assert!(output.contains("Before\n"));
+        assert!(output.contains("\u{1b}[48;5;236m\u{1b}[38;5;111mfn"));
+        assert!(
+            output.contains("\u{1b}[48;5;236m\u{1b}[38;5;150m\"hi\""),
+            "string token should use markdown code string style"
+        );
+        assert!(
+            output.contains("println"),
+            "code block content should still be present"
+        );
+        assert!(
+            !output.contains("```"),
+            "fence markers should not be printed"
+        );
+        assert!(output.ends_with("After\n"));
     }
 
     #[test]

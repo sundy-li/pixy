@@ -9,6 +9,7 @@ use crate::keybindings::parse_key_id;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptLineKind {
     Normal,
+    Code,
     UserInput,
     Thinking,
     Tool,
@@ -22,6 +23,7 @@ const TOOL_COMPACTION_TAIL_LINES: usize = 1;
 pub(crate) struct TranscriptLine {
     pub(crate) text: String,
     pub(crate) kind: TranscriptLineKind,
+    code_language: Option<String>,
     working_marquee: Option<WorkingMarquee>,
 }
 
@@ -38,6 +40,16 @@ impl TranscriptLine {
         Self {
             text,
             kind,
+            code_language: None,
+            working_marquee: None,
+        }
+    }
+
+    pub(crate) fn new_code(text: String, language: Option<String>) -> Self {
+        Self {
+            text,
+            kind: TranscriptLineKind::Code,
+            code_language: language,
             working_marquee: None,
         }
     }
@@ -52,6 +64,7 @@ impl TranscriptLine {
         Self {
             text,
             kind: TranscriptLineKind::Working,
+            code_language: None,
             working_marquee: Some(WorkingMarquee {
                 message_char_start,
                 message_char_len,
@@ -81,6 +94,17 @@ impl TranscriptLine {
             if let Some(spans) = tool_diff_stat_spans(self.text.as_str(), base, theme) {
                 return line_with_padding(spans, width, base);
             }
+        }
+
+        if matches!(self.kind, TranscriptLineKind::Code) {
+            let code_base = theme.code_block_style();
+            let spans = code_highlighted_spans(
+                self.text.as_str(),
+                code_base,
+                theme,
+                self.code_language.as_deref(),
+            );
+            return line_with_padding(spans, width, code_base);
         }
 
         if matches!(self.kind, TranscriptLineKind::Working) {
@@ -292,6 +316,268 @@ fn highlighted_spans(text: &str, base: Style, theme: TuiTheme) -> Vec<Span<'stat
     spans
 }
 
+fn code_highlighted_spans(
+    text: &str,
+    base: Style,
+    theme: TuiTheme,
+    language: Option<&str>,
+) -> Vec<Span<'static>> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![Span::styled(String::new(), base)];
+    }
+
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '/' {
+            let fragment = chars[idx..].iter().collect::<String>();
+            spans.push(Span::styled(fragment, theme.code_comment_style(base)));
+            break;
+        }
+
+        if chars[idx] == '"' || chars[idx] == '\'' {
+            let quote = chars[idx];
+            let start = idx;
+            idx += 1;
+            let mut escaped = false;
+            while idx < chars.len() {
+                let ch = chars[idx];
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    idx += 1;
+                    continue;
+                }
+                idx += 1;
+                if ch == quote {
+                    break;
+                }
+            }
+            let fragment = chars[start..idx].iter().collect::<String>();
+            spans.push(Span::styled(fragment, theme.code_string_style(base)));
+            continue;
+        }
+
+        if chars[idx].is_ascii_digit() {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() {
+                let ch = chars[idx];
+                if ch.is_ascii_digit() || ch == '_' || ch == '.' {
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+            let fragment = chars[start..idx].iter().collect::<String>();
+            spans.push(Span::styled(fragment, theme.code_number_style(base)));
+            continue;
+        }
+
+        if is_identifier_start(chars[idx]) {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && is_identifier_continue(chars[idx]) {
+                idx += 1;
+            }
+            let token = chars[start..idx].iter().collect::<String>();
+            let style = if is_code_keyword(token.as_str(), language) {
+                theme.code_keyword_style(base)
+            } else {
+                base
+            };
+            spans.push(Span::styled(token, style));
+            continue;
+        }
+
+        let start = idx;
+        idx += 1;
+        while idx < chars.len()
+            && !is_identifier_start(chars[idx])
+            && !chars[idx].is_ascii_digit()
+            && chars[idx] != '"'
+            && chars[idx] != '\''
+            && !(idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '/')
+        {
+            idx += 1;
+        }
+        spans.push(Span::styled(
+            chars[start..idx].iter().collect::<String>(),
+            base,
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_code_keyword(token: &str, language: Option<&str>) -> bool {
+    let normalized = token.to_ascii_lowercase();
+    match language.map(|value| value.to_ascii_lowercase()) {
+        Some(language) if matches!(language.as_str(), "python" | "py") => matches!(
+            normalized.as_str(),
+            "def"
+                | "class"
+                | "if"
+                | "elif"
+                | "else"
+                | "for"
+                | "while"
+                | "return"
+                | "import"
+                | "from"
+                | "try"
+                | "except"
+                | "finally"
+                | "with"
+                | "as"
+                | "lambda"
+                | "yield"
+                | "pass"
+                | "break"
+                | "continue"
+                | "raise"
+                | "async"
+                | "await"
+                | "true"
+                | "false"
+                | "none"
+        ),
+        Some(language)
+            if matches!(language.as_str(), "javascript" | "js" | "typescript" | "ts") =>
+        {
+            matches!(
+                normalized.as_str(),
+                "const"
+                    | "let"
+                    | "var"
+                    | "function"
+                    | "class"
+                    | "if"
+                    | "else"
+                    | "for"
+                    | "while"
+                    | "return"
+                    | "import"
+                    | "export"
+                    | "from"
+                    | "async"
+                    | "await"
+                    | "try"
+                    | "catch"
+                    | "finally"
+                    | "switch"
+                    | "case"
+                    | "break"
+                    | "continue"
+                    | "new"
+                    | "null"
+                    | "undefined"
+                    | "true"
+                    | "false"
+            )
+        }
+        _ => matches!(
+            normalized.as_str(),
+            "fn" | "let"
+                | "mut"
+                | "pub"
+                | "impl"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "use"
+                | "mod"
+                | "crate"
+                | "self"
+                | "super"
+                | "const"
+                | "static"
+                | "match"
+                | "if"
+                | "else"
+                | "loop"
+                | "while"
+                | "for"
+                | "in"
+                | "return"
+                | "break"
+                | "continue"
+                | "where"
+                | "as"
+                | "type"
+                | "async"
+                | "await"
+                | "move"
+                | "ref"
+                | "unsafe"
+                | "dyn"
+                | "true"
+                | "false"
+                | "none"
+        ),
+    }
+}
+
+fn parse_markdown_fence(text: &str) -> Option<Option<String>> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("```")?;
+    let language = rest
+        .split_whitespace()
+        .next()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase());
+    Some(language)
+}
+
+fn render_markdown_code_blocks(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
+    let mut rendered = Vec::with_capacity(lines.len());
+    let mut in_code_block = false;
+    let mut current_language: Option<String> = None;
+
+    for line in lines {
+        if matches!(line.kind, TranscriptLineKind::Normal) {
+            if let Some(language) = parse_markdown_fence(line.text.as_str()) {
+                if in_code_block {
+                    in_code_block = false;
+                    current_language = None;
+                } else {
+                    in_code_block = true;
+                    current_language = language;
+                }
+                continue;
+            }
+
+            if in_code_block {
+                rendered.push(TranscriptLine::new_code(
+                    line.text.clone(),
+                    current_language.clone(),
+                ));
+                continue;
+            }
+        }
+
+        rendered.push(line.clone());
+    }
+
+    rendered
+}
+
 fn styled_fragment(fragment: &str, is_token: bool, base: Style, theme: TuiTheme) -> Span<'static> {
     if !is_token {
         return Span::styled(fragment.to_string(), base);
@@ -421,6 +707,7 @@ pub(crate) fn visible_transcript_lines(
         .iter()
         .filter(|line| match line.kind {
             TranscriptLineKind::Normal => true,
+            TranscriptLineKind::Code => true,
             TranscriptLineKind::UserInput => true,
             TranscriptLineKind::Thinking => show_thinking,
             TranscriptLineKind::Tool => show_tool_results,
@@ -435,7 +722,8 @@ pub(crate) fn visible_transcript_lines(
         filtered.push(working_line);
     }
 
-    let compacted = compact_tool_transcript_lines(&filtered);
+    let markdown_rendered = render_markdown_code_blocks(&filtered);
+    let compacted = compact_tool_transcript_lines(&markdown_rendered);
     let spaced = pad_transcript_block_boundaries(&compacted);
     let wrapped = wrap_transcript_lines(&spaced, max_width);
     let max_scroll = wrapped.len().saturating_sub(max_lines);

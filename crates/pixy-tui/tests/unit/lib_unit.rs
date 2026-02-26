@@ -1008,6 +1008,75 @@ fn highlights_file_path_and_key_tokens() {
 }
 
 #[test]
+fn markdown_fenced_code_blocks_are_rendered_without_fence_and_with_syntax_highlight() {
+    let lines = vec![
+        TranscriptLine::new("Before".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("```rust".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("fn main() {".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("    // comment".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new(
+            "    println!(\"hello\", 42);".to_string(),
+            TranscriptLineKind::Normal,
+        ),
+        TranscriptLine::new("}".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("```".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("After".to_string(), TranscriptLineKind::Normal),
+    ];
+
+    let visible =
+        visible_transcript_lines(&lines, &[], 20, 120, true, true, None, 0, TuiTheme::Dark);
+    let texts = visible.iter().map(line_text).collect::<Vec<_>>();
+
+    assert!(!texts.iter().any(|line| line.contains("```")));
+    assert!(texts.iter().any(|line| line.contains("fn main() {")));
+    assert!(texts.iter().any(|line| line.contains("After")));
+
+    let fn_line = visible
+        .iter()
+        .find(|line| line_text(line).contains("fn main() {"))
+        .expect("code line should exist");
+    assert!(
+        fn_line
+            .spans
+            .iter()
+            .any(|span| span.content == "fn" && span.style.fg == Some(Color::Rgb(129, 161, 193))),
+        "rust keyword should be highlighted"
+    );
+
+    let comment_line = visible
+        .iter()
+        .find(|line| line_text(line).contains("// comment"))
+        .expect("comment line should exist");
+    assert!(
+        comment_line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("// comment")
+                && span.style.fg == Some(Color::Rgb(125, 130, 140))),
+        "comment should be highlighted"
+    );
+
+    let print_line = visible
+        .iter()
+        .find(|line| line_text(line).contains("println!"))
+        .expect("string/number line should exist");
+    assert!(
+        print_line.spans.iter().any(|span| {
+            span.content.contains("\"hello\"") && span.style.fg == Some(Color::Rgb(163, 190, 140))
+        }),
+        "string should be highlighted"
+    );
+    assert!(
+        print_line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("42")
+                && span.style.fg == Some(Color::Rgb(208, 135, 112))),
+        "number should be highlighted"
+    );
+}
+
+#[test]
 fn slash_compound_shortcuts_use_key_token_color_instead_of_path_color() {
     let token = "ctrl+p/ctrl+shift+p";
     let line = TranscriptLine::new(

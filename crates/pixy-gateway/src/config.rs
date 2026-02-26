@@ -93,26 +93,32 @@ struct PixyTomlGatewayChannel {
     allowed_user_ids: Vec<String>,
 }
 
-const DEFAULT_CONF_DIR_NAME: &str = ".pixy";
+const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
 static CONF_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn init_conf_dir(conf_dir: Option<PathBuf>) {
-    let resolved = conf_dir
-        .as_deref()
-        .map(resolve_conf_dir_arg)
-        .unwrap_or_else(default_conf_dir);
+    let resolved = resolve_pixy_home_dir(conf_dir.as_deref());
     let _ = CONF_DIR.set(resolved);
 }
 
-pub(crate) fn current_conf_dir() -> PathBuf {
-    CONF_DIR.get().cloned().unwrap_or_else(default_conf_dir)
+pub(crate) fn current_pixy_home_dir() -> PathBuf {
+    CONF_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| resolve_pixy_home_dir(None))
 }
 
-fn default_conf_dir() -> PathBuf {
-    home_dir().join(DEFAULT_CONF_DIR_NAME)
+fn resolve_pixy_home_dir(conf_dir: Option<&Path>) -> PathBuf {
+    conf_dir
+        .map(resolve_pixy_home_arg)
+        .unwrap_or_else(default_pixy_home_dir)
 }
 
-fn resolve_conf_dir_arg(path: &Path) -> PathBuf {
+fn default_pixy_home_dir() -> PathBuf {
+    home_dir().join(DEFAULT_PIXY_HOME_DIR_NAME)
+}
+
+fn resolve_pixy_home_arg(path: &Path) -> PathBuf {
     let expanded = expand_path_with_home(path);
     if expanded.is_absolute() {
         expanded
@@ -141,7 +147,7 @@ fn home_dir() -> PathBuf {
 }
 
 pub fn default_pixy_config_path() -> PathBuf {
-    current_conf_dir().join("pixy.toml")
+    current_pixy_home_dir().join("pixy.toml")
 }
 
 pub fn load_gateway_config(path: &Path) -> Result<GatewayConfig, String> {
@@ -152,7 +158,7 @@ pub fn load_gateway_config(path: &Path) -> Result<GatewayConfig, String> {
 
 pub(crate) fn gateway_runtime_load_options() -> RuntimeLoadOptions {
     RuntimeLoadOptions {
-        conf_dir: Some(current_conf_dir()),
+        conf_dir: Some(current_pixy_home_dir()),
         load_skills: true,
         include_default_skills: true,
         ..RuntimeLoadOptions::default()
@@ -364,7 +370,7 @@ mod tests {
         let options = gateway_runtime_load_options();
         assert!(options.load_skills);
         assert!(options.include_default_skills);
-        assert_eq!(options.conf_dir, Some(current_conf_dir()));
+        assert_eq!(options.conf_dir, Some(current_pixy_home_dir()));
     }
 
     #[test]

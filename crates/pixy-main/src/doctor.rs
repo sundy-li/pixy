@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use pixy_coding_agent::RuntimeLoadOptions;
 
+use crate::pixy_home::resolve_pixy_home_dir;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckStatus {
     Pass,
@@ -59,7 +61,7 @@ impl DoctorReport {
 }
 
 pub fn run_doctor(conf_dir: Option<PathBuf>) -> Result<(), String> {
-    let conf_dir = conf_dir.unwrap_or_else(default_conf_dir);
+    let conf_dir = resolve_pixy_home_dir(conf_dir.as_deref());
     let report = collect_doctor_report(&conf_dir);
 
     println!("pixy doctor report");
@@ -190,16 +192,6 @@ fn ensure_dir_writable(path: &Path) -> Result<(), String> {
     fs::remove_file(&probe)
         .map_err(|error| format!("cleanup test in {} failed: {error}", path.display()))?;
     Ok(())
-}
-
-fn default_conf_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".pixy");
-    }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(profile).join(".pixy");
-    }
-    PathBuf::from(".pixy")
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::{LoadSkillsOptions, Skill, SkillDiagnostic, load_skills};
 
-const DEFAULT_CONF_DIR_NAME: &str = ".pixy";
+const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeOverrides {
@@ -82,7 +82,7 @@ impl RuntimeLoadOptions {
         cwd: &Path,
         router_seed: u64,
     ) -> Result<ResolvedRuntime, String> {
-        let conf_dir = self.conf_dir.clone().unwrap_or_else(default_conf_dir);
+        let conf_dir = pixy_home_dir(self.conf_dir.as_deref());
         let config_path = conf_dir.join("pixy.toml");
         let content = if config_path.exists() {
             std::fs::read_to_string(&config_path)
@@ -132,7 +132,7 @@ impl RuntimeLoadOptions {
         let runtime = resolve_runtime_config_with_seed(&self.overrides, &local, router_seed)?;
 
         let (skills, skill_diagnostics) = if self.load_skills {
-            let conf_dir = self.conf_dir.clone().unwrap_or_else(default_conf_dir);
+            let conf_dir = pixy_home_dir(self.conf_dir.as_deref());
             let agent_dir = self
                 .agent_dir
                 .clone()
@@ -853,8 +853,33 @@ fn default_reasoning_enabled_for_api(api: &str) -> bool {
     )
 }
 
-fn default_conf_dir() -> PathBuf {
-    home_dir().join(DEFAULT_CONF_DIR_NAME)
+fn pixy_home_dir(conf_dir: Option<&Path>) -> PathBuf {
+    conf_dir
+        .map(resolve_pixy_home_arg)
+        .unwrap_or_else(default_pixy_home_dir)
+}
+
+fn resolve_pixy_home_arg(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let expanded = if raw == "~" {
+        home_dir()
+    } else if let Some(suffix) = raw.strip_prefix("~/") {
+        home_dir().join(suffix)
+    } else {
+        path.to_path_buf()
+    };
+
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
+    }
+}
+
+fn default_pixy_home_dir() -> PathBuf {
+    home_dir().join(DEFAULT_PIXY_HOME_DIR_NAME)
 }
 
 fn home_dir() -> PathBuf {

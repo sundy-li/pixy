@@ -4,12 +4,15 @@ dev-cli:
 cli:
 	cargo run -p pixy-main --bin pixy --release
 
+pixy *args:
+	cargo run -p pixy-main --bin pixy --release -- {{args}}
+
 dev-gateway:
 	cargo run -p pixy-main --bin pixy -- gateway start
 
 gateway:
 	cargo run -p pixy-main --bin pixy --release -- gateway start
-
+	
 ut:
 	cargo nextest run
 

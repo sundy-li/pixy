@@ -289,7 +289,7 @@ fn expand_home_path(path: &str) -> PathBuf {
 }
 
 fn default_log_dir() -> PathBuf {
-    config::current_conf_dir().join("logs")
+    config::current_pixy_home_dir().join("logs")
 }
 
 pub async fn run_gateway_command(command: GatewayCommand) -> Result<(), String> {
@@ -334,7 +334,7 @@ async fn start_daemon() -> Result<(), String> {
         .map_err(|error| format!("resolve current executable failed: {error}"))?;
     let child = Command::new(current_exe)
         .arg("--conf-dir")
-        .arg(config::current_conf_dir())
+        .arg(config::current_pixy_home_dir())
         .arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -395,7 +395,7 @@ async fn stop_daemon() -> Result<(), String> {
 }
 
 fn default_runtime_dir() -> PathBuf {
-    config::current_conf_dir().join("gateway")
+    config::current_pixy_home_dir().join("gateway")
 }
 
 fn read_pid_file(path: &Path) -> Result<Option<u32>, String> {

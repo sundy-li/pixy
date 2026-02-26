@@ -166,7 +166,7 @@ pub async fn serve_gateway(config: GatewayConfig) -> Result<(), String> {
 }
 
 fn default_session_root() -> PathBuf {
-    crate::config::current_conf_dir()
+    crate::config::current_pixy_home_dir()
         .join("agent")
         .join("sessions")
 }

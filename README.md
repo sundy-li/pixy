@@ -73,11 +73,10 @@ Manual onboarding only:
 
 ## Quick Start (30 seconds)
 
-1. Create config directory and copy sample:
+1. Initialize pixy home and default config:
 
 ```bash
-mkdir -p ~/.pixy
-cp pixy.toml.sample ~/.pixy/pixy.toml
+pixy config init
 ```
 
 2. Edit `~/.pixy/pixy.toml` and set your API key(s).
@@ -165,13 +164,19 @@ Gateway runtime files:
 Upgrade to latest:
 
 ```bash
-./scripts/install.sh
+pixy update
 ```
 
 Upgrade to a fixed version:
 
 ```bash
-PIXY_VERSION=v0.1.0 ./scripts/install.sh
+pixy update --version v0.1.0
+```
+
+Use a custom release repository:
+
+```bash
+pixy update --repo owner/repo
 ```
 
 Uninstall:
