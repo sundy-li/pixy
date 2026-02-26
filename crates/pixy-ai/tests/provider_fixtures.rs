@@ -92,23 +92,30 @@ fn sample_context() -> Context {
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    let fixture_relative = PathBuf::from("docs/fixtures/m1-provider").join(name);
+    let crate_fixture_relative = PathBuf::from("crates")
+        .join("pixy-ai")
+        .join("tests")
+        .join("fixtures")
+        .join("m1-provider")
+        .join(name);
 
-    // Prefer runtime lookup from current working directory upward.
-    // This avoids brittle compile-time absolute paths after workspace moves/renames.
+    // Prefer runtime lookup from current working directory upward when running
+    // from workspace root or nested workspace paths.
     if let Ok(cwd) = std::env::current_dir() {
         for ancestor in cwd.ancestors() {
-            let candidate = ancestor.join(&fixture_relative);
+            let candidate = ancestor.join(&crate_fixture_relative);
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
 
-    // Fallback to compile-time manifest-dir based location.
+    // Fallback to compile-time manifest-dir based location inside the crate.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../")
-        .join(&fixture_relative)
+        .join("tests")
+        .join("fixtures")
+        .join("m1-provider")
+        .join(name)
 }
 
 fn read_fixture(name: &str) -> Fixture {
@@ -260,6 +267,22 @@ fn collect_thinking(content: &[AssistantContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[test]
+fn fixture_files_resolve_from_crate_test_fixtures() {
+    let path = fixture_path("openai-tooluse.json");
+    let expected_suffix = PathBuf::from("tests")
+        .join("fixtures")
+        .join("m1-provider")
+        .join("openai-tooluse.json");
+    assert!(
+        path.ends_with(&expected_suffix),
+        "fixture path should end with {:?}, got {}",
+        expected_suffix,
+        path.display()
+    );
+    assert!(path.is_file(), "fixture file should exist: {}", path.display());
 }
 
 #[test]
