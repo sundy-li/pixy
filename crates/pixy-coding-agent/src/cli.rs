@@ -3,25 +3,24 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{
-    AgentSession, AgentSessionStreamUpdate, CreatedSession, RuntimeLoadOptions, RuntimeOverrides,
-    SessionCreateOptions, SessionManager, Skill, SkillSource,
-    create_session as create_agent_session,
+use crate::cli_app::{
+    CliSession, CliSessionFactory, CliSessionRequest, ReplCommand, ReplCommandParser,
 };
+use crate::{AgentSession, AgentSessionStreamUpdate, RuntimeOverrides, Skill, SkillSource};
 use clap::{Args, Parser, Subcommand};
-use pixy_ai::{
-    AssistantContentBlock, Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Message, Model, StopReason,
-    ToolResultContentBlock,
-};
+use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
 use pixy_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
 use serde::Deserialize;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(test)]
-use crate::{LoadSkillsOptions, load_skills};
+use crate::{LoadSkillsOptions, RuntimeLoadOptions, load_skills};
+#[cfg(test)]
+use pixy_ai::{Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Model};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESUME_PICKER_LIMIT: usize = 10;
 const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
@@ -407,10 +406,27 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         .as_ref()
         .map(|path| resolve_path(&cwd, path))
         .unwrap_or_else(|| default_agent_dir().join("sessions"));
-    let CreatedSession {
-        mut session,
-        runtime,
-    } = create_cli_session(&args, &cwd, &agent_dir, &session_dir)?;
+
+    let session_factory = CliSessionFactory::new(current_pixy_home_dir());
+    let session_request = CliSessionRequest {
+        session_file: args.session_file.clone(),
+        include_default_skills: !args.no_skills,
+        skill_paths: args.skills.clone(),
+        runtime_overrides: RuntimeOverrides {
+            api: args.api.clone(),
+            provider: args.provider.clone(),
+            model: args.model.clone(),
+            base_url: args.base_url.clone(),
+            context_window: args.context_window,
+            max_tokens: args.max_tokens,
+            ..RuntimeOverrides::default()
+        },
+        custom_system_prompt: args.system_prompt.clone(),
+        no_tools: args.no_tools,
+    };
+    let mut session =
+        session_factory.create_session(&session_request, &cwd, &agent_dir, &session_dir)?;
+    let runtime = session.runtime().clone();
     pixy_ai::set_transport_retry_count(runtime.transport_retry_count);
     for diagnostic in &runtime.skill_diagnostics {
         eprintln!(
@@ -423,19 +439,21 @@ async fn run(args: ChatArgs) -> Result<(), String> {
     let discovered_skills = runtime.skills.clone();
     let use_tui = args.prompt.is_none() && !args.no_tui;
 
-    if !use_tui {
-        if let Some(session_file) = session.session_file() {
-            println!("session: {}", session_file.display());
-        }
+    if let Some(prompt) = args.prompt.as_deref() {
+        let active_session = session.ensure_session()?;
+        println!(
+            "session: {}",
+            active_session
+                .session_file()
+                .ok_or_else(|| "session file unavailable".to_string())?
+                .display()
+        );
         println!("cwd: {}", cwd.display());
         println!(
             "model: {}/{}/{}",
             runtime_model.api, runtime_model.provider, runtime_model.id
         );
-    }
-
-    if let Some(prompt) = args.prompt.as_deref() {
-        run_prompt_streaming_cli(&mut session, prompt, !args.hide_tool_results).await?;
+        run_prompt_streaming_cli(active_session, prompt, !args.hide_tool_results).await?;
         return Ok(());
     }
 
@@ -478,8 +496,18 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         return pixy_tui::run_tui(&mut session, tui_options).await;
     }
 
+    if let Some(session_file) = session.session_file() {
+        println!("session: {}", session_file.display());
+    }
+    println!("cwd: {}", cwd.display());
+    println!(
+        "model: {}/{}/{}",
+        runtime_model.api, runtime_model.provider, runtime_model.id
+    );
+
     if args.continue_first {
-        run_continue_streaming_cli(&mut session, !args.hide_tool_results).await?;
+        let active_session = session.ensure_session()?;
+        run_continue_streaming_cli(active_session, !args.hide_tool_results).await?;
     }
 
     println!("commands: /new, /continue, /resume [session], /session, /help, /exit");
@@ -636,49 +664,6 @@ fn format_display_path(path: &Path) -> String {
     }
 }
 
-fn create_cli_session(
-    args: &ChatArgs,
-    cwd: &Path,
-    agent_dir: &Path,
-    session_dir: &Path,
-) -> Result<CreatedSession, String> {
-    let session_manager = if let Some(session_file) = &args.session_file {
-        let resolved = resolve_path(cwd, session_file);
-        SessionManager::load(&resolved)?
-    } else {
-        let cwd_text = cwd
-            .to_str()
-            .ok_or_else(|| format!("cwd is not valid UTF-8: {}", cwd.display()))?;
-        SessionManager::create(cwd_text, session_dir)?
-    };
-
-    let runtime_options = RuntimeLoadOptions {
-        conf_dir: Some(current_pixy_home_dir()),
-        agent_dir: Some(agent_dir.to_path_buf()),
-        load_skills: true,
-        include_default_skills: !args.no_skills,
-        skill_paths: args.skills.clone(),
-        overrides: RuntimeOverrides {
-            api: args.api.clone(),
-            provider: args.provider.clone(),
-            model: args.model.clone(),
-            base_url: args.base_url.clone(),
-            context_window: args.context_window,
-            max_tokens: args.max_tokens,
-            ..RuntimeOverrides::default()
-        },
-    };
-    create_agent_session(
-        cwd,
-        session_manager,
-        SessionCreateOptions {
-            runtime: runtime_options,
-            custom_system_prompt: args.system_prompt.clone(),
-            no_tools: args.no_tools,
-        },
-    )
-}
-
 #[cfg(test)]
 fn load_runtime_skills(
     args: &ChatArgs,
@@ -702,7 +687,7 @@ fn load_runtime_skills(
     result.skills
 }
 
-async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Result<(), String> {
+async fn repl_loop(session: &mut CliSession, show_tool_results: bool) -> Result<(), String> {
     loop {
         print!("pixy> ");
         io::stdout()
@@ -718,51 +703,41 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
             return Ok(());
         }
 
-        let input = line.trim();
-        if input.is_empty() {
+        let Some(command) = ReplCommandParser::parse(&line) else {
             continue;
-        }
+        };
 
-        if is_new_session_command(input) {
-            match session.start_new_session() {
+        match command {
+            ReplCommand::NewSession => match session.start_new_session() {
                 Ok(path) => println!("new session: {}", path.display()),
                 Err(error) => eprintln!("new session failed: {error}"),
-            }
-            continue;
-        }
+            },
+            ReplCommand::Resume { target } => {
+                let target = if let Some(target) = target {
+                    Some(target)
+                } else {
+                    match prompt_resume_target_selection(
+                        session.recent_resumable_sessions(RESUME_PICKER_LIMIT)?,
+                    ) {
+                        Ok(Some(path)) => Some(path.display().to_string()),
+                        Ok(None) => {
+                            println!("resume cancelled");
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("resume failed: {error}");
+                            continue;
+                        }
+                    }
+                };
 
-        if input.starts_with("/resume") {
-            let explicit_target = input
-                .strip_prefix("/resume")
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
-            let target = if let Some(target) = explicit_target {
-                Some(target)
-            } else {
-                match prompt_resume_target_selection(session, RESUME_PICKER_LIMIT) {
-                    Ok(Some(path)) => Some(path.display().to_string()),
-                    Ok(None) => {
-                        println!("resume cancelled");
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!("resume failed: {error}");
-                        continue;
-                    }
+                match session.resume(target.as_deref()) {
+                    Ok(path) => println!("resumed: {}", path.display()),
+                    Err(error) => eprintln!("resume failed: {error}"),
                 }
-            };
-
-            match session.resume(target.as_deref()) {
-                Ok(path) => println!("resumed: {}", path.display()),
-                Err(error) => eprintln!("resume failed: {error}"),
             }
-            continue;
-        }
-
-        match input {
-            "/exit" | "/quit" => return Ok(()),
-            "/help" => {
+            ReplCommand::Exit => return Ok(()),
+            ReplCommand::Help => {
                 println!("commands:");
                 println!("  /new       start a new session and reset current context");
                 println!(
@@ -775,21 +750,37 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
                 println!("  /help      show this help");
                 println!("  /exit      quit");
             }
-            "/session" => {
+            ReplCommand::Session => {
                 if let Some(path) = session.session_file() {
                     println!("{}", path.display());
                 } else {
                     println!("(no session file)");
                 }
             }
-            "/continue" => {
-                if let Err(error) = run_continue_streaming_cli(session, show_tool_results).await {
+            ReplCommand::Continue => {
+                let active_session = match session.ensure_session() {
+                    Ok(active) => active,
+                    Err(error) => {
+                        eprintln!("continue failed: {error}");
+                        continue;
+                    }
+                };
+                if let Err(error) =
+                    run_continue_streaming_cli(active_session, show_tool_results).await
+                {
                     eprintln!("continue failed: {error}");
                 }
             }
-            _ => {
+            ReplCommand::Prompt { text } => {
+                let active_session = match session.ensure_session() {
+                    Ok(active) => active,
+                    Err(error) => {
+                        eprintln!("prompt failed: {error}");
+                        continue;
+                    }
+                };
                 if let Err(error) =
-                    run_prompt_streaming_cli(session, input, show_tool_results).await
+                    run_prompt_streaming_cli(active_session, text.as_str(), show_tool_results).await
                 {
                     eprintln!("prompt failed: {error}");
                 }
@@ -798,15 +789,7 @@ async fn repl_loop(session: &mut AgentSession, show_tool_results: bool) -> Resul
     }
 }
 
-fn is_new_session_command(input: &str) -> bool {
-    input.trim() == "/new"
-}
-
-fn prompt_resume_target_selection(
-    session: &AgentSession,
-    limit: usize,
-) -> Result<Option<PathBuf>, String> {
-    let candidates = session.recent_resumable_sessions(limit)?;
+fn prompt_resume_target_selection(candidates: Vec<PathBuf>) -> Result<Option<PathBuf>, String> {
     if candidates.is_empty() {
         return Err("No historical sessions available to resume".to_string());
     }
@@ -1692,7 +1675,7 @@ fn parse_keybinding_values(value: &serde_json::Value) -> Option<Vec<KeyBinding>>
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct AgentSettingsFile {
     default_provider: Option<String>,
@@ -1702,13 +1685,13 @@ struct AgentSettingsFile {
     env: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct ModelsFile {
     providers: HashMap<String, ProviderConfig>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct ProviderConfig {
     provider: Option<String>,
@@ -1721,12 +1704,12 @@ struct ProviderConfig {
     models: Vec<ProviderModelConfig>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn default_provider_weight() -> u8 {
     1
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ProviderModelConfig {
     id: String,
@@ -1743,7 +1726,7 @@ struct ProviderModelConfig {
     max_tokens: Option<u32>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PixyTomlFile {
     #[serde(default)]
@@ -1757,7 +1740,7 @@ struct PixyTomlFile {
     env: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PixyTomlLlm {
     #[serde(default)]
@@ -1766,7 +1749,7 @@ struct PixyTomlLlm {
     providers: Vec<PixyTomlProvider>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PixyTomlProvider {
     name: String,
@@ -1794,14 +1777,14 @@ struct PixyTomlProvider {
     max_tokens: Option<u32>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct AgentLocalConfig {
     settings: AgentSettingsFile,
     models: ModelsFile,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ResolvedRuntimeConfig {
     model: Model,
@@ -1809,20 +1792,20 @@ struct ResolvedRuntimeConfig {
     api_key: Option<String>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct LLMRouter {
     slots: Vec<Slot>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct Slot {
     provider: String,
     weight: u8,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl LLMRouter {
     fn from_provider_configs(providers: &HashMap<String, ProviderConfig>) -> Result<Self, String> {
         let mut slots = Vec::with_capacity(providers.len());
@@ -1866,7 +1849,7 @@ impl LLMRouter {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn load_agent_local_config(_agent_dir: &Path) -> Result<AgentLocalConfig, String> {
     let config_path = default_pixy_config_path();
     let config = read_toml_if_exists::<PixyTomlFile>(&config_path)?;
@@ -1875,7 +1858,7 @@ fn load_agent_local_config(_agent_dir: &Path) -> Result<AgentLocalConfig, String
         .unwrap_or_default())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
     let mut providers = HashMap::new();
     for provider in config.llm.providers {
@@ -1929,7 +1912,7 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn resolve_transport_retry_count(settings: &AgentSettingsFile) -> usize {
     settings
         .transport_retry_count
@@ -1951,15 +1934,15 @@ where
     Ok(Some(parsed))
 }
 
-#[allow(dead_code)]
-fn resolve_runtime_config(
+#[cfg(test)]
+fn resolve_runtime_config_for_tests(
     args: &ChatArgs,
     local: &AgentLocalConfig,
 ) -> Result<ResolvedRuntimeConfig, String> {
-    resolve_runtime_config_with_seed(args, local, runtime_router_seed())
+    resolve_runtime_config_for_tests_with_seed(args, local, runtime_router_seed())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn runtime_router_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1967,174 +1950,205 @@ fn runtime_router_seed() -> u64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
-fn resolve_runtime_config_with_seed(
+#[cfg(test)]
+fn resolve_runtime_config_for_tests_with_seed(
     args: &ChatArgs,
     local: &AgentLocalConfig,
     router_seed: u64,
 ) -> Result<ResolvedRuntimeConfig, String> {
-    let cli_model_parts = split_provider_model(args.model.as_deref());
-    let explicit_provider = first_non_empty([args.provider.clone(), cli_model_parts.0.clone()]);
-    let routed_provider = if explicit_provider.is_none() {
-        resolve_weighted_provider_selection(local, router_seed)?
-    } else {
-        None
-    };
-    let settings_provider = local
-        .settings
-        .default_provider
-        .clone()
-        .filter(|value| value.trim() != "*");
-
-    let provider = first_non_empty([
-        explicit_provider,
-        routed_provider,
-        settings_provider,
-        infer_single_provider(local),
-        Some("openai".to_string()),
-    ])
-    .ok_or_else(|| "Unable to resolve provider".to_string())?;
-
-    let provider_config = local.models.providers.get(&provider);
-    if let Some(config) = provider_config {
-        if config.weight >= 100 {
-            return Err(format!(
-                "Provider '{provider}' has invalid weight {}, expected value < 100",
-                config.weight
-            ));
-        }
-        if !is_chat_provider(config) {
-            let kind = config.kind.as_deref().unwrap_or("unknown");
-            return Err(format!(
-                "Provider '{provider}' has kind '{kind}', expected 'chat' for coding sessions"
-            ));
-        }
-    }
-    let provider_name = resolve_provider_name(&provider, provider_config);
-    let model_id = first_non_empty([
-        cli_model_parts.1.clone(),
-        provider_config_default_model(provider_config),
-        default_model_for_provider(&provider_name),
-    ])
-    .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
-
-    let selected_model_cfg = provider_config.and_then(|provider_config| {
-        provider_config
-            .models
-            .iter()
-            .find(|model| model.id == model_id)
-    });
-
-    let api = first_non_empty([
-        args.api.clone(),
-        selected_model_cfg.and_then(|model| model.api.clone()),
-        provider_config.and_then(|provider| provider.api.clone()),
-        infer_api_for_provider(&provider_name),
-    ])
-    .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
-
-    let cli_base_url = args
-        .base_url
-        .as_ref()
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let model_base_url = selected_model_cfg
-        .and_then(|model| model.base_url.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let provider_base_url = provider_config
-        .and_then(|provider| provider.base_url.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let base_url = first_non_empty([
-        cli_base_url,
-        model_base_url,
-        provider_base_url,
-        default_base_url_for_api(&api),
-    ])
-    .ok_or_else(|| format!("Unable to resolve base URL for api '{api}'"))?;
-
-    let context_window = args
-        .context_window
-        .or_else(|| selected_model_cfg.and_then(|model| model.context_window))
-        .unwrap_or(200_000);
-    let max_tokens = args
-        .max_tokens
-        .or_else(|| selected_model_cfg.and_then(|model| model.max_tokens))
-        .unwrap_or(8_192);
-
-    let api_key = provider_config
-        .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env))
-        .or_else(|| infer_api_key_from_settings(&provider_name, &local.settings.env))
-        .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
-
-    let reasoning = selected_model_cfg
-        .and_then(|cfg| cfg.reasoning)
-        .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
-    let reasoning_effort = selected_model_cfg
-        .and_then(|cfg| cfg.reasoning_effort.clone())
-        .or_else(|| {
-            if reasoning {
-                Some(pixy_ai::ThinkingLevel::Medium)
-            } else {
-                None
-            }
-        });
-
-    let model = Model {
-        id: model_id.clone(),
-        name: model_id,
-        api,
-        provider: provider_name.clone(),
-        base_url,
-        reasoning,
-        reasoning_effort,
-        input: vec!["text".to_string()],
-        cost: Cost {
-            input: 0.0,
-            output: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            total: 0.0,
-        },
-        context_window,
-        max_tokens,
-    };
-
-    let mut model_catalog = provider_config
-        .map(|provider_cfg| {
-            provider_cfg
-                .models
-                .iter()
-                .map(|entry| {
-                    model_from_config(
-                        entry,
-                        &provider_name,
-                        &model.api,
-                        &model.base_url,
-                        model.context_window,
-                        model.max_tokens,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    dedupe_models(&mut model_catalog);
-
-    if let Some(position) = model_catalog
-        .iter()
-        .position(|entry| entry.provider == model.provider && entry.id == model.id)
-    {
-        model_catalog.remove(position);
-    }
-    model_catalog.insert(0, model.clone());
-
-    Ok(ResolvedRuntimeConfig {
-        model,
-        model_catalog,
-        api_key,
-    })
+    CliRuntimeConfigResolver::new(args, local, router_seed).resolve_runtime_config_with_seed()
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
+struct CliRuntimeConfigResolver<'a> {
+    args: &'a ChatArgs,
+    local: &'a AgentLocalConfig,
+    router_seed: u64,
+}
+
+#[cfg(test)]
+impl<'a> CliRuntimeConfigResolver<'a> {
+    fn new(args: &'a ChatArgs, local: &'a AgentLocalConfig, router_seed: u64) -> Self {
+        Self {
+            args,
+            local,
+            router_seed,
+        }
+    }
+
+    fn resolve_runtime_config_with_seed(&self) -> Result<ResolvedRuntimeConfig, String> {
+        self.resolve_runtime_config_with_seed_impl()
+    }
+
+    fn resolve_runtime_config_with_seed_impl(&self) -> Result<ResolvedRuntimeConfig, String> {
+        let cli_model_parts = split_provider_model(self.args.model.as_deref());
+        let explicit_provider =
+            first_non_empty([self.args.provider.clone(), cli_model_parts.0.clone()]);
+        let routed_provider = if explicit_provider.is_none() {
+            resolve_weighted_provider_selection(self.local, self.router_seed)?
+        } else {
+            None
+        };
+        let settings_provider = self
+            .local
+            .settings
+            .default_provider
+            .clone()
+            .filter(|value| value.trim() != "*");
+
+        let provider = first_non_empty([
+            explicit_provider,
+            routed_provider,
+            settings_provider,
+            infer_single_provider(self.local),
+            Some("openai".to_string()),
+        ])
+        .ok_or_else(|| "Unable to resolve provider".to_string())?;
+
+        let provider_config = self.local.models.providers.get(&provider);
+        if let Some(config) = provider_config {
+            if config.weight >= 100 {
+                return Err(format!(
+                    "Provider '{provider}' has invalid weight {}, expected value < 100",
+                    config.weight
+                ));
+            }
+            if !is_chat_provider(config) {
+                let kind = config.kind.as_deref().unwrap_or("unknown");
+                return Err(format!(
+                    "Provider '{provider}' has kind '{kind}', expected 'chat' for coding sessions"
+                ));
+            }
+        }
+        let provider_name = resolve_provider_name(&provider, provider_config);
+        let model_id = first_non_empty([
+            cli_model_parts.1.clone(),
+            provider_config_default_model(provider_config),
+            default_model_for_provider(&provider_name),
+        ])
+        .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
+
+        let selected_model_cfg = provider_config.and_then(|provider_config| {
+            provider_config
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+        });
+
+        let api = first_non_empty([
+            self.args.api.clone(),
+            selected_model_cfg.and_then(|model| model.api.clone()),
+            provider_config.and_then(|provider| provider.api.clone()),
+            infer_api_for_provider(&provider_name),
+        ])
+        .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
+
+        let cli_base_url = self
+            .args
+            .base_url
+            .as_ref()
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let model_base_url = selected_model_cfg
+            .and_then(|model| model.base_url.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let provider_base_url = provider_config
+            .and_then(|provider| provider.base_url.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let base_url = first_non_empty([
+            cli_base_url,
+            model_base_url,
+            provider_base_url,
+            default_base_url_for_api(&api),
+        ])
+        .ok_or_else(|| format!("Unable to resolve base URL for api '{api}'"))?;
+
+        let context_window = self
+            .args
+            .context_window
+            .or_else(|| selected_model_cfg.and_then(|model| model.context_window))
+            .unwrap_or(200_000);
+        let max_tokens = self
+            .args
+            .max_tokens
+            .or_else(|| selected_model_cfg.and_then(|model| model.max_tokens))
+            .unwrap_or(8_192);
+
+        let api_key = provider_config
+            .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env))
+            .or_else(|| infer_api_key_from_settings(&provider_name, &self.local.settings.env))
+            .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
+
+        let reasoning = selected_model_cfg
+            .and_then(|cfg| cfg.reasoning)
+            .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
+        let reasoning_effort = selected_model_cfg
+            .and_then(|cfg| cfg.reasoning_effort.clone())
+            .or_else(|| {
+                if reasoning {
+                    Some(pixy_ai::ThinkingLevel::Medium)
+                } else {
+                    None
+                }
+            });
+
+        let model = Model {
+            id: model_id.clone(),
+            name: model_id,
+            api,
+            provider: provider_name.clone(),
+            base_url,
+            reasoning,
+            reasoning_effort,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window,
+            max_tokens,
+        };
+
+        let mut model_catalog = provider_config
+            .map(|provider_cfg| {
+                provider_cfg
+                    .models
+                    .iter()
+                    .map(|entry| {
+                        model_from_config(
+                            entry,
+                            &provider_name,
+                            &model.api,
+                            &model.base_url,
+                            model.context_window,
+                            model.max_tokens,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        dedupe_models(&mut model_catalog);
+
+        if let Some(position) = model_catalog
+            .iter()
+            .position(|entry| entry.provider == model.provider && entry.id == model.id)
+        {
+            model_catalog.remove(position);
+        }
+        model_catalog.insert(0, model.clone());
+
+        Ok(ResolvedRuntimeConfig {
+            model,
+            model_catalog,
+            api_key,
+        })
+    }
+}
+
+#[cfg(test)]
 fn resolve_weighted_provider_selection(
     local: &AgentLocalConfig,
     router_seed: u64,
@@ -2156,7 +2170,7 @@ fn resolve_weighted_provider_selection(
     Ok(Some(provider))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn provider_config_default_model(provider_config: Option<&ProviderConfig>) -> Option<String> {
     provider_config.and_then(|config| {
         first_non_empty([
@@ -2166,7 +2180,7 @@ fn provider_config_default_model(provider_config: Option<&ProviderConfig>) -> Op
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn resolve_provider_name(provider_key: &str, provider_config: Option<&ProviderConfig>) -> String {
     provider_config
         .and_then(|config| config.provider.clone())
@@ -2181,7 +2195,7 @@ fn resolve_provider_name(provider_key: &str, provider_config: Option<&ProviderCo
         .unwrap_or_else(|| provider_key.to_string())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn infer_single_provider(local: &AgentLocalConfig) -> Option<String> {
     let chat_providers = local
         .models
@@ -2197,7 +2211,7 @@ fn infer_single_provider(local: &AgentLocalConfig) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn is_chat_provider(config: &ProviderConfig) -> bool {
     config
         .kind
@@ -2206,7 +2220,7 @@ fn is_chat_provider(config: &ProviderConfig) -> bool {
         .map_or(true, |kind| kind.eq_ignore_ascii_case("chat"))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn model_from_config(
     config: &ProviderModelConfig,
     provider: &str,
@@ -2256,7 +2270,7 @@ fn model_from_config(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn default_reasoning_enabled_for_api(api: &str) -> bool {
     matches!(
         api,
@@ -2267,7 +2281,7 @@ fn default_reasoning_enabled_for_api(api: &str) -> bool {
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn dedupe_models(models: &mut Vec<Model>) {
     let mut deduped = Vec::new();
     for model in std::mem::take(models) {
@@ -2282,7 +2296,7 @@ fn dedupe_models(models: &mut Vec<Model>) {
     *models = deduped;
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn split_provider_model(input: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(raw) = input.map(str::trim).filter(|value| !value.is_empty()) else {
         return (None, None);
@@ -2309,7 +2323,7 @@ fn first_non_empty<const N: usize>(candidates: [Option<String>; N]) -> Option<St
     None
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn infer_api_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("openai-responses".to_string()),
@@ -2328,7 +2342,7 @@ fn infer_api_for_provider(provider: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn default_model_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" | "openai-completions" => Some("gpt-5.3-codex".to_string()),
@@ -2347,7 +2361,7 @@ fn default_model_for_provider(provider: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn default_base_url_for_api(api: &str) -> Option<String> {
     match api {
         "openai-completions" | "openai-responses" | "openai-codex-responses" => {
@@ -2361,7 +2375,7 @@ fn default_base_url_for_api(api: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn primary_env_key_for_provider(provider: &str) -> &'static str {
     match provider {
         "anthropic" | "anthropic-messages" => "ANTHROPIC_API_KEY",
@@ -2380,7 +2394,7 @@ fn primary_env_key_for_provider(provider: &str) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn infer_api_key_from_settings(
     provider: &str,
     env_map: &HashMap<String, String>,
@@ -2507,10 +2521,73 @@ mod tests {
 
     #[test]
     fn new_repl_command_matches_exact_new_token() {
-        assert!(is_new_session_command("/new"));
-        assert!(is_new_session_command(" /new "));
-        assert!(!is_new_session_command("/new task"));
-        assert!(!is_new_session_command("new"));
+        use crate::cli_app::{ReplCommand, ReplCommandParser};
+
+        assert_eq!(
+            ReplCommandParser::parse("/new"),
+            Some(ReplCommand::NewSession)
+        );
+        assert_eq!(
+            ReplCommandParser::parse(" /new "),
+            Some(ReplCommand::NewSession)
+        );
+        assert_eq!(
+            ReplCommandParser::parse("/new task"),
+            Some(ReplCommand::Prompt {
+                text: "/new task".to_string()
+            })
+        );
+        assert_eq!(
+            ReplCommandParser::parse("new"),
+            Some(ReplCommand::Prompt {
+                text: "new".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn repl_command_parser_recognizes_control_commands() {
+        use crate::cli_app::{ReplCommand, ReplCommandParser};
+
+        assert_eq!(
+            ReplCommandParser::parse("/new"),
+            Some(ReplCommand::NewSession)
+        );
+        assert_eq!(
+            ReplCommandParser::parse("/resume"),
+            Some(ReplCommand::Resume { target: None })
+        );
+        assert_eq!(
+            ReplCommandParser::parse("/resume  abc.jsonl "),
+            Some(ReplCommand::Resume {
+                target: Some("abc.jsonl".to_string())
+            })
+        );
+        assert_eq!(
+            ReplCommandParser::parse("/continue"),
+            Some(ReplCommand::Continue)
+        );
+        assert_eq!(
+            ReplCommandParser::parse("/session"),
+            Some(ReplCommand::Session)
+        );
+        assert_eq!(ReplCommandParser::parse("/help"), Some(ReplCommand::Help));
+        assert_eq!(ReplCommandParser::parse("/quit"), Some(ReplCommand::Exit));
+        assert_eq!(ReplCommandParser::parse("/exit"), Some(ReplCommand::Exit));
+    }
+
+    #[test]
+    fn repl_command_parser_treats_other_text_as_prompt() {
+        use crate::cli_app::{ReplCommand, ReplCommandParser};
+
+        assert_eq!(
+            ReplCommandParser::parse(" summarize this file "),
+            Some(ReplCommand::Prompt {
+                text: "summarize this file".to_string()
+            })
+        );
+        assert_eq!(ReplCommandParser::parse(""), None);
+        assert_eq!(ReplCommandParser::parse("   "), None);
     }
 
     #[test]
@@ -2566,7 +2643,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "anthropic");
         assert_eq!(resolved.model.api, "anthropic-messages");
         assert_eq!(resolved.model.id, "claude-opus-4-6");
@@ -2614,13 +2691,94 @@ mod tests {
             },
         };
 
-        let weighted_anthropic = resolve_runtime_config_with_seed(&args, &local, 10)
+        let weighted_anthropic = resolve_runtime_config_for_tests_with_seed(&args, &local, 10)
             .expect("runtime config should resolve");
         assert_eq!(weighted_anthropic.model.provider, "anthropic");
 
-        let weighted_openai = resolve_runtime_config_with_seed(&args, &local, 90)
+        let weighted_openai = resolve_runtime_config_for_tests_with_seed(&args, &local, 90)
             .expect("runtime config should resolve");
         assert_eq!(weighted_openai.model.provider, "openai");
+    }
+
+    #[test]
+    fn resolve_runtime_config_matches_runtime_module_with_same_seed() {
+        let dir = tempdir().expect("tempdir");
+        let pixy_dir = dir.path().join(".pixy");
+        std::fs::create_dir_all(&pixy_dir).expect("create .pixy");
+        std::fs::write(
+            pixy_dir.join("pixy.toml"),
+            r#"
+[env]
+PIXY_TEST_OPENAI_KEY = "sk-from-settings"
+
+[llm]
+default_provider = "*"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$PIXY_TEST_OPENAI_KEY"
+model = "gpt-5.3-codex"
+weight = 90
+
+[[llm.providers]]
+name = "anthropic"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-anthropic"
+model = "claude-3-5-sonnet-latest"
+weight = 10
+"#,
+        )
+        .expect("write pixy.toml");
+
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        let args = test_chat_args();
+        let local = load_agent_local_config(Path::new(".")).expect("load local config");
+        let cli_resolved = resolve_runtime_config_for_tests_with_seed(&args, &local, 42)
+            .expect("cli runtime config should resolve");
+
+        let runtime_options = RuntimeLoadOptions {
+            conf_dir: Some(pixy_dir.clone()),
+            agent_dir: Some(dir.path().join("agent")),
+            load_skills: false,
+            include_default_skills: false,
+            skill_paths: vec![],
+            overrides: RuntimeOverrides {
+                api: args.api.clone(),
+                provider: args.provider.clone(),
+                model: args.model.clone(),
+                base_url: args.base_url.clone(),
+                context_window: args.context_window,
+                max_tokens: args.max_tokens,
+                ..RuntimeOverrides::default()
+            },
+        };
+        let runtime_resolved = runtime_options
+            .resolve_runtime_with_seed(Path::new("."), 42)
+            .expect("runtime module should resolve");
+
+        assert_eq!(cli_resolved.model.provider, runtime_resolved.model.provider);
+        assert_eq!(cli_resolved.model.id, runtime_resolved.model.id);
+        assert_eq!(cli_resolved.model.api, runtime_resolved.model.api);
+        assert_eq!(cli_resolved.model.base_url, runtime_resolved.model.base_url);
+        assert_eq!(
+            cli_resolved.model.reasoning,
+            runtime_resolved.model.reasoning
+        );
+        assert_eq!(
+            cli_resolved.model.reasoning_effort,
+            runtime_resolved.model.reasoning_effort
+        );
+        assert_eq!(cli_resolved.api_key, runtime_resolved.api_key);
     }
 
     #[test]
@@ -2648,7 +2806,7 @@ mod tests {
             },
         };
 
-        let error = resolve_runtime_config_with_seed(&args, &local, 0)
+        let error = resolve_runtime_config_for_tests_with_seed(&args, &local, 0)
             .expect_err("invalid weight should be rejected");
         assert!(error.contains("expected value < 100"));
     }
@@ -2677,7 +2835,7 @@ mod tests {
             },
         };
 
-        let error = resolve_runtime_config_with_seed(&args, &local, 0)
+        let error = resolve_runtime_config_for_tests_with_seed(&args, &local, 0)
             .expect_err("invalid weight should be rejected");
         assert!(error.contains("expected value < 100"));
     }
@@ -2725,7 +2883,7 @@ mod tests {
             },
         };
 
-        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+        let resolved = resolve_runtime_config_for_tests_with_seed(&args, &local, 0)
             .expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "openai");
         assert_eq!(resolved.model.id, "gpt-5.3-codex");
@@ -2771,7 +2929,7 @@ mod tests {
             },
         };
 
-        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+        let resolved = resolve_runtime_config_for_tests_with_seed(&args, &local, 0)
             .expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "openai");
     }
@@ -2821,7 +2979,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.id, "gpt-4.1");
     }
 
@@ -2861,7 +3019,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "openai");
         assert_eq!(resolved.model.api, "openai-responses");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
@@ -2906,7 +3064,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("anthropic-token"));
     }
 
@@ -2942,7 +3100,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.base_url, "https://codex.databend.cloud");
     }
 
@@ -3009,7 +3167,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model_catalog.len(), 2);
         assert_eq!(resolved.model_catalog[0].id, "gpt-5.3-codex");
         assert_eq!(resolved.model_catalog[1].id, "gpt-4.1");
@@ -3330,7 +3488,7 @@ mod tests {
         let local = AgentLocalConfig::default();
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert_eq!(resolved.model.api, "google-generative-ai");
         assert_eq!(
             resolved.model.base_url,
@@ -3364,7 +3522,7 @@ mod tests {
         let local = AgentLocalConfig::default();
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert!(resolved.model.reasoning);
         assert_eq!(
             resolved.model.reasoning_effort,
@@ -3520,7 +3678,7 @@ default_provider = "openai"
             },
         };
 
-        let resolved = resolve_runtime_config_with_seed(&args, &local, 0)
+        let resolved = resolve_runtime_config_for_tests_with_seed(&args, &local, 0)
             .expect("runtime config should resolve");
         assert_eq!(resolved.model.provider, "openai");
         assert_eq!(resolved.model.id, "gpt-5.3-codex");
@@ -3648,7 +3806,7 @@ description: default discovered skill
         };
 
         let resolved =
-            resolve_runtime_config(&args, &local).expect("runtime config should resolve");
+            resolve_runtime_config_for_tests(&args, &local).expect("runtime config should resolve");
         assert!(resolved.model.reasoning);
         assert_eq!(
             resolved.model.reasoning_effort,

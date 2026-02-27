@@ -1,8 +1,10 @@
 //! Session-oriented coding agent orchestration.
 
 mod agent_session;
+mod agent_session_services;
 mod bash_command;
 pub mod cli;
+mod cli_app;
 mod messages;
 mod runtime_config;
 mod session_manager;

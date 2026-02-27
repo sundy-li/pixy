@@ -64,124 +64,126 @@ impl LoadSkillsOptions {
 }
 
 pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
-    let mut aggregated = LoadSkillsResult::default();
-    let mut loaded_real_paths = HashSet::<PathBuf>::new();
-    let mut loaded_names = HashMap::<String, PathBuf>::new();
-
-    if options.include_defaults {
-        merge_load_result(
-            load_skills_from_dir(&options.agent_dir.join("skills"), SkillSource::User),
-            &mut aggregated,
-            &mut loaded_real_paths,
-            &mut loaded_names,
-        );
-
-        if let Some(home) = home_dir() {
-            merge_load_result(
-                load_skills_from_dir(&home.join(".agents").join("skills"), SkillSource::User),
-                &mut aggregated,
-                &mut loaded_real_paths,
-                &mut loaded_names,
-            );
-        }
-
-        merge_load_result(
-            load_skills_from_dir(
-                &options.cwd.join(PIXY_CONFIG_DIR_NAME).join("skills"),
-                SkillSource::Project,
-            ),
-            &mut aggregated,
-            &mut loaded_real_paths,
-            &mut loaded_names,
-        );
-
-        for dir in project_ancestor_dirs(&options.cwd) {
-            merge_load_result(
-                load_skills_from_dir(&dir.join(".agents").join("skills"), SkillSource::Project),
-                &mut aggregated,
-                &mut loaded_real_paths,
-                &mut loaded_names,
-            );
-        }
-    }
-
-    for raw_path in &options.skill_paths {
-        let resolved_path = resolve_skill_path(raw_path, &options.cwd);
-        if !resolved_path.exists() {
-            aggregated.diagnostics.push(SkillDiagnostic {
-                kind: SkillDiagnosticKind::Warning,
-                message: "skill path does not exist".to_string(),
-                path: resolved_path,
-            });
-            continue;
-        }
-
-        let source = infer_explicit_source(&resolved_path, &options);
-
-        if resolved_path.is_dir() {
-            merge_load_result(
-                load_skills_from_dir(&resolved_path, source),
-                &mut aggregated,
-                &mut loaded_real_paths,
-                &mut loaded_names,
-            );
-            continue;
-        }
-
-        if resolved_path.is_file() && is_markdown_file(&resolved_path) {
-            let (skill, diagnostics) = load_skill_from_file(&resolved_path, source);
-            merge_load_result(
-                LoadSkillsResult {
-                    skills: skill.into_iter().collect(),
-                    diagnostics,
-                },
-                &mut aggregated,
-                &mut loaded_real_paths,
-                &mut loaded_names,
-            );
-            continue;
-        }
-
-        aggregated.diagnostics.push(SkillDiagnostic {
-            kind: SkillDiagnosticKind::Warning,
-            message: "skill path is not a markdown file".to_string(),
-            path: resolved_path,
-        });
-    }
-
-    aggregated
+    SkillLoader::new(options).load()
 }
 
-fn merge_load_result(
+struct SkillLoader {
+    options: LoadSkillsOptions,
     result: LoadSkillsResult,
-    aggregated: &mut LoadSkillsResult,
-    loaded_real_paths: &mut HashSet<PathBuf>,
-    loaded_names: &mut HashMap<String, PathBuf>,
-) {
-    aggregated.diagnostics.extend(result.diagnostics);
-    for skill in result.skills {
-        let real_path = std::fs::canonicalize(&skill.file_path).unwrap_or(skill.file_path.clone());
-        if loaded_real_paths.contains(&real_path) {
-            continue;
+    loaded_real_paths: HashSet<PathBuf>,
+    loaded_names: HashMap<String, PathBuf>,
+}
+
+impl SkillLoader {
+    fn new(options: LoadSkillsOptions) -> Self {
+        Self {
+            options,
+            result: LoadSkillsResult::default(),
+            loaded_real_paths: HashSet::new(),
+            loaded_names: HashMap::new(),
+        }
+    }
+
+    fn load(mut self) -> LoadSkillsResult {
+        if self.options.include_defaults {
+            self.load_default_sources();
+        }
+        self.load_explicit_paths();
+        self.result
+    }
+
+    fn load_default_sources(&mut self) {
+        self.merge(load_skills_from_dir(
+            &self.options.agent_dir.join("skills"),
+            SkillSource::User,
+        ));
+
+        if let Some(home) = home_dir() {
+            self.merge(load_skills_from_dir(
+                &home.join(".agents").join("skills"),
+                SkillSource::User,
+            ));
         }
 
-        if let Some(existing_path) = loaded_names.get(&skill.name) {
-            aggregated.diagnostics.push(SkillDiagnostic {
-                kind: SkillDiagnosticKind::Collision,
-                message: format!("name \"{}\" collision", skill.name),
-                path: skill.file_path.clone(),
-            });
-            aggregated.diagnostics.push(SkillDiagnostic {
+        self.merge(load_skills_from_dir(
+            &self.options.cwd.join(PIXY_CONFIG_DIR_NAME).join("skills"),
+            SkillSource::Project,
+        ));
+
+        for dir in project_ancestor_dirs(&self.options.cwd) {
+            self.merge(load_skills_from_dir(
+                &dir.join(".agents").join("skills"),
+                SkillSource::Project,
+            ));
+        }
+    }
+
+    fn load_explicit_paths(&mut self) {
+        let cwd = self.options.cwd.clone();
+        let options = self.options.clone();
+        let skill_paths = self.options.skill_paths.clone();
+        for raw_path in skill_paths {
+            let resolved_path = resolve_skill_path(&raw_path, &cwd);
+            if !resolved_path.exists() {
+                self.result.diagnostics.push(SkillDiagnostic {
+                    kind: SkillDiagnosticKind::Warning,
+                    message: "skill path does not exist".to_string(),
+                    path: resolved_path,
+                });
+                continue;
+            }
+
+            let source = infer_explicit_source(&resolved_path, &options);
+            if resolved_path.is_dir() {
+                self.merge(load_skills_from_dir(&resolved_path, source));
+                continue;
+            }
+
+            if resolved_path.is_file() && is_markdown_file(&resolved_path) {
+                let (skill, diagnostics) = load_skill_from_file(&resolved_path, source);
+                self.merge(LoadSkillsResult {
+                    skills: skill.into_iter().collect(),
+                    diagnostics,
+                });
+                continue;
+            }
+
+            self.result.diagnostics.push(SkillDiagnostic {
                 kind: SkillDiagnosticKind::Warning,
-                message: format!("keeping first skill at {}", existing_path.display()),
-                path: skill.file_path.clone(),
+                message: "skill path is not a markdown file".to_string(),
+                path: resolved_path,
             });
-            continue;
         }
+    }
 
-        loaded_real_paths.insert(real_path);
-        loaded_names.insert(skill.name.clone(), skill.file_path.clone());
-        aggregated.skills.push(skill);
+    fn merge(&mut self, incoming: LoadSkillsResult) {
+        self.result.diagnostics.extend(incoming.diagnostics);
+        for skill in incoming.skills {
+            let real_path =
+                std::fs::canonicalize(&skill.file_path).unwrap_or(skill.file_path.clone());
+            if self.loaded_real_paths.contains(&real_path) {
+                continue;
+            }
+
+            if let Some(existing_path) = self.loaded_names.get(&skill.name) {
+                self.result.diagnostics.push(SkillDiagnostic {
+                    kind: SkillDiagnosticKind::Collision,
+                    message: format!("name \"{}\" collision", skill.name),
+                    path: skill.file_path.clone(),
+                });
+                self.result.diagnostics.push(SkillDiagnostic {
+                    kind: SkillDiagnosticKind::Warning,
+                    message: format!("keeping first skill at {}", existing_path.display()),
+                    path: skill.file_path.clone(),
+                });
+                continue;
+            }
+
+            self.loaded_real_paths.insert(real_path);
+            self.loaded_names
+                .insert(skill.name.clone(), skill.file_path.clone());
+            self.result.skills.push(skill);
+        }
     }
 }
 
@@ -744,5 +746,43 @@ description: should not be discovered.
             .collect::<HashSet<_>>();
         assert!(names.contains("repo-skill"));
         assert!(!names.contains("outside"));
+    }
+
+    #[test]
+    fn skill_loader_matches_public_loader_for_explicit_paths() {
+        let dir = tempdir().expect("temp dir");
+        let first = dir.path().join("alpha").join("alpha-skill");
+        let second = dir.path().join("beta").join("beta-skill");
+        std::fs::create_dir_all(&first).expect("create first skill dir");
+        std::fs::create_dir_all(&second).expect("create second skill dir");
+        std::fs::write(
+            first.join("SKILL.md"),
+            r#"---
+name: alpha-skill
+description: alpha description
+---
+"#,
+        )
+        .expect("write alpha");
+        std::fs::write(
+            second.join("SKILL.md"),
+            r#"---
+name: beta-skill
+description: beta description
+---
+"#,
+        )
+        .expect("write beta");
+
+        let mut options =
+            LoadSkillsOptions::new(dir.path().to_path_buf(), dir.path().join(".pixy/agent"));
+        options.include_defaults = false;
+        options.skill_paths = vec!["alpha".to_string(), "beta".to_string()];
+
+        let public_result = load_skills(options.clone());
+        let object_result = SkillLoader::new(options).load();
+
+        assert_eq!(object_result.skills, public_result.skills);
+        assert_eq!(object_result.diagnostics, public_result.diagnostics);
     }
 }

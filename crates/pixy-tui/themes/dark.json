@@ -16,8 +16,10 @@
     "workingHighlightFg": "white",
     "toolDiffAdded": "green",
     "toolDiffRemoved": "red",
-    "filePathFg": "cyan",
-    "keyTokenFg": "lightYellow",
+    "filePathFg": "#7d828c",
+    "keyTokenFg": "#949699",
+    "skillsHeaderFg": "#f0c674",
+    "skillsGroupFg": "#8ac0b8",
     "selectionBg": "white",
     "selectionFg": "black"
   }

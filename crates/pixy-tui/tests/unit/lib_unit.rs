@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use pixy_agent_core::AgentAbortSignal;
+use pixy_ai::{AssistantContentBlock, Cost, StopReason, ToolResultContentBlock, Usage};
 
 use super::*;
 
@@ -24,6 +25,7 @@ fn mouse_scroll_event(kind: crossterm::event::MouseEventKind) -> crossterm::even
 struct TestBackend {
     resume_result: Result<Option<String>, String>,
     resume_targets: Vec<Option<String>>,
+    session_messages: Option<Vec<Message>>,
     recent_sessions_result: Result<Option<Vec<ResumeCandidate>>, String>,
     recent_sessions_limits: Vec<usize>,
     new_session_result: Result<Option<String>, String>,
@@ -74,6 +76,10 @@ impl TuiBackend for TestBackend {
     fn new_session(&mut self) -> Result<Option<String>, String> {
         self.new_session_calls += 1;
         self.new_session_result.clone()
+    }
+
+    fn session_messages(&self) -> Option<Vec<Message>> {
+        self.session_messages.clone()
     }
 
     fn recent_resumable_sessions(
@@ -968,41 +974,38 @@ fn highlights_file_path_and_key_tokens() {
     assert!(
         line.spans.iter().any(|span| {
             span.content.contains("crates/pixy-tui/src/lib.rs:902")
-                && span.style.fg == Some(Color::Cyan)
+                && span.style.fg == Some(Color::Rgb(125, 130, 140))
         }),
         "file path token should be highlighted"
     );
     assert!(
-        line.spans.iter().any(
-            |span| span.content.contains("PageUp") && span.style.fg == Some(Color::LightYellow)
-        ),
+        line.spans.iter().any(|span| {
+            span.content.contains("PageUp") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "PageUp token should be highlighted"
     );
     assert!(
-        line.spans
-            .iter()
-            .any(|span| span.content.contains("PageDown")
-                && span.style.fg == Some(Color::LightYellow)),
+        line.spans.iter().any(|span| {
+            span.content.contains("PageDown") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "PageDown token should be highlighted"
     );
     assert!(
-        line.spans.iter().any(
-            |span| span.content.contains("ctrl+c") && span.style.fg == Some(Color::LightYellow)
-        ),
+        line.spans.iter().any(|span| {
+            span.content.contains("ctrl+c") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "ctrl+c token should be highlighted"
     );
     assert!(
-        line.spans
-            .iter()
-            .any(|span| span.content.contains("shift+tab")
-                && span.style.fg == Some(Color::LightYellow)),
+        line.spans.iter().any(|span| {
+            span.content.contains("shift+tab") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "shift+tab token should be highlighted"
     );
     assert!(
-        line.spans
-            .iter()
-            .any(|span| span.content.contains("alt+enter")
-                && span.style.fg == Some(Color::LightYellow)),
+        line.spans.iter().any(|span| {
+            span.content.contains("alt+enter") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "alt+enter token should be highlighted"
     );
 }
@@ -1077,6 +1080,386 @@ fn markdown_fenced_code_blocks_are_rendered_without_fence_and_with_syntax_highli
 }
 
 #[test]
+fn markdown_tables_are_rendered_as_aligned_box_drawing_tables() {
+    let lines = vec![
+        TranscriptLine::new("| col1 | col2 |".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("| ---- | ---- |".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("| A    | BBB  |".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("| CC   | D    |".to_string(), TranscriptLineKind::Normal),
+    ];
+
+    let visible =
+        visible_transcript_lines(&lines, &[], 20, 120, true, true, None, 0, TuiTheme::Dark);
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "┌──────┬──────┐"));
+    assert!(texts.iter().any(|line| line == "│ col1 │ col2 │"));
+    assert!(texts.iter().any(|line| line == "├──────┼──────┤"));
+    assert!(texts.iter().any(|line| line == "│ A    │ BBB  │"));
+    assert!(texts.iter().any(|line| line == "│ CC   │ D    │"));
+    assert!(texts.iter().any(|line| line == "└──────┴──────┘"));
+    assert!(
+        !texts.iter().any(|line| line.contains("| ---- |")),
+        "markdown separator rows should not leak into rendered output"
+    );
+}
+
+#[test]
+fn multiline_assistant_markdown_tables_are_rendered_in_transcript() {
+    let messages = vec![Message::Assistant {
+        content: vec![AssistantContentBlock::Text {
+            text: "before\n| col1 | col2 |\n| ---- | ---- |\n| A    | BBB  |\nafter".to_string(),
+            text_signature: None,
+        }],
+        api: "openai-responses".to_string(),
+        provider: "openai".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        usage: Usage {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 0,
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+        },
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        timestamp: 1_700_000_000_000,
+    }];
+
+    let rendered = render_messages(&messages);
+    let visible =
+        visible_transcript_lines(&rendered, &[], 30, 120, true, true, None, 0, TuiTheme::Dark);
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "before"));
+    assert!(texts.iter().any(|line| line == "┌──────┬──────┐"));
+    assert!(texts.iter().any(|line| line == "│ A    │ BBB  │"));
+    assert!(texts.iter().any(|line| line == "after"));
+}
+
+#[test]
+fn streaming_delta_with_chinese_markdown_table_is_rendered_as_table() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.apply_stream_update(StreamUpdate::AssistantTextDelta(
+        "给你一个 markdown 表格：\n\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| A1  | B1  | C1  |\n| A2  | B2  | C2  |\n| A3  | B3  | C3  |\n".to_string(),
+    ));
+
+    let visible = visible_transcript_lines(
+        &app.transcript,
+        &[],
+        40,
+        120,
+        app.show_tool_results,
+        app.show_thinking,
+        app.working_line(),
+        app.transcript_scroll_from_bottom,
+        TuiTheme::Dark,
+    );
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "给你一个 markdown 表格："));
+    assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
+    assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
+    assert!(texts.iter().any(|line| line == "│ A1  │ B1  │ C1  │"));
+    assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
+    assert!(
+        !texts
+            .iter()
+            .any(|line| line.contains("| 列1 | 列2 | 列3 |")),
+        "raw markdown table rows should be replaced by rendered table output"
+    );
+}
+
+#[test]
+fn user_input_markdown_table_is_rendered_as_table() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    let input = "给我一个 markdown 表格，三行三列\n\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| A1  | B1  | C1  |\n| A2  | B2  | C2  |\n| A3  | B3  | C3  |";
+    app.push_user_input_line(format_user_input_line(input, TuiTheme::Dark.input_prompt()));
+
+    let visible = visible_transcript_lines(
+        &app.transcript,
+        &[],
+        40,
+        120,
+        app.show_tool_results,
+        app.show_thinking,
+        app.working_line(),
+        app.transcript_scroll_from_bottom,
+        TuiTheme::Dark,
+    );
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
+    assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
+    assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
+    assert!(
+        !texts
+            .iter()
+            .any(|line| line.contains("| 列1 | 列2 | 列3 |")),
+        "raw user markdown table rows should be replaced by rendered table output"
+    );
+}
+
+#[test]
+fn assistant_line_with_multiline_markdown_table_is_rendered_as_table() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.apply_stream_update(StreamUpdate::AssistantLine(
+        "这里是表格：\n\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| A1  | B1  | C1  |\n| A2  | B2  | C2  |\n| A3  | B3  | C3  |".to_string(),
+    ));
+
+    let visible = visible_transcript_lines(
+        &app.transcript,
+        &[],
+        40,
+        120,
+        app.show_tool_results,
+        app.show_thinking,
+        app.working_line(),
+        app.transcript_scroll_from_bottom,
+        TuiTheme::Dark,
+    );
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "这里是表格："));
+    assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
+    assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
+    assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
+    assert!(
+        !texts
+            .iter()
+            .any(|line| line.contains("| 列1 | 列2 | 列3 |")),
+        "raw assistant markdown table rows should be replaced by rendered table output"
+    );
+}
+
+#[test]
+fn markdown_fenced_markdown_table_is_rendered_as_table_not_code() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.apply_stream_update(StreamUpdate::AssistantLine(
+        "```markdown\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| A1  | B1  | C1  |\n| A2  | B2  | C2  |\n| A3  | B3  | C3  |\n```".to_string(),
+    ));
+
+    let visible = visible_transcript_lines(
+        &app.transcript,
+        &[],
+        40,
+        120,
+        app.show_tool_results,
+        app.show_thinking,
+        app.working_line(),
+        app.transcript_scroll_from_bottom,
+        TuiTheme::Dark,
+    );
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
+    assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
+    assert!(
+        !texts.iter().any(|line| line.contains("```")),
+        "markdown fences should be hidden in transcript rendering"
+    );
+}
+
+#[test]
+fn inline_markdown_bold_italic_and_code_are_rendered_without_markers() {
+    let line = TranscriptLine::new(
+        "Use **bold**, *italic*, and `code`".to_string(),
+        TranscriptLineKind::Normal,
+    )
+    .to_line(120, TuiTheme::Dark);
+    let text = line_text(&line);
+
+    assert!(text.contains("Use bold, italic, and code"));
+    assert!(!text.contains("**"));
+    assert!(!text.contains("`"));
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("bold")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        }),
+        "bold markdown should add bold style"
+    );
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("italic")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)
+        }),
+        "italic markdown should add italic style"
+    );
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("code") && span.style.bg == Some(Color::Rgb(40, 44, 52))
+        }),
+        "inline code should use markdown code background color"
+    );
+}
+
+#[test]
+fn inline_markdown_extended_styles_and_links_are_rendered_without_markers() {
+    let line = TranscriptLine::new(
+        "Try __bold__, _italic_, ~~done~~, and [Pixy](https://example.com)".to_string(),
+        TranscriptLineKind::Normal,
+    )
+    .to_line(200, TuiTheme::Dark);
+    let text = line_text(&line);
+
+    assert!(text.contains("Try bold, italic, done, and Pixy (https://example.com)"));
+    assert!(!text.contains("__"));
+    assert!(!text.contains("~~"));
+    assert!(!text.contains("[Pixy]("));
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("bold")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        }),
+        "double underscore bold markdown should add bold style"
+    );
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("italic")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)
+        }),
+        "underscore italic markdown should add italic style"
+    );
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("done")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::CROSSED_OUT)
+        }),
+        "strikethrough markdown should add crossed-out style"
+    );
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("Pixy")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+        }),
+        "markdown links should be rendered with underline style"
+    );
+}
+
+#[test]
+fn inline_markdown_underscore_markers_do_not_break_snake_case_tokens() {
+    let line = TranscriptLine::new(
+        "Keep snake_case and config_value unchanged".to_string(),
+        TranscriptLineKind::Normal,
+    )
+    .to_line(120, TuiTheme::Dark);
+    let text = line_text(&line);
+
+    assert!(text.contains("snake_case"));
+    assert!(text.contains("config_value"));
+    assert!(
+        !line.spans.iter().any(|span| {
+            span.content.contains("snake_case")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)
+        }),
+        "plain snake_case tokens should not be parsed as italic markdown"
+    );
+}
+
+#[test]
+fn markdown_heading_quote_list_and_rule_are_structurally_rendered() {
+    let lines = vec![
+        TranscriptLine::new("# Heading".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("- item one".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("- [x] done".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("> quote".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("---".to_string(), TranscriptLineKind::Normal),
+    ];
+
+    let visible =
+        visible_transcript_lines(&lines, &[], 30, 120, true, true, None, 0, TuiTheme::Dark);
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "Heading"));
+    assert!(texts.iter().any(|line| line == "• item one"));
+    assert!(texts.iter().any(|line| line == "☑ done"));
+    assert!(texts.iter().any(|line| line == "│ quote"));
+    assert!(texts.iter().any(|line| line == "────────────────────────"));
+    assert!(
+        !texts.iter().any(|line| line == "# Heading"),
+        "heading marker should be removed"
+    );
+}
+
+#[test]
+fn markdown_ordered_and_indented_lists_are_structurally_rendered() {
+    let lines = vec![
+        TranscriptLine::new("1. first".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("2) second".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new("  - child".to_string(), TranscriptLineKind::Normal),
+    ];
+
+    let visible =
+        visible_transcript_lines(&lines, &[], 20, 120, true, true, None, 0, TuiTheme::Dark);
+    let texts = visible
+        .iter()
+        .map(line_text)
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(texts.iter().any(|line| line == "1. first"));
+    assert!(texts.iter().any(|line| line == "2) second"));
+    assert!(texts.iter().any(|line| line == "  • child"));
+}
+
+#[test]
 fn slash_compound_shortcuts_use_key_token_color_instead_of_path_color() {
     let token = "ctrl+p/ctrl+shift+p";
     let line = TranscriptLine::new(
@@ -1086,16 +1469,15 @@ fn slash_compound_shortcuts_use_key_token_color_instead_of_path_color() {
     .to_line(80, TuiTheme::Dark);
 
     assert!(
-        line.spans
-            .iter()
-            .any(|span| span.content.contains(token) && span.style.fg == Some(Color::LightYellow)),
+        line.spans.iter().any(|span| {
+            span.content.contains(token) && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "slash compound shortcuts should use key token color"
     );
     assert!(
-        !line
-            .spans
-            .iter()
-            .any(|span| span.content.contains(token) && span.style.fg == Some(Color::Cyan)),
+        !line.spans.iter().any(|span| {
+            span.content.contains(token) && span.style.fg == Some(Color::Rgb(125, 130, 140))
+        }),
         "slash compound shortcuts should not be treated as file paths"
     );
 }
@@ -1109,15 +1491,15 @@ fn named_single_key_shortcuts_are_highlighted() {
     .to_line(80, TuiTheme::Dark);
 
     assert!(
-        line.spans.iter().any(
-            |span| span.content.contains("escape") && span.style.fg == Some(Color::LightYellow)
-        ),
+        line.spans.iter().any(|span| {
+            span.content.contains("escape") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "escape should be highlighted as a key token"
     );
     assert!(
-        line.spans.iter().any(
-            |span| span.content.contains("enter") && span.style.fg == Some(Color::LightYellow)
-        ),
+        line.spans.iter().any(|span| {
+            span.content.contains("enter") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+        }),
         "enter should be highlighted as a key token"
     );
 }
@@ -1130,8 +1512,66 @@ fn slash_command_hint_token_is_highlighted() {
     assert!(
         line.spans
             .iter()
-            .any(|span| span.content == "/" && span.style.fg == Some(Color::LightYellow)),
+            .any(|span| span.content == "/" && span.style.fg == Some(Color::Rgb(148, 150, 153))),
         "slash command hint should use key token color"
+    );
+}
+
+#[test]
+fn section_headers_and_user_group_use_reference_colors() {
+    let skills_header = TranscriptLine::new("[Skills]".to_string(), TranscriptLineKind::Normal)
+        .to_line(40, TuiTheme::Dark);
+    assert!(
+        skills_header
+            .spans
+            .iter()
+            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+        "skills header left bracket should use reference accent color"
+    );
+    assert!(
+        skills_header.spans.iter().any(|span| {
+            span.content.contains("Skills") && span.style.fg == Some(Color::Rgb(240, 198, 116))
+        }),
+        "skills header text should use reference accent color"
+    );
+    assert!(
+        skills_header
+            .spans
+            .iter()
+            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+        "skills header right bracket should use reference accent color"
+    );
+
+    let context_header = TranscriptLine::new("[Context]".to_string(), TranscriptLineKind::Normal)
+        .to_line(40, TuiTheme::Dark);
+    assert!(
+        context_header
+            .spans
+            .iter()
+            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+        "context header left bracket should use reference accent color"
+    );
+    assert!(
+        context_header.spans.iter().any(|span| {
+            span.content.contains("Context") && span.style.fg == Some(Color::Rgb(240, 198, 116))
+        }),
+        "context header text should use reference accent color"
+    );
+    assert!(
+        context_header
+            .spans
+            .iter()
+            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+        "context header right bracket should use reference accent color"
+    );
+
+    let user_group = TranscriptLine::new("  user".to_string(), TranscriptLineKind::Normal)
+        .to_line(40, TuiTheme::Dark);
+    assert!(
+        user_group.spans.iter().any(|span| {
+            span.content.contains("user") && span.style.fg == Some(Color::Rgb(138, 192, 184))
+        }),
+        "skills user group should use reference accent color"
     );
 }
 
@@ -1200,6 +1640,7 @@ async fn slash_resume_command_updates_status_when_backend_supports_resume() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/resumed.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(None),
         recent_sessions_limits: vec![],
         new_session_result: Ok(None),
@@ -1220,10 +1661,73 @@ async fn slash_resume_command_updates_status_when_backend_supports_resume() {
 }
 
 #[tokio::test]
+async fn slash_resume_command_renders_resumed_session_messages() {
+    let resumed_messages = vec![
+        Message::Assistant {
+            content: vec![AssistantContentBlock::Text {
+                text: "restored answer".to_string(),
+                text_signature: None,
+            }],
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            usage: Usage {
+                input: 12,
+                output: 4,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 16,
+                cost: Cost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.0,
+                },
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1_700_000_000_000,
+        },
+        Message::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ToolResultContentBlock::Text {
+                text: "ok".to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            is_error: false,
+            timestamp: 1_700_000_000_010,
+        },
+    ];
+    let mut backend = TestBackend {
+        resume_result: Ok(Some("session: /tmp/resumed.jsonl".to_string())),
+        resume_targets: vec![],
+        session_messages: Some(resumed_messages.clone()),
+        recent_sessions_result: Ok(None),
+        recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
+    };
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.push_lines(["welcome".to_string()]);
+
+    let handled = handle_slash_command("/resume old-session", &mut backend, &mut app)
+        .await
+        .expect("resume command should not error");
+
+    assert!(handled);
+    assert_eq!(app.status, "session: /tmp/resumed.jsonl");
+    assert_eq!(app.transcript, render_messages(&resumed_messages));
+}
+
+#[tokio::test]
 async fn slash_new_command_starts_new_session() {
     let mut backend = TestBackend {
         resume_result: Ok(None),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(None),
         recent_sessions_limits: vec![],
         new_session_result: Ok(Some("session: /tmp/new-session.jsonl".to_string())),
@@ -1241,10 +1745,32 @@ async fn slash_new_command_starts_new_session() {
 }
 
 #[tokio::test]
+async fn slash_session_command_avoids_none_placeholder_when_uninitialized() {
+    let mut backend = TestBackend {
+        resume_result: Ok(None),
+        resume_targets: vec![],
+        session_messages: None,
+        recent_sessions_result: Ok(None),
+        recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
+    };
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+
+    let handled = handle_slash_command("/session", &mut backend, &mut app)
+        .await
+        .expect("/session should be handled");
+
+    assert!(handled);
+    assert_eq!(app.status, "session not initialized yet");
+}
+
+#[tokio::test]
 async fn slash_resume_command_renders_resume_error() {
     let mut backend = TestBackend {
         resume_result: Err("boom".to_string()),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(None),
         recent_sessions_limits: vec![],
         new_session_result: Ok(None),
@@ -1273,6 +1799,7 @@ async fn slash_resume_without_target_lists_recent_sessions() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/resumed.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(Some(vec![
             ResumeCandidate {
                 session_ref: "/tmp/session-2.jsonl".to_string(),
@@ -1307,6 +1834,7 @@ async fn slash_resume_numeric_selection_resumes_selected_candidate() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/session-1.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(Some(vec![
             ResumeCandidate {
                 session_ref: "/tmp/session-2.jsonl".to_string(),
@@ -1343,6 +1871,7 @@ async fn slash_resume_numeric_selection_rejects_out_of_range_index() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/session-1.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(Some(vec![ResumeCandidate {
             session_ref: "/tmp/session-2.jsonl".to_string(),
             title: "first task".to_string(),
@@ -1375,6 +1904,7 @@ fn resume_picker_enter_resumes_selected_item() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/session-1.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(Some(vec![])),
         recent_sessions_limits: vec![],
         new_session_result: Ok(None),
@@ -1417,6 +1947,7 @@ fn resume_picker_escape_cancels_picker() {
     let mut backend = TestBackend {
         resume_result: Ok(Some("session: /tmp/session-1.jsonl".to_string())),
         resume_targets: vec![],
+        session_messages: None,
         recent_sessions_result: Ok(Some(vec![])),
         recent_sessions_limits: vec![],
         new_session_result: Ok(None),

@@ -49,7 +49,7 @@ async fn run_anthropic(
 ) -> Result<(), PiAiError> {
     let api_key = resolve_api_key(&model.provider, options.as_ref())?;
     let mut output = empty_assistant_message(&model);
-    let payload = build_anthropic_payload(&model, &context, options.as_ref(), false);
+    let payload = build_anthropic_payload(&model, &context, options.as_ref(), model.reasoning);
     let endpoint = join_url(&model.base_url, "messages");
     let client = shared_http_client(&model.base_url);
 
@@ -155,4 +155,131 @@ fn resolve_api_key(provider: &str, options: Option<&StreamOptions>) -> Result<St
             provider, provider_env
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::types::{Context, Cost, Message, UserContent};
+
+    #[test]
+    fn run_anthropic_request_enables_thinking_when_reasoning_is_enabled() {
+        let response_body = r#"{
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"text","text":"ok"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":1,"output_tokens":1}
+        }"#
+        .to_string();
+        let (base_url, captured_body) = spawn_inspecting_server(response_body);
+
+        let model = sample_model(base_url, true);
+        let context = sample_context();
+        let options = StreamOptions {
+            api_key: Some("test-api-key".to_string()),
+            ..StreamOptions::default()
+        };
+
+        let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+        runtime
+            .block_on(run_anthropic(
+                model,
+                context,
+                Some(options),
+                AssistantMessageEventStream::new(),
+            ))
+            .expect("anthropic run succeeds");
+
+        let request_body = captured_body
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("request body captured");
+        assert!(
+            request_body.contains("\"thinking\""),
+            "expected request payload to include thinking block, got: {request_body}"
+        );
+    }
+
+    fn sample_model(base_url: String, reasoning: bool) -> Model {
+        Model {
+            id: "claude-test".to_string(),
+            name: "claude-test".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url,
+            reasoning,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+        }
+    }
+
+    fn sample_context() -> Context {
+        Context {
+            system_prompt: Some("You are a helpful assistant".to_string()),
+            messages: vec![Message::User {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: 1_700_000_000_000,
+            }],
+            tools: None,
+        }
+    }
+
+    fn spawn_inspecting_server(response_body: String) -> (String, Arc<Mutex<Option<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("server local addr");
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_thread = Arc::clone(&captured_body);
+
+        thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set read timeout");
+
+                let request = read_http_request(&mut socket);
+                *captured_body_thread.lock().expect("capture lock") = request;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                let _ = socket.flush();
+            }
+        });
+
+        (format!("http://{address}/v1"), captured_body)
+    }
+
+    fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
+        let mut buffer = [0_u8; 16_384];
+        let read_len = socket.read(&mut buffer).ok()?;
+        if read_len == 0 {
+            return None;
+        }
+        let request = String::from_utf8_lossy(&buffer[..read_len]).to_string();
+        let body_start = request.find("\r\n\r\n")?;
+        let body = request[(body_start + 4)..].to_string();
+        Some(body)
+    }
 }

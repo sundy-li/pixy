@@ -21,15 +21,13 @@ pub(super) fn handle_slash_resume_command<B: TuiBackend>(
             return match resolve_resume_target_by_index(backend, index) {
                 Ok(Some(session_ref)) => {
                     app.close_resume_picker();
-                    Ok(apply_resume_result(
-                        backend.resume_session(Some(session_ref.as_str())),
-                        app,
-                    ))
+                    let result = backend.resume_session(Some(session_ref.as_str()));
+                    Ok(apply_resume_result(backend, result, app))
                 }
-                Ok(None) => Ok(apply_resume_result(
-                    backend.resume_session(Some(target)),
-                    app,
-                )),
+                Ok(None) => {
+                    let result = backend.resume_session(Some(target));
+                    Ok(apply_resume_result(backend, result, app))
+                }
                 Err(error) => {
                     app.push_lines([format!("[resume_error] {error}")]);
                     app.status = format!("resume failed: {error}");
@@ -38,10 +36,8 @@ pub(super) fn handle_slash_resume_command<B: TuiBackend>(
             };
         }
         app.close_resume_picker();
-        return Ok(apply_resume_result(
-            backend.resume_session(Some(target)),
-            app,
-        ));
+        let result = backend.resume_session(Some(target));
+        return Ok(apply_resume_result(backend, result, app));
     }
 
     match backend.recent_resumable_sessions(RESUME_LIST_LIMIT) {
@@ -54,7 +50,10 @@ pub(super) fn handle_slash_resume_command<B: TuiBackend>(
             app.status = "select session and press Enter to resume".to_string();
             Ok(true)
         }
-        Ok(None) => Ok(apply_resume_result(backend.resume_session(None), app)),
+        Ok(None) => {
+            let result = backend.resume_session(None);
+            Ok(apply_resume_result(backend, result, app))
+        }
         Err(error) => {
             app.push_lines([format!("[resume_error] {error}")]);
             app.status = format!("resume failed: {error}");
@@ -95,7 +94,8 @@ pub(super) fn handle_resume_picker_key_event<B: TuiBackend>(
             app.close_resume_picker();
             match selected {
                 Some(session_ref) => {
-                    apply_resume_result(backend.resume_session(Some(session_ref.as_str())), app)
+                    let result = backend.resume_session(Some(session_ref.as_str()));
+                    apply_resume_result(backend, result, app)
                 }
                 None => {
                     app.status = "resume failed: selection unavailable".to_string();
@@ -107,10 +107,17 @@ pub(super) fn handle_resume_picker_key_event<B: TuiBackend>(
     }
 }
 
-fn apply_resume_result(result: Result<Option<String>, String>, app: &mut TuiApp) -> bool {
+fn apply_resume_result<B: TuiBackend>(
+    backend: &B,
+    result: Result<Option<String>, String>,
+    app: &mut TuiApp,
+) -> bool {
     match result {
         Ok(Some(status)) => {
             app.status = status;
+            if let Some(messages) = backend.session_messages() {
+                app.replace_transcript_with_messages(&messages);
+            }
             true
         }
         Ok(None) => {

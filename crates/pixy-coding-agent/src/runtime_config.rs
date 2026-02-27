@@ -91,7 +91,8 @@ impl RuntimeLoadOptions {
             String::new()
         };
         let mut local = load_agent_local_config_from_toml(&content)?;
-        let runtime = resolve_runtime_config_with_seed(&self.overrides, &local, router_seed)?;
+        let runtime = RuntimeConfigResolver::new(&self.overrides, &local, router_seed)
+            .resolve_runtime_config_with_seed()?;
 
         let (skills, skill_diagnostics) = if self.load_skills {
             let agent_dir = self
@@ -129,7 +130,8 @@ impl RuntimeLoadOptions {
         router_seed: u64,
     ) -> Result<ResolvedRuntime, String> {
         let mut local = load_agent_local_config_from_toml(content)?;
-        let runtime = resolve_runtime_config_with_seed(&self.overrides, &local, router_seed)?;
+        let runtime = RuntimeConfigResolver::new(&self.overrides, &local, router_seed)
+            .resolve_runtime_config_with_seed()?;
 
         let (skills, skill_diagnostics) = if self.load_skills {
             let conf_dir = pixy_home_dir(self.conf_dir.as_deref());
@@ -397,17 +399,198 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
     }
 }
 
-fn resolve_runtime_config_with_seed(
-    overrides: &RuntimeOverrides,
-    local: &AgentLocalConfig,
+struct RuntimeConfigResolver<'a> {
+    overrides: &'a RuntimeOverrides,
+    local: &'a AgentLocalConfig,
     router_seed: u64,
-) -> Result<ResolvedRuntimeConfig, String> {
-    if let Some(model) = overrides.fixed_model.clone() {
-        let mut model_catalog = overrides
-            .fixed_model_catalog
+}
+
+impl<'a> RuntimeConfigResolver<'a> {
+    fn new(overrides: &'a RuntimeOverrides, local: &'a AgentLocalConfig, router_seed: u64) -> Self {
+        Self {
+            overrides,
+            local,
+            router_seed,
+        }
+    }
+
+    fn resolve_runtime_config_with_seed(&self) -> Result<ResolvedRuntimeConfig, String> {
+        self.resolve_runtime_config_with_seed_impl()
+    }
+
+    fn resolve_runtime_config_with_seed_impl(&self) -> Result<ResolvedRuntimeConfig, String> {
+        if let Some(model) = self.overrides.fixed_model.clone() {
+            let mut model_catalog = self
+                .overrides
+                .fixed_model_catalog
+                .clone()
+                .unwrap_or_else(|| vec![model.clone()]);
+            dedupe_models(&mut model_catalog);
+            if let Some(position) = model_catalog
+                .iter()
+                .position(|entry| entry.provider == model.provider && entry.id == model.id)
+            {
+                model_catalog.remove(position);
+            }
+            model_catalog.insert(0, model.clone());
+            return Ok(ResolvedRuntimeConfig {
+                model,
+                model_catalog,
+                api_key: self.overrides.fixed_api_key.clone(),
+            });
+        }
+
+        let cli_model_parts = split_provider_model(self.overrides.model.as_deref());
+        let explicit_provider =
+            first_non_empty([self.overrides.provider.clone(), cli_model_parts.0.clone()]);
+        let routed_provider = if explicit_provider.is_none() {
+            resolve_weighted_provider_selection(self.local, self.router_seed)?
+        } else {
+            None
+        };
+        let settings_provider = self
+            .local
+            .settings
+            .default_provider
             .clone()
-            .unwrap_or_else(|| vec![model.clone()]);
+            .filter(|value| value.trim() != "*");
+
+        let provider = first_non_empty([
+            explicit_provider,
+            routed_provider,
+            settings_provider,
+            infer_single_provider(self.local),
+            Some("openai".to_string()),
+        ])
+        .ok_or_else(|| "Unable to resolve provider".to_string())?;
+
+        let provider_config = self.local.models.providers.get(&provider);
+        if let Some(config) = provider_config {
+            if config.weight >= 100 {
+                return Err(format!(
+                    "Provider '{provider}' has invalid weight {}, expected value < 100",
+                    config.weight
+                ));
+            }
+            if !is_chat_provider(config) {
+                let kind = config.kind.as_deref().unwrap_or("unknown");
+                return Err(format!(
+                    "Provider '{provider}' has kind '{kind}', expected 'chat' for coding sessions"
+                ));
+            }
+        }
+        let provider_name = resolve_provider_name(&provider, provider_config);
+        let model_id = first_non_empty([
+            cli_model_parts.1.clone(),
+            provider_config_default_model(provider_config),
+            default_model_for_provider(&provider_name),
+        ])
+        .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
+
+        let selected_model_cfg = provider_config.and_then(|provider_config| {
+            provider_config
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+        });
+
+        let api = first_non_empty([
+            self.overrides.api.clone(),
+            selected_model_cfg.and_then(|model| model.api.clone()),
+            provider_config.and_then(|provider| provider.api.clone()),
+            infer_api_for_provider(&provider_name),
+        ])
+        .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
+
+        let cli_base_url = self
+            .overrides
+            .base_url
+            .as_ref()
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let model_base_url = selected_model_cfg
+            .and_then(|model| model.base_url.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let provider_base_url = provider_config
+            .and_then(|provider| provider.base_url.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env));
+        let base_url = first_non_empty([
+            cli_base_url,
+            model_base_url,
+            provider_base_url,
+            default_base_url_for_api(&api),
+        ])
+        .ok_or_else(|| format!("Unable to resolve base URL for api '{api}'"))?;
+
+        let context_window = self
+            .overrides
+            .context_window
+            .or_else(|| selected_model_cfg.and_then(|model| model.context_window))
+            .unwrap_or(200_000);
+        let max_tokens = self
+            .overrides
+            .max_tokens
+            .or_else(|| selected_model_cfg.and_then(|model| model.max_tokens))
+            .unwrap_or(8_192);
+
+        let api_key = provider_config
+            .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
+            .and_then(|value| resolve_config_value(value, &self.local.settings.env))
+            .or_else(|| infer_api_key_from_settings(&provider_name, &self.local.settings.env))
+            .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
+
+        let reasoning = selected_model_cfg
+            .and_then(|cfg| cfg.reasoning)
+            .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
+        let reasoning_effort = selected_model_cfg
+            .and_then(|cfg| cfg.reasoning_effort.clone())
+            .or_else(|| {
+                if reasoning {
+                    Some(pixy_ai::ThinkingLevel::Medium)
+                } else {
+                    None
+                }
+            });
+
+        let model = Model {
+            id: model_id.clone(),
+            name: model_id,
+            api,
+            provider: provider_name.clone(),
+            base_url,
+            reasoning,
+            reasoning_effort,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window,
+            max_tokens,
+        };
+
+        let mut model_catalog = provider_config
+            .map(|provider_cfg| {
+                provider_cfg
+                    .models
+                    .iter()
+                    .map(|entry| {
+                        model_from_config(
+                            entry,
+                            &provider_name,
+                            &model.api,
+                            &model.base_url,
+                            model.context_window,
+                            model.max_tokens,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         dedupe_models(&mut model_catalog);
+
         if let Some(position) = model_catalog
             .iter()
             .position(|entry| entry.provider == model.provider && entry.id == model.id)
@@ -415,173 +598,13 @@ fn resolve_runtime_config_with_seed(
             model_catalog.remove(position);
         }
         model_catalog.insert(0, model.clone());
-        return Ok(ResolvedRuntimeConfig {
+
+        Ok(ResolvedRuntimeConfig {
             model,
             model_catalog,
-            api_key: overrides.fixed_api_key.clone(),
-        });
-    }
-
-    let cli_model_parts = split_provider_model(overrides.model.as_deref());
-    let explicit_provider =
-        first_non_empty([overrides.provider.clone(), cli_model_parts.0.clone()]);
-    let routed_provider = if explicit_provider.is_none() {
-        resolve_weighted_provider_selection(local, router_seed)?
-    } else {
-        None
-    };
-    let settings_provider = local
-        .settings
-        .default_provider
-        .clone()
-        .filter(|value| value.trim() != "*");
-
-    let provider = first_non_empty([
-        explicit_provider,
-        routed_provider,
-        settings_provider,
-        infer_single_provider(local),
-        Some("openai".to_string()),
-    ])
-    .ok_or_else(|| "Unable to resolve provider".to_string())?;
-
-    let provider_config = local.models.providers.get(&provider);
-    if let Some(config) = provider_config {
-        if config.weight >= 100 {
-            return Err(format!(
-                "Provider '{provider}' has invalid weight {}, expected value < 100",
-                config.weight
-            ));
-        }
-        if !is_chat_provider(config) {
-            let kind = config.kind.as_deref().unwrap_or("unknown");
-            return Err(format!(
-                "Provider '{provider}' has kind '{kind}', expected 'chat' for coding sessions"
-            ));
-        }
-    }
-    let provider_name = resolve_provider_name(&provider, provider_config);
-    let model_id = first_non_empty([
-        cli_model_parts.1.clone(),
-        provider_config_default_model(provider_config),
-        default_model_for_provider(&provider_name),
-    ])
-    .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
-
-    let selected_model_cfg = provider_config.and_then(|provider_config| {
-        provider_config
-            .models
-            .iter()
-            .find(|model| model.id == model_id)
-    });
-
-    let api = first_non_empty([
-        overrides.api.clone(),
-        selected_model_cfg.and_then(|model| model.api.clone()),
-        provider_config.and_then(|provider| provider.api.clone()),
-        infer_api_for_provider(&provider_name),
-    ])
-    .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
-
-    let cli_base_url = overrides
-        .base_url
-        .as_ref()
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let model_base_url = selected_model_cfg
-        .and_then(|model| model.base_url.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let provider_base_url = provider_config
-        .and_then(|provider| provider.base_url.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env));
-    let base_url = first_non_empty([
-        cli_base_url,
-        model_base_url,
-        provider_base_url,
-        default_base_url_for_api(&api),
-    ])
-    .ok_or_else(|| format!("Unable to resolve base URL for api '{api}'"))?;
-
-    let context_window = overrides
-        .context_window
-        .or_else(|| selected_model_cfg.and_then(|model| model.context_window))
-        .unwrap_or(200_000);
-    let max_tokens = overrides
-        .max_tokens
-        .or_else(|| selected_model_cfg.and_then(|model| model.max_tokens))
-        .unwrap_or(8_192);
-
-    let api_key = provider_config
-        .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
-        .and_then(|value| resolve_config_value(value, &local.settings.env))
-        .or_else(|| infer_api_key_from_settings(&provider_name, &local.settings.env))
-        .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
-
-    let reasoning = selected_model_cfg
-        .and_then(|cfg| cfg.reasoning)
-        .unwrap_or_else(|| default_reasoning_enabled_for_api(&api));
-    let reasoning_effort = selected_model_cfg
-        .and_then(|cfg| cfg.reasoning_effort.clone())
-        .or_else(|| {
-            if reasoning {
-                Some(pixy_ai::ThinkingLevel::Medium)
-            } else {
-                None
-            }
-        });
-
-    let model = Model {
-        id: model_id.clone(),
-        name: model_id,
-        api,
-        provider: provider_name.clone(),
-        base_url,
-        reasoning,
-        reasoning_effort,
-        input: vec!["text".to_string()],
-        cost: Cost {
-            input: 0.0,
-            output: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            total: 0.0,
-        },
-        context_window,
-        max_tokens,
-    };
-
-    let mut model_catalog = provider_config
-        .map(|provider_cfg| {
-            provider_cfg
-                .models
-                .iter()
-                .map(|entry| {
-                    model_from_config(
-                        entry,
-                        &provider_name,
-                        &model.api,
-                        &model.base_url,
-                        model.context_window,
-                        model.max_tokens,
-                    )
-                })
-                .collect::<Vec<_>>()
+            api_key,
         })
-        .unwrap_or_default();
-    dedupe_models(&mut model_catalog);
-
-    if let Some(position) = model_catalog
-        .iter()
-        .position(|entry| entry.provider == model.provider && entry.id == model.id)
-    {
-        model_catalog.remove(position);
     }
-    model_catalog.insert(0, model.clone());
-
-    Ok(ResolvedRuntimeConfig {
-        model,
-        model_catalog,
-        api_key,
-    })
 }
 
 fn resolve_weighted_provider_selection(
@@ -1073,6 +1096,140 @@ weight = 1
         assert!(
             resolved.skills.is_empty(),
             "fixed model options disable skills by default"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_prefers_settings_env_over_process_env_for_placeholder_values() {
+        let content = r#"
+[env]
+PIXY_TEST_PROVIDER_TOKEN = "from-settings"
+PIXY_TEST_PROVIDER_BASE = "https://settings.example/v1"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "$PIXY_TEST_PROVIDER_BASE"
+api_key = "$PIXY_TEST_PROVIDER_TOKEN"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        unsafe {
+            std::env::set_var("PIXY_TEST_PROVIDER_TOKEN", "from-process");
+            std::env::set_var("PIXY_TEST_PROVIDER_BASE", "https://process.example/v1");
+        }
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.api_key.as_deref(), Some("from-settings"));
+        assert_eq!(resolved.model.base_url, "https://settings.example/v1");
+    }
+
+    #[test]
+    fn resolve_runtime_uses_process_env_when_placeholder_is_missing_from_settings_env() {
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$PIXY_TEST_PROCESS_ONLY_TOKEN"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        unsafe {
+            std::env::set_var("PIXY_TEST_PROCESS_ONLY_TOKEN", "from-process-only");
+        }
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.api_key.as_deref(), Some("from-process-only"));
+    }
+
+    #[test]
+    fn wildcard_default_provider_ignores_non_chat_providers() {
+        let content = r#"
+[llm]
+default_provider = "*"
+
+[[llm.providers]]
+name = "embedder"
+kind = "embedding"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "embed-key"
+model = "text-embedding-3-small"
+weight = 99
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "chat-key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.model.provider, "openai");
+        assert_eq!(resolved.model.id, "gpt-5.3-codex");
+        assert_eq!(resolved.api_key.as_deref(), Some("chat-key"));
+    }
+
+    #[test]
+    fn resolve_runtime_defaults_reasoning_to_medium_for_openai_compat_api() {
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(resolved.model.reasoning);
+        assert_eq!(
+            resolved.model.reasoning_effort,
+            Some(pixy_ai::ThinkingLevel::Medium)
         );
     }
 }

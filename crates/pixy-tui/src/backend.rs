@@ -66,5 +66,8 @@ pub trait TuiBackend {
     fn new_session(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn session_messages(&self) -> Option<Vec<Message>> {
+        None
+    }
     fn session_file(&self) -> Option<PathBuf>;
 }

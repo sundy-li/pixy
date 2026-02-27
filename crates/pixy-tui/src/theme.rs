@@ -123,6 +123,14 @@ impl TuiTheme {
             .add_modifier(Modifier::BOLD)
     }
 
+    pub(crate) fn skills_header_style(self, base: Style) -> Style {
+        base.fg(self.palette().colors.skills_header_fg)
+    }
+
+    pub(crate) fn skills_group_style(self, base: Style) -> Style {
+        base.fg(self.palette().colors.skills_group_fg)
+    }
+
     pub(crate) fn code_block_style(self) -> Style {
         match self {
             Self::Dark => Style::default()
@@ -217,6 +225,8 @@ struct ThemeColors {
     tool_diff_removed: Color,
     file_path_fg: Color,
     key_token_fg: Color,
+    skills_header_fg: Color,
+    skills_group_fg: Color,
     selection_bg: Option<Color>,
     selection_fg: Option<Color>,
 }
@@ -305,6 +315,24 @@ impl ThemePalette {
             .map_err(|error| format!("invalid filePathFg: {error}"))?;
         let key_token_fg = parse_color(&colors.key_token_fg)
             .map_err(|error| format!("invalid keyTokenFg: {error}"))?;
+        let skills_header_fg = colors
+            .skills_header_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid skillsHeaderFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(key_token_fg);
+        let skills_group_fg = colors
+            .skills_group_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid skillsGroupFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(key_token_fg);
 
         Ok(Self {
             colors: ThemeColors {
@@ -324,6 +352,8 @@ impl ThemePalette {
                 tool_diff_removed,
                 file_path_fg,
                 key_token_fg,
+                skills_header_fg,
+                skills_group_fg,
                 selection_bg,
                 selection_fg,
             },
@@ -364,6 +394,8 @@ struct ThemeFileColors {
     tool_diff_removed: String,
     file_path_fg: String,
     key_token_fg: String,
+    skills_header_fg: Option<String>,
+    skills_group_fg: Option<String>,
     #[serde(alias = "selection_bg")]
     selection_bg: Option<String>,
     #[serde(alias = "selection_fg")]

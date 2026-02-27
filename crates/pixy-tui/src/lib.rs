@@ -543,6 +543,12 @@ impl TuiApp {
         self.transcript.extend(lines);
     }
 
+    fn replace_transcript_with_messages(&mut self, messages: &[Message]) {
+        self.assistant_stream_open = false;
+        self.transcript = render_messages(messages);
+        self.scroll_transcript_to_latest();
+    }
+
     fn toggle_tool_results(&mut self) -> bool {
         self.show_tool_results = !self.show_tool_results;
         self.show_tool_results
@@ -889,10 +895,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
         .map_err(|error| format!("clear terminal failed: {error}"))?;
     _restore.selection_colors_applied = apply_selection_osc_colors(options.theme);
 
-    let status = backend
-        .session_file()
-        .map(|path| format!("session: {}", path.display()))
-        .unwrap_or_else(|| "session: (none)".to_string());
+    let status = startup_status_label(backend);
     let mut app = TuiApp::new(status, options.show_tool_results, options.initial_help);
     app.set_interrupt_hint_label(primary_keybinding_label_lower(
         &options.keybindings.interrupt,
@@ -985,10 +988,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             continue;
         }
         if matches_keybinding(&options.keybindings.show_session, key) {
-            app.status = backend
-                .session_file()
-                .map(|path| format!("session: {}", path.display()))
-                .unwrap_or_else(|| "session: (none)".to_string());
+            app.status = query_session_status_label(backend);
             continue;
         }
         if matches_keybinding(&options.keybindings.cycle_model_forward, key) {
@@ -1304,6 +1304,19 @@ fn transcript_title(app_name: &str, version: &str) -> String {
     }
 }
 
+fn session_status_label(session_file: Option<PathBuf>) -> Option<String> {
+    session_file.map(|path| format!("session: {}", path.display()))
+}
+
+fn startup_status_label<B: TuiBackend>(backend: &B) -> String {
+    session_status_label(backend.session_file()).unwrap_or_else(|| "ready".to_string())
+}
+
+fn query_session_status_label<B: TuiBackend>(backend: &B) -> String {
+    session_status_label(backend.session_file())
+        .unwrap_or_else(|| "session not initialized yet".to_string())
+}
+
 fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
     let kb = &options.keybindings;
 
@@ -1605,10 +1618,7 @@ async fn handle_slash_command<B: TuiBackend>(
             Ok(true)
         }
         "/session" => {
-            app.status = backend
-                .session_file()
-                .map(|path| format!("session: {}", path.display()))
-                .unwrap_or_else(|| "session: (none)".to_string());
+            app.status = query_session_status_label(backend);
             Ok(true)
         }
         "/new" => {

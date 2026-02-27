@@ -1,5 +1,5 @@
 use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -24,7 +24,15 @@ pub(crate) struct TranscriptLine {
     pub(crate) text: String,
     pub(crate) kind: TranscriptLineKind,
     code_language: Option<String>,
+    markdown_line_style: Option<MarkdownLineStyle>,
     working_marquee: Option<WorkingMarquee>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MarkdownLineStyle {
+    Heading,
+    Quote,
+    Rule,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +49,7 @@ impl TranscriptLine {
             text,
             kind,
             code_language: None,
+            markdown_line_style: None,
             working_marquee: None,
         }
     }
@@ -50,6 +59,21 @@ impl TranscriptLine {
             text,
             kind: TranscriptLineKind::Code,
             code_language: language,
+            markdown_line_style: None,
+            working_marquee: None,
+        }
+    }
+
+    fn new_markdown(
+        text: String,
+        kind: TranscriptLineKind,
+        markdown_line_style: MarkdownLineStyle,
+    ) -> Self {
+        Self {
+            text,
+            kind,
+            code_language: None,
+            markdown_line_style: Some(markdown_line_style),
             working_marquee: None,
         }
     }
@@ -65,6 +89,7 @@ impl TranscriptLine {
             text,
             kind: TranscriptLineKind::Working,
             code_language: None,
+            markdown_line_style: None,
             working_marquee: Some(WorkingMarquee {
                 message_char_start,
                 message_char_len,
@@ -75,7 +100,10 @@ impl TranscriptLine {
     }
 
     pub(crate) fn to_line(&self, width: usize, theme: TuiTheme) -> Line<'static> {
-        let base = theme.line_style(self.kind.clone());
+        let mut base = theme.line_style(self.kind.clone());
+        if let Some(markdown_line_style) = &self.markdown_line_style {
+            base = apply_markdown_line_style(base, markdown_line_style);
+        }
 
         let is_tool_diff_removed = matches!(self.kind, TranscriptLineKind::Tool)
             && self.text.trim_start().starts_with('-');
@@ -126,8 +154,24 @@ impl TranscriptLine {
             );
         }
 
-        let spans = highlighted_spans(self.text.as_str(), base, theme);
+        let spans = highlighted_spans(
+            self.text.as_str(),
+            base,
+            theme,
+            matches!(
+                self.kind,
+                TranscriptLineKind::Normal | TranscriptLineKind::UserInput
+            ),
+        );
         line_with_padding(spans, width, base)
+    }
+}
+
+fn apply_markdown_line_style(base: Style, line_style: &MarkdownLineStyle) -> Style {
+    match line_style {
+        MarkdownLineStyle::Heading => base.add_modifier(Modifier::BOLD),
+        MarkdownLineStyle::Quote => base.add_modifier(Modifier::ITALIC),
+        MarkdownLineStyle::Rule => base.add_modifier(Modifier::DIM),
     }
 }
 
@@ -281,13 +325,84 @@ enum SegmentKind {
     Removed,
 }
 
-fn highlighted_spans(text: &str, base: Style, theme: TuiTheme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InlineMarkdownStyle {
+    bold: bool,
+    italic: bool,
+    code: bool,
+    strikethrough: bool,
+    link: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StyledFragment {
+    text: String,
+    is_token: bool,
+    style: InlineMarkdownStyle,
+}
+
+fn highlighted_spans(
+    text: &str,
+    base: Style,
+    theme: TuiTheme,
+    enable_inline_markdown: bool,
+) -> Vec<Span<'static>> {
+    let mut fragments = Vec::new();
+    if enable_inline_markdown {
+        for (segment, markdown_style) in parse_inline_markdown_segments(text) {
+            let segment_fragments = tokenize_text_fragments(segment.as_str(), markdown_style.code);
+            for (text, is_token) in segment_fragments {
+                fragments.push(StyledFragment {
+                    text,
+                    is_token,
+                    style: markdown_style,
+                });
+            }
+        }
+    } else {
+        for (text, is_token) in tokenize_text_fragments(text, false) {
+            fragments.push(StyledFragment {
+                text,
+                is_token,
+                style: InlineMarkdownStyle::default(),
+            });
+        }
+    }
+
+    let mut spans = Vec::with_capacity(fragments.len().max(1));
+    for (index, fragment) in fragments.iter().enumerate() {
+        let previous = index
+            .checked_sub(1)
+            .and_then(|previous_index| fragments.get(previous_index))
+            .map(|fragment| fragment.text.as_str());
+        let next = fragments
+            .get(index + 1)
+            .map(|fragment| fragment.text.as_str());
+        let fragment_base = apply_inline_markdown_style(base, fragment.style, theme);
+        spans.push(styled_fragment(
+            fragment.text.as_str(),
+            fragment.is_token,
+            previous,
+            next,
+            fragment_base,
+            theme,
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+
+    spans
+}
+
+fn tokenize_text_fragments(text: &str, disable_token_detection: bool) -> Vec<(String, bool)> {
+    let mut fragments = Vec::new();
     let mut buffer = String::new();
     let mut buffer_is_token = None::<bool>;
 
     for ch in text.chars() {
-        let is_token = is_token_char(ch);
+        let is_token = !disable_token_detection && is_token_char(ch);
         match buffer_is_token {
             None => {
                 buffer.push(ch);
@@ -297,8 +412,7 @@ fn highlighted_spans(text: &str, base: Style, theme: TuiTheme) -> Vec<Span<'stat
                 buffer.push(ch);
             }
             Some(state) => {
-                spans.push(styled_fragment(&buffer, state, base, theme));
-                buffer.clear();
+                fragments.push((std::mem::take(&mut buffer), state));
                 buffer.push(ch);
                 buffer_is_token = Some(is_token);
             }
@@ -306,14 +420,293 @@ fn highlighted_spans(text: &str, base: Style, theme: TuiTheme) -> Vec<Span<'stat
     }
 
     if let Some(state) = buffer_is_token {
-        spans.push(styled_fragment(&buffer, state, base, theme));
+        fragments.push((buffer, state));
     }
 
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
+    fragments
+}
+
+fn parse_inline_markdown_segments(text: &str) -> Vec<(String, InlineMarkdownStyle)> {
+    if text.is_empty() {
+        return vec![(String::new(), InlineMarkdownStyle::default())];
     }
 
-    spans
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut style = InlineMarkdownStyle::default();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        if chars[idx] == '\\' && idx + 1 < chars.len() && is_markdown_escape_char(chars[idx + 1]) {
+            current.push(chars[idx + 1]);
+            idx += 2;
+            continue;
+        }
+
+        if !style.code && chars[idx] == '[' {
+            if let Some((consumed, label, url)) = parse_markdown_link(&chars, idx) {
+                flush_markdown_segment(&mut segments, &mut current, style);
+                let mut link_style = style;
+                link_style.link = true;
+                if url.is_empty() {
+                    segments.push((label, link_style));
+                } else {
+                    segments.push((format!("{label} ({url})"), link_style));
+                }
+                idx += consumed;
+                continue;
+            }
+        }
+
+        if chars[idx] == '`' && (style.code || has_future_unescaped_char(&chars, idx + 1, '`')) {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.code = !style.code;
+            idx += 1;
+            continue;
+        }
+
+        if !style.code
+            && idx + 1 < chars.len()
+            && chars[idx] == '~'
+            && chars[idx + 1] == '~'
+            && (style.strikethrough || has_future_unescaped_pair(&chars, idx + 2, '~', '~'))
+        {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.strikethrough = !style.strikethrough;
+            idx += 2;
+            continue;
+        }
+
+        if !style.code
+            && idx + 1 < chars.len()
+            && chars[idx] == '*'
+            && chars[idx + 1] == '*'
+            && (style.bold || has_future_unescaped_pair(&chars, idx + 2, '*', '*'))
+        {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.bold = !style.bold;
+            idx += 2;
+            continue;
+        }
+
+        if !style.code
+            && idx + 1 < chars.len()
+            && chars[idx] == '_'
+            && chars[idx + 1] == '_'
+            && can_toggle_underscore_marker(&chars, idx, 2, style.bold)
+            && (style.bold || has_future_unescaped_pair(&chars, idx + 2, '_', '_'))
+        {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.bold = !style.bold;
+            idx += 2;
+            continue;
+        }
+
+        if !style.code
+            && chars[idx] == '*'
+            && chars.get(idx + 1).is_none_or(|next| *next != '*')
+            && (style.italic || has_future_unescaped_char(&chars, idx + 1, '*'))
+        {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.italic = !style.italic;
+            idx += 1;
+            continue;
+        }
+
+        if !style.code
+            && chars[idx] == '_'
+            && chars.get(idx + 1).is_none_or(|next| *next != '_')
+            && can_toggle_underscore_marker(&chars, idx, 1, style.italic)
+            && (style.italic || has_future_unescaped_char(&chars, idx + 1, '_'))
+        {
+            flush_markdown_segment(&mut segments, &mut current, style);
+            style.italic = !style.italic;
+            idx += 1;
+            continue;
+        }
+
+        current.push(chars[idx]);
+        idx += 1;
+    }
+
+    if !current.is_empty() || segments.is_empty() {
+        segments.push((current, style));
+    }
+
+    segments
+}
+
+fn flush_markdown_segment(
+    segments: &mut Vec<(String, InlineMarkdownStyle)>,
+    current: &mut String,
+    style: InlineMarkdownStyle,
+) {
+    if current.is_empty() {
+        return;
+    }
+    segments.push((std::mem::take(current), style));
+}
+
+fn is_markdown_escape_char(ch: char) -> bool {
+    matches!(ch, '\\' | '*' | '`' | '_' | '~' | '[' | ']' | '(' | ')')
+}
+
+fn parse_markdown_link(chars: &[char], start: usize) -> Option<(usize, String, String)> {
+    if chars.get(start).copied() != Some('[') {
+        return None;
+    }
+
+    let mut index = start + 1;
+    let mut label = String::new();
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            label.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == ']' {
+            break;
+        }
+        label.push(ch);
+        index += 1;
+    }
+
+    if index >= chars.len() || chars[index] != ']' || label.trim().is_empty() {
+        return None;
+    }
+    index += 1;
+    if index >= chars.len() || chars[index] != '(' {
+        return None;
+    }
+    index += 1;
+
+    let mut url = String::new();
+    escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            url.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == ')' {
+            break;
+        }
+        url.push(ch);
+        index += 1;
+    }
+
+    if index >= chars.len() || chars[index] != ')' {
+        return None;
+    }
+
+    Some((index + 1 - start, label, url.trim().to_string()))
+}
+
+fn can_toggle_underscore_marker(
+    chars: &[char],
+    idx: usize,
+    marker_len: usize,
+    is_active: bool,
+) -> bool {
+    let previous = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    let next = chars.get(idx + marker_len).copied();
+    if is_active {
+        next.is_none_or(|ch| !is_markdown_word_char(ch))
+    } else {
+        previous.is_none_or(|ch| !is_markdown_word_char(ch))
+    }
+}
+
+fn is_markdown_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn has_future_unescaped_char(chars: &[char], mut idx: usize, target: char) -> bool {
+    let mut escaped = false;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if ch == target {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn has_future_unescaped_pair(chars: &[char], mut idx: usize, first: char, second: char) -> bool {
+    let mut escaped = false;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if idx + 1 < chars.len() && ch == first && chars[idx + 1] == second {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn apply_inline_markdown_style(base: Style, style: InlineMarkdownStyle, theme: TuiTheme) -> Style {
+    let mut rendered = base;
+    if style.code {
+        let code_base = theme.code_block_style();
+        if let Some(fg) = code_base.fg {
+            rendered = rendered.fg(fg);
+        }
+        if let Some(bg) = code_base.bg {
+            rendered = rendered.bg(bg);
+        }
+    }
+    if style.bold {
+        rendered = rendered.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        rendered = rendered.add_modifier(Modifier::ITALIC);
+    }
+    if style.strikethrough {
+        rendered = rendered.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if style.link {
+        rendered = theme
+            .file_path_style(rendered)
+            .add_modifier(Modifier::UNDERLINED);
+    }
+    rendered
 }
 
 fn code_highlighted_spans(
@@ -545,45 +938,440 @@ fn parse_markdown_fence(text: &str) -> Option<Option<String>> {
     Some(language)
 }
 
-fn render_markdown_code_blocks(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
-    let mut rendered = Vec::with_capacity(lines.len());
-    let mut in_code_block = false;
-    let mut current_language: Option<String> = None;
-
+fn explode_multiline_transcript_lines(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
+    let mut exploded = Vec::with_capacity(lines.len());
     for line in lines {
-        if matches!(line.kind, TranscriptLineKind::Normal) {
+        if !line.text.contains('\n') || matches!(line.kind, TranscriptLineKind::Working) {
+            exploded.push(line.clone());
+            continue;
+        }
+
+        for part in line.text.split('\n') {
+            let segment = part.trim_end_matches('\r').to_string();
+            if matches!(line.kind, TranscriptLineKind::Code) {
+                exploded.push(TranscriptLine::new_code(
+                    segment,
+                    line.code_language.clone(),
+                ));
+            } else {
+                exploded.push(TranscriptLine::new(segment, line.kind.clone()));
+            }
+        }
+    }
+    exploded
+}
+
+fn render_markdown(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
+    let expanded = explode_multiline_transcript_lines(lines);
+    let mut rendered = Vec::with_capacity(expanded.len());
+    let mut code_block_kind: Option<TranscriptLineKind> = None;
+    let mut markdown_fence_kind: Option<TranscriptLineKind> = None;
+    let mut current_language: Option<String> = None;
+    let mut cursor = 0usize;
+
+    while cursor < expanded.len() {
+        let line = &expanded[cursor];
+        if code_block_kind
+            .as_ref()
+            .is_some_and(|kind| *kind != line.kind)
+        {
+            code_block_kind = None;
+            current_language = None;
+        }
+        if markdown_fence_kind
+            .as_ref()
+            .is_some_and(|kind| *kind != line.kind)
+        {
+            markdown_fence_kind = None;
+        }
+
+        if supports_markdown_render(line.kind.clone()) {
             if let Some(language) = parse_markdown_fence(line.text.as_str()) {
-                if in_code_block {
-                    in_code_block = false;
+                if code_block_kind.is_some() {
+                    code_block_kind = None;
                     current_language = None;
+                } else if markdown_fence_kind.is_some() {
+                    markdown_fence_kind = None;
+                } else if is_markdown_fence_language(language.as_deref()) {
+                    // Treat ```markdown fenced blocks as normal markdown content.
+                    markdown_fence_kind = Some(line.kind.clone());
                 } else {
-                    in_code_block = true;
+                    code_block_kind = Some(line.kind.clone());
                     current_language = language;
                 }
+                cursor += 1;
                 continue;
             }
 
-            if in_code_block {
+            if code_block_kind
+                .as_ref()
+                .is_some_and(|kind| *kind == line.kind)
+            {
                 rendered.push(TranscriptLine::new_code(
                     line.text.clone(),
                     current_language.clone(),
                 ));
+                cursor += 1;
+                continue;
+            }
+
+            if let Some((consumed, table_lines)) =
+                render_markdown_table_block(&expanded[cursor..], line.kind.clone())
+            {
+                rendered.extend(table_lines);
+                cursor += consumed;
+                continue;
+            }
+
+            if let Some(structural_line) = render_markdown_structural_line(line) {
+                rendered.push(structural_line);
+                cursor += 1;
                 continue;
             }
         }
 
         rendered.push(line.clone());
+        cursor += 1;
     }
 
     rendered
 }
 
-fn styled_fragment(fragment: &str, is_token: bool, base: Style, theme: TuiTheme) -> Span<'static> {
-    if !is_token {
-        return Span::styled(fragment.to_string(), base);
+fn supports_markdown_render(kind: TranscriptLineKind) -> bool {
+    matches!(
+        kind,
+        TranscriptLineKind::Normal | TranscriptLineKind::UserInput
+    )
+}
+
+fn is_markdown_fence_language(language: Option<&str>) -> bool {
+    matches!(language, Some("markdown" | "md"))
+}
+
+fn render_markdown_structural_line(line: &TranscriptLine) -> Option<TranscriptLine> {
+    if !supports_markdown_render(line.kind.clone()) {
+        return None;
     }
 
-    let style = if is_key_token(fragment) {
+    let indent_columns = line
+        .text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum::<usize>();
+    let trimmed = line.text.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(heading) = parse_markdown_heading(trimmed) {
+        return Some(TranscriptLine::new_markdown(
+            heading,
+            line.kind.clone(),
+            MarkdownLineStyle::Heading,
+        ));
+    }
+
+    if let Some(quote) = parse_markdown_quote(trimmed) {
+        return Some(TranscriptLine::new_markdown(
+            quote,
+            line.kind.clone(),
+            MarkdownLineStyle::Quote,
+        ));
+    }
+
+    if let Some(list_item) = parse_markdown_list_item(trimmed, indent_columns / 2) {
+        return Some(TranscriptLine::new(list_item, line.kind.clone()));
+    }
+
+    if is_markdown_horizontal_rule(trimmed) {
+        return Some(TranscriptLine::new_markdown(
+            "────────────────────────".to_string(),
+            line.kind.clone(),
+            MarkdownLineStyle::Rule,
+        ));
+    }
+
+    None
+}
+
+fn parse_markdown_heading(line: &str) -> Option<String> {
+    let marker_len = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&marker_len) {
+        return None;
+    }
+
+    let rest = line.chars().skip(marker_len).collect::<String>();
+    let heading = rest.trim_start();
+    if heading.is_empty() {
+        return None;
+    }
+    Some(heading.to_string())
+}
+
+fn parse_markdown_quote(line: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut rest = line;
+
+    loop {
+        let Some(stripped) = rest.strip_prefix('>') else {
+            break;
+        };
+        depth += 1;
+        rest = stripped.trim_start();
+    }
+
+    if depth == 0 {
+        return None;
+    }
+
+    let prefix = "│ ".repeat(depth);
+    if rest.is_empty() {
+        return Some(prefix.trim_end().to_string());
+    }
+    Some(format!("{prefix}{rest}"))
+}
+
+fn parse_markdown_list_item(line: &str, indent_level: usize) -> Option<String> {
+    let indent = "  ".repeat(indent_level);
+
+    if let Some(body) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        if let Some(task) = parse_markdown_task_item(body) {
+            return Some(format!("{indent}{task}"));
+        }
+        return Some(format!("{indent}• {}", body.trim_start()));
+    }
+
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == 0 || index + 1 >= bytes.len() {
+        return None;
+    }
+    if !matches!(bytes[index], b'.' | b')') || bytes[index + 1] != b' ' {
+        return None;
+    }
+
+    let marker = &line[..=index];
+    let body = line[index + 2..].trim_start();
+    Some(format!("{indent}{marker} {body}"))
+}
+
+fn parse_markdown_task_item(body: &str) -> Option<String> {
+    if let Some(rest) = body.strip_prefix("[ ] ") {
+        return Some(format!("☐ {}", rest.trim_start()));
+    }
+    if let Some(rest) = body
+        .strip_prefix("[x] ")
+        .or_else(|| body.strip_prefix("[X] "))
+    {
+        return Some(format!("☑ {}", rest.trim_start()));
+    }
+    None
+}
+
+fn is_markdown_horizontal_rule(line: &str) -> bool {
+    let compact = line
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if compact.len() < 3 {
+        return false;
+    }
+    let marker = compact[0];
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+    compact.iter().all(|ch| *ch == marker)
+}
+
+fn render_markdown_table_block(
+    lines: &[TranscriptLine],
+    line_kind: TranscriptLineKind,
+) -> Option<(usize, Vec<TranscriptLine>)> {
+    if lines.len() < 2 {
+        return None;
+    }
+
+    let header_line = lines.first()?;
+    if header_line.kind != line_kind {
+        return None;
+    }
+    let header = parse_markdown_table_row(header_line.text.as_str())?;
+    if header.is_empty() {
+        return None;
+    }
+
+    let separator_line = lines.get(1)?;
+    if separator_line.kind != line_kind {
+        return None;
+    }
+    let separator = parse_markdown_table_row(separator_line.text.as_str())?;
+    if separator.len() != header.len() || !is_markdown_table_separator_row(&separator) {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    let mut consumed = 2usize;
+    while let Some(line) = lines.get(consumed) {
+        if line.kind != line_kind || line.text.trim().is_empty() {
+            break;
+        }
+        let Some(cells) = parse_markdown_table_row(line.text.as_str()) else {
+            break;
+        };
+        if cells.len() != header.len() || is_markdown_table_separator_row(&cells) {
+            break;
+        }
+        rows.push(cells);
+        consumed += 1;
+    }
+
+    let rendered = render_box_table_lines(header.as_slice(), rows.as_slice())
+        .into_iter()
+        .map(|line| TranscriptLine::new(line, line_kind.clone()))
+        .collect::<Vec<_>>();
+    Some((consumed, rendered))
+}
+
+fn parse_markdown_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.contains('|') {
+        return None;
+    }
+
+    let mut cells = split_markdown_table_cells(trimmed);
+    if trimmed.starts_with('|') && !cells.is_empty() {
+        cells.remove(0);
+    }
+    if trimmed.ends_with('|') && !cells.is_empty() {
+        cells.pop();
+    }
+
+    if cells.is_empty() {
+        return None;
+    }
+
+    Some(
+        cells
+            .into_iter()
+            .map(|cell| cell.trim().to_string())
+            .collect(),
+    )
+}
+
+fn split_markdown_table_cells(row: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = row.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if chars.peek().is_some_and(|next| *next == '|') {
+                current.push('|');
+                chars.next();
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if ch == '|' {
+            cells.push(std::mem::take(&mut current));
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    cells.push(current);
+    cells
+}
+
+fn is_markdown_table_separator_row(cells: &[String]) -> bool {
+    if cells.is_empty() {
+        return false;
+    }
+    cells.iter().all(|cell| {
+        let trimmed = cell.trim();
+        !trimmed.is_empty()
+            && trimmed.chars().all(|ch| matches!(ch, '-' | ':'))
+            && trimmed.contains('-')
+    })
+}
+
+fn render_box_table_lines(header: &[String], rows: &[Vec<String>]) -> Vec<String> {
+    let mut widths = vec![0usize; header.len()];
+    for row in std::iter::once(header).chain(rows.iter().map(|row| row.as_slice())) {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(UnicodeWidthStr::width(cell.as_str()));
+        }
+    }
+
+    let mut rendered = Vec::new();
+    rendered.push(render_table_border('┌', '┬', '┐', widths.as_slice()));
+    rendered.push(render_table_row(header, widths.as_slice()));
+    rendered.push(render_table_border('├', '┼', '┤', widths.as_slice()));
+    for row in rows {
+        rendered.push(render_table_row(row.as_slice(), widths.as_slice()));
+    }
+    rendered.push(render_table_border('└', '┴', '┘', widths.as_slice()));
+    rendered
+}
+
+fn render_table_border(left: char, mid: char, right: char, widths: &[usize]) -> String {
+    let mut line = String::new();
+    line.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        line.push_str("─".repeat(*width + 2).as_str());
+        if index + 1 < widths.len() {
+            line.push(mid);
+        }
+    }
+    line.push(right);
+    line
+}
+
+fn render_table_row(row: &[String], widths: &[usize]) -> String {
+    let mut line = String::new();
+    line.push('│');
+    for (index, width) in widths.iter().enumerate() {
+        let cell = row.get(index).map(String::as_str).unwrap_or("");
+        let cell_width = UnicodeWidthStr::width(cell);
+        line.push(' ');
+        line.push_str(cell);
+        if cell_width < *width {
+            line.push_str(" ".repeat(*width - cell_width).as_str());
+        }
+        line.push(' ');
+        line.push('│');
+    }
+    line
+}
+
+fn styled_fragment(
+    fragment: &str,
+    is_token: bool,
+    previous: Option<&str>,
+    next: Option<&str>,
+    base: Style,
+    theme: TuiTheme,
+) -> Span<'static> {
+    let style = if is_section_header_bracket_fragment(fragment, previous, next) {
+        theme.skills_header_style(base)
+    } else if !is_token {
+        base
+    } else if is_skills_header_token(fragment, previous, next) {
+        theme.skills_header_style(base)
+    } else if is_skills_user_group_token(fragment, previous, next) {
+        theme.skills_group_style(base)
+    } else if is_key_token(fragment) {
         theme.key_token_style(base)
     } else if is_file_path_token(fragment) {
         theme.file_path_style(base)
@@ -591,6 +1379,54 @@ fn styled_fragment(fragment: &str, is_token: bool, base: Style, theme: TuiTheme)
         base
     };
     Span::styled(fragment.to_string(), style)
+}
+
+fn is_section_header_bracket_fragment(
+    fragment: &str,
+    previous: Option<&str>,
+    next: Option<&str>,
+) -> bool {
+    let normalized = fragment.trim_matches(char::is_whitespace);
+    if normalized == "[" {
+        return next.is_some_and(is_section_header_name_fragment);
+    }
+    if normalized == "]" {
+        return previous.is_some_and(is_section_header_name_fragment);
+    }
+    false
+}
+
+fn is_section_header_name_fragment(fragment: &str) -> bool {
+    let normalized = fragment
+        .trim_matches(char::is_whitespace)
+        .to_ascii_lowercase();
+    matches!(normalized.as_str(), "skills" | "context")
+}
+
+fn is_skills_header_token(token: &str, previous: Option<&str>, next: Option<&str>) -> bool {
+    if !is_section_header_name_fragment(token) {
+        return false;
+    }
+
+    previous.is_some_and(|fragment| fragment.trim_end().ends_with('['))
+        && next.is_some_and(|fragment| fragment.trim_start().starts_with(']'))
+}
+
+fn is_skills_user_group_token(token: &str, previous: Option<&str>, next: Option<&str>) -> bool {
+    let normalized = token
+        .trim_matches(|ch: char| ch.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    if normalized != "user" {
+        return false;
+    }
+
+    let previous_is_whitespace = previous
+        .map(|fragment| fragment.chars().all(char::is_whitespace))
+        .unwrap_or(true);
+    let next_is_whitespace = next
+        .map(|fragment| fragment.chars().all(char::is_whitespace))
+        .unwrap_or(true);
+    previous_is_whitespace && next_is_whitespace
 }
 
 fn is_token_char(ch: char) -> bool {
@@ -722,7 +1558,7 @@ pub(crate) fn visible_transcript_lines(
         filtered.push(working_line);
     }
 
-    let markdown_rendered = render_markdown_code_blocks(&filtered);
+    let markdown_rendered = render_markdown(&filtered);
     let compacted = compact_tool_transcript_lines(&markdown_rendered);
     let spaced = pad_transcript_block_boundaries(&compacted);
     let wrapped = wrap_transcript_lines(&spaced, max_width);

@@ -15,8 +15,12 @@ use serde_json::Value;
 
 use crate::{
     BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, ResolvedRuntime, RuntimeLoadOptions,
-    SessionContext, SessionManager, bash_command::normalize_nested_bash_lc, build_system_prompt,
-    create_coding_tools,
+    SessionContext, SessionManager,
+    agent_session_services::{
+        AutoCompactionService, SessionResumeService, StreamingToolLineRenderer,
+    },
+    bash_command::normalize_nested_bash_lc,
+    build_system_prompt, create_coding_tools,
 };
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
@@ -69,6 +73,9 @@ pub struct AgentSession {
     model_catalog: Vec<Model>,
     current_model_index: usize,
     retry_config: AgentRetryConfig,
+    resume_service: SessionResumeService,
+    compaction_service: AutoCompactionService,
+    stream_renderer: StreamingToolLineRenderer,
 }
 
 impl AgentSession {
@@ -81,6 +88,9 @@ impl AgentSession {
             model_catalog: vec![current_model],
             current_model_index: 0,
             retry_config: AgentRetryConfig::default(),
+            resume_service: SessionResumeService::new(),
+            compaction_service: AutoCompactionService::new(),
+            stream_renderer: StreamingToolLineRenderer::new(),
         }
     }
 
@@ -93,8 +103,9 @@ impl AgentSession {
     }
 
     pub fn resume(&mut self, target: Option<&str>) -> Result<PathBuf, String> {
-        let target_path =
-            resolve_resume_session_target(target, self.session_manager.session_file().cloned())?;
+        let target_path = self
+            .resume_service
+            .resolve_resume_session_target(target, self.session_manager.session_file().cloned())?;
         let loaded = SessionManager::load(&target_path)?;
         self.session_manager = loaded;
         self.sync_model_from_session_state();
@@ -157,9 +168,10 @@ impl AgentSession {
         &self,
         limit: usize,
     ) -> Result<Vec<SessionResumeCandidate>, String> {
+        let resume_service = &self.resume_service;
         self.recent_resumable_sessions(limit)?
             .into_iter()
-            .map(build_session_resume_candidate)
+            .map(|path| resume_service.build_session_resume_candidate(path))
             .collect()
     }
 
@@ -278,7 +290,10 @@ impl AgentSession {
             .run_prompt_once_streaming(input, blocks, abort_signal, Some(&mut on_update))
             .await?;
         if let Some(mut retry_messages) = self.maybe_handle_overflow_and_retry(&produced).await? {
-            for update in render_messages_for_streaming(&retry_messages) {
+            for update in self
+                .stream_renderer
+                .render_messages_for_streaming(&retry_messages)
+            {
                 on_update(update);
             }
             produced.append(&mut retry_messages);
@@ -337,7 +352,7 @@ impl AgentSession {
 
         let context = self.agent_context_from_session();
         let stream = agent_loop(vec![prompt], context, self.loop_config(), abort_signal);
-        let produced = collect_agent_loop_result(stream, on_update).await?;
+        let produced = collect_agent_loop_result(stream, on_update, &self.stream_renderer).await?;
 
         self.persist_messages_and_maybe_compact(&produced).await?;
         Ok(produced)
@@ -370,7 +385,10 @@ impl AgentSession {
             .run_continue_once_streaming(abort_signal, Some(&mut on_update))
             .await?;
         if let Some(mut retry_messages) = self.maybe_handle_overflow_and_retry(&produced).await? {
-            for update in render_messages_for_streaming(&retry_messages) {
+            for update in self
+                .stream_renderer
+                .render_messages_for_streaming(&retry_messages)
+            {
                 on_update(update);
             }
             produced.append(&mut retry_messages);
@@ -428,7 +446,7 @@ impl AgentSession {
         } else {
             agent_loop_continue(context, self.loop_config(), abort_signal)
         };
-        let produced = collect_agent_loop_result(stream, on_update).await?;
+        let produced = collect_agent_loop_result(stream, on_update, &self.stream_renderer).await?;
 
         self.persist_messages_and_maybe_compact(&produced).await?;
         Ok(produced)
@@ -566,12 +584,16 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let Some(assistant_message) = latest_assistant_message(produced) else {
+        let Some(assistant_message) = self.compaction_service.latest_assistant_message(produced)
+        else {
             return Ok(None);
         };
 
         let context_window = self.config.model.context_window as u64;
-        if !is_context_overflow_message(assistant_message, context_window) {
+        if !self
+            .compaction_service
+            .is_context_overflow_message(assistant_message, context_window)
+        {
             return Ok(None);
         }
 
@@ -625,7 +647,10 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let Some(context_tokens) = latest_context_tokens_from_messages(produced) else {
+        let Some(context_tokens) = self
+            .compaction_service
+            .latest_context_tokens_from_messages(produced)
+        else {
             return Ok(None);
         };
 
@@ -674,7 +699,7 @@ impl AgentSession {
             Ok(summary) if !summary.trim().is_empty() => {
                 truncate_chars(summary.trim(), self.auto_compaction.max_summary_chars)
             }
-            _ => build_auto_compaction_summary(
+            _ => self.compaction_service.build_auto_compaction_summary(
                 messages_to_summarize,
                 context_tokens,
                 context_window,
@@ -814,6 +839,7 @@ pub fn create_session_from_runtime(
 async fn collect_agent_loop_result(
     stream: pixy_ai::EventStream<AgentEvent, Vec<AgentMessage>>,
     mut on_update: Option<&mut dyn FnMut(AgentSessionStreamUpdate)>,
+    renderer: &StreamingToolLineRenderer,
 ) -> Result<Vec<AgentMessage>, String> {
     let mut saw_assistant_text_delta = false;
     let mut saw_assistant_thinking_delta = false;
@@ -832,9 +858,9 @@ async fn collect_agent_loop_result(
                 tool_name, args, ..
             } => {
                 if let Some(callback) = on_update.as_mut() {
-                    callback(AgentSessionStreamUpdate::ToolLine(format_tool_start_line(
-                        &tool_name, &args,
-                    )));
+                    callback(AgentSessionStreamUpdate::ToolLine(
+                        renderer.format_tool_start_line(&tool_name, &args),
+                    ));
                 }
             }
             AgentEvent::MessageUpdate {
@@ -899,7 +925,7 @@ async fn collect_agent_loop_result(
                         tool_name, content, ..
                     } = &message
                     {
-                        if should_render_tool_result_content(tool_name) {
+                        if renderer.should_render_tool_result_content(tool_name) {
                             for block in content {
                                 match block {
                                     ToolResultContentBlock::Text { text, .. } => {
@@ -926,7 +952,9 @@ async fn collect_agent_loop_result(
         .ok_or_else(|| "Agent loop ended without a final result".to_string())
 }
 
-fn render_messages_for_streaming(messages: &[AgentMessage]) -> Vec<AgentSessionStreamUpdate> {
+pub(crate) fn render_messages_for_streaming(
+    messages: &[AgentMessage],
+) -> Vec<AgentSessionStreamUpdate> {
     let mut updates = vec![];
     for message in messages {
         match message {
@@ -968,11 +996,11 @@ fn render_messages_for_streaming(messages: &[AgentMessage]) -> Vec<AgentSessionS
     updates
 }
 
-fn should_render_tool_result_content(tool_name: &str) -> bool {
+pub(crate) fn should_render_tool_result_content(tool_name: &str) -> bool {
     tool_name != "read"
 }
 
-fn format_tool_start_line(tool_name: &str, args: &Value) -> String {
+pub(crate) fn format_tool_start_line(tool_name: &str, args: &Value) -> String {
     match tool_name {
         "bash" => format_bash_tool_start_line(args),
         "read" | "write" | "edit" => format_path_tool_start_line(tool_name, args),
@@ -1077,7 +1105,7 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn latest_context_tokens_from_messages(messages: &[AgentMessage]) -> Option<u64> {
+pub(crate) fn latest_context_tokens_from_messages(messages: &[AgentMessage]) -> Option<u64> {
     messages.iter().rev().find_map(|message| match message {
         Message::Assistant {
             usage, stop_reason, ..
@@ -1096,7 +1124,7 @@ fn context_tokens_from_usage(usage: &Usage) -> u64 {
     }
 }
 
-fn latest_assistant_message(messages: &[AgentMessage]) -> Option<&Message> {
+pub(crate) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<&Message> {
     messages
         .iter()
         .rev()
@@ -1117,7 +1145,7 @@ fn overflow_context_tokens(message: &Message, context_window: u64) -> u64 {
     }
 }
 
-fn is_context_overflow_message(message: &Message, context_window: u64) -> bool {
+pub(crate) fn is_context_overflow_message(message: &Message, context_window: u64) -> bool {
     match message {
         Message::Assistant {
             stop_reason,
@@ -1192,7 +1220,7 @@ fn serialize_messages_for_summary(messages: &[Message]) -> String {
         .join("\n\n")
 }
 
-fn build_auto_compaction_summary(
+pub(crate) fn build_auto_compaction_summary(
     messages_to_summarize: &[Message],
     context_tokens: u64,
     context_window: u64,
@@ -1309,7 +1337,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn resolve_resume_session_target(
+pub(crate) fn resolve_resume_session_target(
     target: Option<&str>,
     current_session_file: Option<PathBuf>,
 ) -> Result<PathBuf, String> {
@@ -1422,7 +1450,9 @@ fn list_session_files(session_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn build_session_resume_candidate(path: PathBuf) -> Result<SessionResumeCandidate, String> {
+pub(crate) fn build_session_resume_candidate(
+    path: PathBuf,
+) -> Result<SessionResumeCandidate, String> {
     let manager = SessionManager::load(&path)?;
     let context = manager.build_session_context();
     let title = session_candidate_title(&context).unwrap_or_else(|| {
