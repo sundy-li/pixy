@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Skill, SkillSource, format_skills_for_prompt};
+use crate::{Skill, SkillSource, SubAgentSpec, format_skills_for_prompt};
 use chrono::Local;
 use pixy_agent_core::AgentTool;
 
@@ -17,6 +17,37 @@ pub fn build_system_prompt(
         .to_string();
     let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
     build_system_prompt_with_now(custom_prompt, cwd, &tool_names, skills, &now_text)
+}
+
+pub fn append_multi_agent_prompt_section(
+    prompt: &mut String,
+    tools: &[AgentTool],
+    subagents: &[SubAgentSpec],
+) {
+    if !tools.iter().any(|tool| tool.name == "task") {
+        return;
+    }
+
+    let mut sorted = subagents
+        .iter()
+        .filter(|spec| !spec.name.trim().is_empty())
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return;
+    }
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut lines = vec![
+        "<MULTI_AGENT>".to_string(),
+        "Task delegation is enabled through the `task` tool.".to_string(),
+        "Available subagents:".to_string(),
+    ];
+    for spec in sorted {
+        lines.push(format!("- {}: {}", spec.name, spec.description));
+    }
+    lines.push("</MULTI_AGENT>".to_string());
+
+    append_prompt_section(prompt, &lines.join("\n"));
 }
 
 fn build_system_prompt_with_now(
@@ -237,6 +268,7 @@ fn tool_description(name: &str) -> Option<&'static str> {
         "bash" => Some("Execute bash commands in the current directory"),
         "edit" => Some("Make surgical edits to existing files"),
         "write" => Some("Create or overwrite files"),
+        "task" => Some("Delegate a prompt to a configured subagent"),
         _ => None,
     }
 }
@@ -262,7 +294,7 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
         );
     }
     if has("read") && has("edit") {
-        lines.push("- MSUT read every file you modify.".to_string());
+        lines.push("- MUST read every file you modify.".to_string());
     }
     if has("list_directory") {
         lines.push(
@@ -298,10 +330,33 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::{Skill, SkillSource};
+    use crate::{Skill, SkillSource, SubAgentSpec};
+    use pixy_agent_core::{AgentToolResult, ToolFuture};
+    use pixy_ai::PiAiError;
     use tempfile::tempdir;
 
+    use super::append_multi_agent_prompt_section;
     use super::build_system_prompt_with_now;
+    use pixy_agent_core::AgentTool;
+
+    fn no_op_tool(name: &str) -> AgentTool {
+        AgentTool {
+            name: name.to_string(),
+            label: name.to_string(),
+            description: name.to_string(),
+            parameters: serde_json::json!({}),
+            execute: std::sync::Arc::new(
+                |_tool_call_id: String, _args: serde_json::Value| -> ToolFuture {
+                    Box::pin(async {
+                        Err(PiAiError::new(
+                            pixy_ai::PiAiErrorCode::ToolExecutionFailed,
+                            "unused",
+                        )) as Result<AgentToolResult, PiAiError>
+                    })
+                },
+            ),
+        }
+    }
 
     #[test]
     fn default_prompt_uses_sectioned_structure() {
@@ -530,5 +585,44 @@ mod tests {
         assert!(prompt.contains("path-skill"));
         assert!(!prompt.contains("user-skill"));
         assert!(prompt.contains("</WORKSPACE_SKILLS>"));
+    }
+
+    #[test]
+    fn append_multi_agent_prompt_section_includes_subagent_names_when_task_tool_present() {
+        let mut prompt = "base prompt".to_string();
+        let tools = vec![no_op_tool("task")];
+        let subagents = vec![
+            SubAgentSpec {
+                name: "general".to_string(),
+                description: "General helper".to_string(),
+                mode: crate::SubAgentMode::SubAgent,
+            },
+            SubAgentSpec {
+                name: "explore".to_string(),
+                description: "Exploration helper".to_string(),
+                mode: crate::SubAgentMode::SubAgent,
+            },
+        ];
+
+        append_multi_agent_prompt_section(&mut prompt, &tools, &subagents);
+
+        assert!(prompt.contains("<MULTI_AGENT>"));
+        assert!(prompt.contains("explore"));
+        assert!(prompt.contains("general"));
+    }
+
+    #[test]
+    fn append_multi_agent_prompt_section_skips_when_task_tool_absent() {
+        let mut prompt = "base prompt".to_string();
+        let tools = vec![no_op_tool("read")];
+        let subagents = vec![SubAgentSpec {
+            name: "general".to_string(),
+            description: "General helper".to_string(),
+            mode: crate::SubAgentMode::SubAgent,
+        }];
+
+        append_multi_agent_prompt_section(&mut prompt, &tools, &subagents);
+
+        assert!(!prompt.contains("<MULTI_AGENT>"));
     }
 }

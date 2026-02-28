@@ -1,6 +1,6 @@
 {
   "name": "light",
-  "inputPrompt": "› ",
+  "inputPrompt": "> ",
   "colors": {
     "transcriptFg": "black",
     "transcriptBg": "#f8f8f8",

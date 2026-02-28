@@ -45,6 +45,51 @@ where
 
 pub type StreamFn = Arc<dyn StreamExecutor>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParentChildRunEvent {
+    ChildRunStart {
+        parent_session_id: String,
+        child_session_file: String,
+        task_id: String,
+        subagent: String,
+    },
+    ChildRunEnd {
+        parent_session_id: String,
+        child_session_file: String,
+        task_id: String,
+        subagent: String,
+        duration_ms: u64,
+        summary: String,
+    },
+    ChildRunError {
+        parent_session_id: String,
+        child_session_file: String,
+        task_id: String,
+        subagent: String,
+        error: String,
+    },
+}
+
+impl ParentChildRunEvent {
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::ChildRunStart { task_id, .. } => task_id,
+            Self::ChildRunEnd { task_id, .. } => task_id,
+            Self::ChildRunError { task_id, .. } => task_id,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ChildRunStart { .. } => "child_run_start",
+            Self::ChildRunEnd { .. } => "child_run_end",
+            Self::ChildRunError { .. } => "child_run_error",
+        }
+    }
+}
+
+pub type ParentChildRunEventSink = Arc<dyn Fn(ParentChildRunEvent) + Send + Sync>;
+
 pub trait MessageConverter: Send + Sync {
     fn convert(&self, messages: Vec<AgentMessage>) -> Vec<Message>;
 }
@@ -283,4 +328,41 @@ pub enum AgentEvent {
     Metrics {
         metrics: AgentRunMetrics,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParentChildRunEvent;
+
+    #[test]
+    fn parent_child_run_event_exposes_task_id_and_kind_for_all_variants() {
+        let start = ParentChildRunEvent::ChildRunStart {
+            parent_session_id: "parent".to_string(),
+            child_session_file: "/tmp/child.jsonl".to_string(),
+            task_id: "task-1".to_string(),
+            subagent: "general".to_string(),
+        };
+        let end = ParentChildRunEvent::ChildRunEnd {
+            parent_session_id: "parent".to_string(),
+            child_session_file: "/tmp/child.jsonl".to_string(),
+            task_id: "task-1".to_string(),
+            subagent: "general".to_string(),
+            duration_ms: 12,
+            summary: "done".to_string(),
+        };
+        let error = ParentChildRunEvent::ChildRunError {
+            parent_session_id: "parent".to_string(),
+            child_session_file: "/tmp/child.jsonl".to_string(),
+            task_id: "task-1".to_string(),
+            subagent: "general".to_string(),
+            error: "boom".to_string(),
+        };
+
+        assert_eq!(start.task_id(), "task-1");
+        assert_eq!(start.kind(), "child_run_start");
+        assert_eq!(end.task_id(), "task-1");
+        assert_eq!(end.kind(), "child_run_end");
+        assert_eq!(error.task_id(), "task-1");
+        assert_eq!(error.kind(), "child_run_error");
+    }
 }

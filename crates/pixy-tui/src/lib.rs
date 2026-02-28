@@ -12,18 +12,16 @@ use crossterm::event::{
     MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_util::StreamExt;
 use pixy_agent_core::AgentAbortController;
 use pixy_ai::{Message, StopReason, UserContentBlock};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -42,13 +40,17 @@ pub use theme::TuiTheme;
 use transcript::{
     TranscriptLine, TranscriptLineKind, is_thinking_line, is_tool_run_line,
     normalize_tool_line_for_display, parse_tool_name, render_messages, split_tool_output_lines,
-    visible_transcript_lines, wrap_text_by_display_width,
+    visible_transcript_lines,
 };
 
 const FORCE_EXIT_SIGNAL: &str = "__FORCE_EXIT__";
 const FORCE_EXIT_STATUS: &str = "force exiting...";
 const PASTED_TEXT_PREVIEW_LIMIT: usize = 100;
 const RESUME_LIST_LIMIT: usize = 10;
+const INPUT_RENDER_LEFT_PADDING: &str = " ";
+const INPUT_AREA_FIXED_HEIGHT: u16 = 3;
+const STATUS_HINT_LEFT: &str = "shift+tab to cycle modes (auto/spec), ctrl+L for autonomy";
+const STATUS_HINT_RIGHT: &str = "ctrl+N to cycle models";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingTextAttachment {
@@ -165,6 +167,7 @@ struct TuiApp {
     status_left: String,
     status_right: String,
     resume_picker: Option<ResumePickerState>,
+    welcome_lines: Vec<String>,
 }
 
 impl TuiApp {
@@ -198,6 +201,7 @@ impl TuiApp {
             status_left: String::new(),
             status_right: String::new(),
             resume_picker: None,
+            welcome_lines: vec![],
         }
     }
 
@@ -205,6 +209,10 @@ impl TuiApp {
         self.status_top = top;
         self.status_left = left;
         self.status_right = right;
+    }
+
+    fn set_welcome_lines(&mut self, lines: Vec<String>) {
+        self.welcome_lines = lines;
     }
 
     fn set_interrupt_hint_label(&mut self, label: String) {
@@ -597,20 +605,8 @@ impl TuiApp {
         }
     }
 
-    fn with_working_suffix(&self, message: &str) -> String {
-        format!(
-            "{message} ({} • {} to interrupt)",
-            self.working_elapsed_label(),
-            self.interrupt_hint_label
-        )
-    }
-
     fn status_for_render(&self) -> String {
-        if self.is_working {
-            self.with_working_suffix(self.status.as_str())
-        } else {
-            self.status.clone()
-        }
+        self.status.clone()
     }
 
     fn queue_follow_up(&mut self, input: String) {
@@ -756,33 +752,32 @@ impl TuiApp {
         if !self.is_working {
             return None;
         }
-        let frames = if is_tool_run_line(&self.working_message) {
-            ["▱", "▰", "▱", "▱"]
-        } else {
-            ["•", "◦", "•", "•"]
-        };
-        let spinner = frames[self.working_tick % frames.len()];
-        let prefix = format!("{spinner} ");
 
-        let suffix = format!(
-            " ({} • {} to interrupt)",
-            self.working_elapsed_label(),
-            self.interrupt_hint_label
-        );
-        let text = format!("{prefix}{}{}", self.working_message, suffix);
-        let message_char_len = self.working_message.chars().count();
-        let highlight_len = message_char_len.min(4);
-        let highlight_start = if message_char_len == 0 {
-            0
+        if self.status == "interrupting..." {
+            return Some(TranscriptLine::new(
+                "interrupting...".to_string(),
+                TranscriptLineKind::Working,
+            ));
+        }
+
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = frames[self.working_tick % frames.len()];
+        let stop_key = if self.interrupt_hint_label.starts_with("esc") {
+            "ESC".to_string()
         } else {
-            self.working_tick % message_char_len
+            self.interrupt_hint_label.to_ascii_uppercase()
         };
+        let prefix = format!("{spinner}  ");
+        let message = "Thinking...";
+        let suffix = format!("  (Press {stop_key} to stop)");
+        let text = format!("{prefix}{message}{suffix}");
+
         Some(TranscriptLine::new_working_with_marquee(
             text,
             prefix.chars().count(),
-            message_char_len,
-            highlight_start,
-            highlight_len,
+            message.chars().count(),
+            self.working_tick,
+            4,
         ))
     }
 
@@ -813,7 +808,7 @@ impl TuiApp {
                         }
                     } else {
                         self.transcript
-                            .push(TranscriptLine::new(line, TranscriptLineKind::Normal));
+                            .push(TranscriptLine::new(line, TranscriptLineKind::Assistant));
                     }
                 }
             }
@@ -838,7 +833,7 @@ impl TuiApp {
         if !self.assistant_stream_open {
             self.transcript.push(TranscriptLine::new(
                 String::new(),
-                TranscriptLineKind::Normal,
+                TranscriptLineKind::Assistant,
             ));
             self.assistant_stream_open = true;
         }
@@ -852,7 +847,7 @@ impl TuiApp {
         for part in parts {
             self.transcript.push(TranscriptLine::new(
                 part.to_string(),
-                TranscriptLineKind::Normal,
+                TranscriptLineKind::Assistant,
             ));
         }
     }
@@ -860,13 +855,13 @@ impl TuiApp {
 
 pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Result<(), String> {
     enable_raw_mode().map_err(|error| format!("enable raw mode failed: {error}"))?;
-    if options.enable_mouse_capture {
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
-            .map_err(|error| format!("enter alternate screen failed: {error}"))?;
+    let mouse_capture_enabled = if options.enable_mouse_capture {
+        execute!(io::stdout(), EnableMouseCapture)
+            .map_err(|error| format!("enable mouse capture failed: {error}"))?;
+        true
     } else {
-        execute!(io::stdout(), EnterAlternateScreen)
-            .map_err(|error| format!("enter alternate screen failed: {error}"))?;
-    }
+        false
+    };
 
     let keyboard_enhancement_enabled =
         if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -883,17 +878,11 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
 
     let mut _restore = TerminalRestore {
         keyboard_enhancement_enabled,
-        mouse_capture_enabled: options.enable_mouse_capture,
+        mouse_capture_enabled,
         bracketed_paste_enabled,
         selection_colors_applied: false,
+        alternate_screen_enabled: false,
     };
-
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-        .map_err(|error| format!("create terminal failed: {error}"))?;
-    terminal
-        .clear()
-        .map_err(|error| format!("clear terminal failed: {error}"))?;
-    _restore.selection_colors_applied = apply_selection_osc_colors(options.theme);
 
     let status = startup_status_label(backend);
     let mut app = TuiApp::new(status, options.show_tool_results, options.initial_help);
@@ -908,18 +897,42 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
             .map(|path| InputHistoryStore::new(path.clone(), options.input_history_limit)),
     );
     app.set_status_bar_meta(
-        options.status_top.clone(),
+        String::new(),
         options.status_left.clone(),
         options.status_right.clone(),
     );
-    app.push_lines(build_welcome_banner(&options));
+    app.set_welcome_lines(build_welcome_banner(&options));
+    persist_welcome_into_transcript(&mut app);
+
+    let mut fullscreen_init_error: Option<String> = None;
+    let mut terminal = match Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        default_terminal_options(),
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            fullscreen_init_error = Some(error.to_string());
+            Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|fallback_error| {
+                format!(
+                    "create terminal failed: {error}; fallback terminal failed: {fallback_error}"
+                )
+            })?
+        }
+    };
+    terminal
+        .clear()
+        .map_err(|error| format!("clear terminal failed: {error}"))?;
+    _restore.selection_colors_applied = apply_selection_osc_colors(options.theme);
+
+    if let Some(error) = fullscreen_init_error {
+        app.status = format!("fullscreen viewport unavailable: {error}");
+    }
 
     let mut events = EventStream::new();
     let mut needs_redraw = true;
     loop {
         if needs_redraw {
-            terminal
-                .draw(|frame| render_ui(frame, &app, &options))
+            draw_ui_frame(&mut terminal, &mut app, &options)
                 .map_err(|error| format!("draw UI failed: {error}"))?;
             needs_redraw = false;
         }
@@ -997,7 +1010,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     app.maybe_update_status_right_from_backend_status(&status);
                     status
                 }
-                Ok(None) => "only one model available".to_string(),
+                Ok(None) => "".to_string(),
                 Err(error) => format!("cycle model failed: {error}"),
             };
             continue;
@@ -1008,7 +1021,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     app.maybe_update_status_right_from_backend_status(&status);
                     status
                 }
-                Ok(None) => "only one model available".to_string(),
+                Ok(None) => "".to_string(),
                 Err(error) => format!("cycle model failed: {error}"),
             };
             continue;
@@ -1019,7 +1032,7 @@ pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Res
                     app.maybe_update_status_right_from_backend_status(&status);
                     status
                 }
-                Ok(None) => "no model selection candidates".to_string(),
+                Ok(None) => "".to_string(),
                 Err(error) => format!("select model failed: {error}"),
             };
             continue;
@@ -1296,6 +1309,7 @@ fn is_ctrl_only(modifiers: KeyModifiers) -> bool {
         && !modifiers.contains(KeyModifiers::SUPER)
 }
 
+#[cfg(test)]
 fn transcript_title(app_name: &str, version: &str) -> String {
     if version.trim().is_empty() {
         format!("Welcome to {app_name} Chat")
@@ -1308,8 +1322,14 @@ fn session_status_label(session_file: Option<PathBuf>) -> Option<String> {
     session_file.map(|path| format!("session: {}", path.display()))
 }
 
-fn startup_status_label<B: TuiBackend>(backend: &B) -> String {
-    session_status_label(backend.session_file()).unwrap_or_else(|| "ready".to_string())
+fn startup_status_label<B: TuiBackend>(_backend: &B) -> String {
+    "ready".to_string()
+}
+
+fn default_terminal_options() -> TerminalOptions {
+    TerminalOptions {
+        viewport: Viewport::Fullscreen,
+    }
 }
 
 fn query_session_status_label<B: TuiBackend>(backend: &B) -> String {
@@ -1320,59 +1340,52 @@ fn query_session_status_label<B: TuiBackend>(backend: &B) -> String {
 fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
     let kb = &options.keybindings;
 
-    let interrupt_label = keybinding_label_lower(&kb.interrupt);
-    let clear_label = keybinding_label_lower(&kb.clear);
-    let quit_label = keybinding_label_lower(&kb.quit);
-    let cycle_thinking_label = keybinding_label_lower(&kb.cycle_thinking_level);
-    let cycle_model_fwd = keybinding_label_lower(&kb.cycle_model_forward);
-    let cycle_model_bwd = keybinding_label_lower(&kb.cycle_model_backward);
-    let select_model_label = keybinding_label_lower(&kb.select_model);
-    let expand_tools_label = keybinding_label_lower(&kb.expand_tools);
-    let toggle_thinking_label = keybinding_label_lower(&kb.toggle_thinking);
-    let follow_up_label = keybinding_label_lower(&kb.continue_run);
-    let dequeue_label = keybinding_label_lower(&kb.dequeue);
-    let newline_label = keybinding_label_lower(&kb.newline);
+    let submit_label = keybinding_label_lower(&kb.submit).to_ascii_uppercase();
+    let interrupt_label = keybinding_label_lower(&kb.interrupt).to_ascii_uppercase();
 
-    let mut lines = vec![
-        String::new(),
-        format!(" {} to interrupt", interrupt_label),
-        format!(" {} to clear", clear_label),
-        format!(" {} twice to exit", clear_label),
-        format!(" {} to force exit", quit_label),
-        format!(" {} to cycle thinking level", cycle_thinking_label),
-        format!(" {}/{} to cycle models", cycle_model_fwd, cycle_model_bwd),
-        format!(" {} to select model", select_model_label),
-        format!(" {} to expand tools", expand_tools_label),
-        format!(" {} to expand thinking", toggle_thinking_label),
-        format!(" / for commands"),
-        format!(" {} to queue follow-up", follow_up_label),
-        format!(" {} to edit queued follow-ups", dequeue_label),
-        " ctrl+a/e: move cursor, ctrl+w/u: delete backward".to_string(),
-        format!(" {}: newline", newline_label),
-        history_navigation_help_line(options.enable_mouse_capture).to_string(),
-    ];
-
-    if !options.startup_resource_lines.is_empty() {
+    let mut lines = pixy_ascii_logo_lines(options.app_name.as_str());
+    if !options.version.trim().is_empty() {
         lines.push(String::new());
-        lines.extend(options.startup_resource_lines.iter().map(|line| {
-            if line.is_empty() {
-                String::new()
-            } else {
-                format!(" {line}")
-            }
-        }));
+        lines.push(format!("v{}", options.version.trim()));
+    }
+    lines.extend([
+        String::new(),
+        "You are standing in an open terminal. An AI awaits your commands.".to_string(),
+        String::new(),
+        format!("{submit_label} to send • \\ + ENTER for a new line • @ to mention files"),
+        String::new(),
+        format!("Current folder: {}", options.status_top),
+    ]);
+
+    let startup_lines = options
+        .startup_resource_lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.ends_with("SKILL.md"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !startup_lines.is_empty() {
+        lines.push(String::new());
+        lines.extend(startup_lines);
     }
 
-    lines.push(String::new());
+    let _ = interrupt_label;
     lines
 }
 
-fn history_navigation_help_line(enable_mouse_capture: bool) -> &'static str {
-    if enable_mouse_capture {
-        " up/down/mouse wheel: input history, pageup/pagedown: scroll messages"
-    } else {
-        " up/down: input history, pageup/pagedown: scroll messages"
+fn pixy_ascii_logo_lines(app_name: &str) -> Vec<String> {
+    if !app_name.eq_ignore_ascii_case("pixy") {
+        return vec![app_name.to_string()];
     }
+    vec![
+        "███████   ██  ██      ██  ██      ██".to_string(),
+        "██    ██  ██   ██    ██    ██    ██ ".to_string(),
+        "██    ██  ██    ██  ██      ██  ██  ".to_string(),
+        "███████   ██     ████        ████   ".to_string(),
+        "██        ██    ██  ██        ██    ".to_string(),
+        "██        ██   ██    ██       ██    ".to_string(),
+        "██        ██  ██      ██      ██    ".to_string(),
+    ]
 }
 
 fn history_navigation_help_panel_line(enable_mouse_capture: bool) -> &'static str {
@@ -1404,7 +1417,7 @@ fn primary_keybinding_label_lower(bindings: &[KeyBinding]) -> String {
 }
 
 fn format_user_input_line(input: &str, input_prompt: &str) -> String {
-    format!("{input_prompt}{input}")
+    format!("{input_prompt} {input}")
 }
 
 fn handle_paste_event(app: &mut TuiApp, pasted: String) {
@@ -1655,6 +1668,7 @@ async fn run_submitted_input<B: TuiBackend>(
 ) -> Result<(), String> {
     app.record_input_history(&display_input);
     app.scroll_transcript_to_latest();
+    persist_welcome_into_transcript(app);
 
     if blocks.is_none() && submitted_input == "/continue" {
         handle_continue_streaming(backend, terminal, app, options, events).await?;
@@ -1701,7 +1715,8 @@ async fn run_prompt_streaming<B: TuiBackend>(
 ) -> Result<(), String> {
     app.start_working(format!("{} is working...", options.app_name));
     app.status = format!("{} is working...", options.app_name);
-    let _ = terminal.draw(|frame| render_ui(frame, app, options));
+    app.status_left = "Auto (High) - allow all commands".to_string();
+    let _ = draw_ui_frame(terminal, app, options);
 
     let abort_controller = AgentAbortController::new();
     let mut interrupt_requested = false;
@@ -1742,7 +1757,7 @@ async fn run_prompt_streaming<B: TuiBackend>(
                         interrupt_requested = true;
                     }
                     if outcome.ui_changed {
-                        let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                        let _ = draw_ui_frame(terminal, app, options);
                     }
                 }
             }
@@ -1752,12 +1767,12 @@ async fn run_prompt_streaming<B: TuiBackend>(
                     app.note_working_from_update(&options.app_name, &update);
                     app.bump_working_tick();
                     app.apply_stream_update(update);
-                    let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                    let _ = draw_ui_frame(terminal, app, options);
                 }
             }
             _ = ticker.tick() => {
                 app.bump_working_tick();
-                let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                let _ = draw_ui_frame(terminal, app, options);
             }
             result = &mut stream_future => {
                 while let Ok(update) = update_rx.try_recv() {
@@ -1799,7 +1814,8 @@ async fn handle_continue_streaming<B: TuiBackend>(
 ) -> Result<(), String> {
     app.start_working(format!("{} is working...", options.app_name));
     app.status = format!("{} is working...", options.app_name);
-    let _ = terminal.draw(|frame| render_ui(frame, app, options));
+    app.status_left = "Auto (High) - allow all commands".to_string();
+    let _ = draw_ui_frame(terminal, app, options);
 
     let abort_controller = AgentAbortController::new();
     let mut interrupt_requested = false;
@@ -1836,7 +1852,7 @@ async fn handle_continue_streaming<B: TuiBackend>(
                         interrupt_requested = true;
                     }
                     if outcome.ui_changed {
-                        let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                        let _ = draw_ui_frame(terminal, app, options);
                     }
                 }
             }
@@ -1846,12 +1862,12 @@ async fn handle_continue_streaming<B: TuiBackend>(
                     app.note_working_from_update(&options.app_name, &update);
                     app.bump_working_tick();
                     app.apply_stream_update(update);
-                    let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                    let _ = draw_ui_frame(terminal, app, options);
                 }
             }
             _ = ticker.tick() => {
                 app.bump_working_tick();
-                let _ = terminal.draw(|frame| render_ui(frame, app, options));
+                let _ = draw_ui_frame(terminal, app, options);
             }
             result = &mut stream_future => {
                 while let Ok(update) = update_rx.try_recv() {
@@ -2050,33 +2066,110 @@ fn is_force_exit_signal(error: &str) -> bool {
     error == FORCE_EXIT_SIGNAL
 }
 
+fn draw_ui_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+    options: &TuiOptions,
+) -> io::Result<()> {
+    terminal.draw(|frame| render_ui(frame, app, options))?;
+    Ok(())
+}
+
+fn persist_welcome_into_transcript(app: &mut TuiApp) {
+    if app.welcome_lines.is_empty() || !app.transcript.is_empty() {
+        return;
+    }
+
+    for line in &app.welcome_lines {
+        app.transcript
+            .push(TranscriptLine::new(line.clone(), TranscriptLineKind::Overlay));
+    }
+    app.transcript
+        .push(TranscriptLine::new(String::new(), TranscriptLineKind::Overlay));
+    app.scroll_transcript_to_latest();
+}
+
+fn has_overlay_transcript_lines(lines: &[TranscriptLine]) -> bool {
+    lines.iter().any(|line| line.kind == TranscriptLineKind::Overlay)
+}
+
+fn ensure_bottom_status_separator(
+    mut lines: Vec<Line<'static>>,
+    target_height: usize,
+) -> Vec<Line<'static>> {
+    if target_height == 0 {
+        return vec![];
+    }
+
+    if lines.len() > target_height {
+        lines = lines[lines.len().saturating_sub(target_height)..].to_vec();
+    } else if lines.len() < target_height {
+        let mut padded = vec![Line::from(""); target_height.saturating_sub(lines.len())];
+        padded.extend(lines);
+        lines = padded;
+    }
+
+    let ends_with_blank = lines
+        .last()
+        .map(|line| line_text_for_status_separator(line).trim().is_empty())
+        .unwrap_or(false);
+    if ends_with_blank {
+        return lines;
+    }
+
+    if target_height == 1 {
+        return vec![Line::from("")];
+    }
+
+    if lines.len() == target_height {
+        lines.remove(0);
+    }
+    lines.push(Line::from(""));
+    if lines.len() > target_height {
+        lines = lines[lines.len().saturating_sub(target_height)..].to_vec();
+    }
+    lines
+}
+
+fn line_text_for_status_separator(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
 fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     let input_prompt = options.theme.input_prompt();
-    let footer_height = status_bar_height().min(frame.area().height.saturating_sub(1).max(1));
+    let total_status_height =
+        status_bar_height(app).min(frame.area().height.saturating_sub(1).max(1));
+    let status_top_height = total_status_height.saturating_sub(1);
+    let status_bottom_height = 1u16;
     let desired_steering_height = steering_panel_height(app);
     let steering_height = desired_steering_height.min(
         frame
             .area()
             .height
-            .saturating_sub(footer_height)
+            .saturating_sub(total_status_height)
             .saturating_sub(1),
     );
-    let reserved_height = footer_height.saturating_add(steering_height);
+    let reserved_height = total_status_height.saturating_add(steering_height);
     let input_height = input_area_height(app, frame.area(), input_prompt, reserved_height);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(steering_height),
+            Constraint::Length(status_top_height),
             Constraint::Length(input_height),
-            Constraint::Length(footer_height),
+            Constraint::Length(status_bottom_height),
         ])
         .split(frame.area());
 
     let transcript_area = areas[0];
     let steering_area = areas[1];
-    let input_area = areas[2];
-    let footer_area = areas[3];
+    let status_top_area = areas[2];
+    let input_area = areas[3];
+    let footer_area = areas[4];
 
     let visible_lines = visible_transcript_lines(
         &app.transcript,
@@ -2089,16 +2182,32 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         app.transcript_scroll_from_bottom,
         options.theme,
     );
-    let transcript = Paragraph::new(Text::from(visible_lines))
-        .block(
-            Block::default()
-                .borders(Borders::NONE)
-                .title(transcript_title(
-                    options.app_name.as_str(),
-                    options.version.as_str(),
-                )),
-        )
-        .style(options.theme.transcript_style());
+
+    let target_height = transcript_area.height as usize;
+    let mut lines = if visible_lines.len() > target_height {
+        visible_lines[visible_lines.len().saturating_sub(target_height)..].to_vec()
+    } else {
+        visible_lines
+    };
+
+    if lines.len() < target_height {
+        let missing = target_height.saturating_sub(lines.len());
+        if has_overlay_transcript_lines(&app.transcript) {
+            let top_padding = missing / 2;
+            let bottom_padding = missing.saturating_sub(top_padding);
+            let mut padded = vec![Line::from(""); top_padding];
+            padded.extend(lines);
+            padded.extend(vec![Line::from(""); bottom_padding]);
+            lines = padded;
+        } else {
+            let mut padded = vec![Line::from(""); missing];
+            padded.extend(lines);
+            lines = padded;
+        }
+    }
+    lines = ensure_bottom_status_separator(lines, target_height);
+
+    let transcript = Paragraph::new(Text::from(lines)).style(options.theme.transcript_style());
     frame.render_widget(transcript, transcript_area);
 
     if steering_height > 0 {
@@ -2110,12 +2219,21 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         frame.render_widget(steering, steering_area);
     }
 
+    let full_status = render_status_bar_lines(app, status_top_area.width as usize, options.theme);
+    let mut status_lines = full_status.lines;
+    let bottom_line = status_lines.pop().unwrap_or_else(|| Line::from(""));
+    let status_top = Paragraph::new(Text::from(status_lines))
+        .style(options.theme.footer_style())
+        .wrap(Wrap { trim: false });
+    frame.render_widget(status_top, status_top_area);
+
     let input_scroll = input_scroll_offset(app, input_area, input_prompt);
-    let input_text = format!("{input_prompt}{}", app.input);
+    let input_text = format!("{INPUT_RENDER_LEFT_PADDING}{input_prompt}{}", app.input);
     let input = Paragraph::new(input_text)
         .block(
             Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(options.theme.input_border_style()),
         )
         .wrap(Wrap { trim: false })
@@ -2128,8 +2246,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    let footer = Paragraph::new(render_status_bar_lines(app, footer_area.width as usize))
-        .style(options.theme.footer_style());
+    let footer = Paragraph::new(Text::from(vec![bottom_line])).style(options.theme.footer_style());
     frame.render_widget(footer, footer_area);
 
     if app.show_help {
@@ -2271,13 +2388,13 @@ fn input_scroll_offset(app: &TuiApp, input_area: Rect, input_prompt: &str) -> u1
 }
 
 fn input_cursor_layout(app: &TuiApp, input_area: Rect, input_prompt: &str) -> (u16, u16, u16) {
-    let inner_width = input_area.width as usize;
+    let inner_width = input_area.width.saturating_sub(2) as usize;
     let inner_height = input_area.height.saturating_sub(2) as usize;
     if inner_width == 0 || inner_height == 0 {
         let fallback_y = input_area
             .y
             .saturating_add(input_area.height.saturating_sub(1));
-        return (input_area.x, fallback_y, 0);
+        return (input_area.x.saturating_add(1), fallback_y, 0);
     }
 
     let (row, col) = input_cursor_row_col(
@@ -2291,8 +2408,11 @@ fn input_cursor_layout(app: &TuiApp, input_area: Rect, input_prompt: &str) -> (u
         .saturating_sub(scroll)
         .min(inner_height.saturating_sub(1));
 
-    let max_x_offset = input_area.width.saturating_sub(1);
-    let x = input_area.x.saturating_add((col as u16).min(max_x_offset));
+    let max_x_offset = input_area.width.saturating_sub(2);
+    let x = input_area
+        .x
+        .saturating_add(1)
+        .saturating_add((col as u16).min(max_x_offset));
 
     let y_base = input_area.y.saturating_add(1);
     let max_y_offset = input_area.height.saturating_sub(2);
@@ -2338,6 +2458,9 @@ fn input_cursor_row_col(
     let mut row = 0usize;
     let mut col = 0usize;
 
+    for ch in INPUT_RENDER_LEFT_PADDING.chars() {
+        advance_cursor_row_col(&mut row, &mut col, ch, max_width);
+    }
     for ch in input_prompt.chars() {
         advance_cursor_row_col(&mut row, &mut col, ch, max_width);
     }
@@ -2349,45 +2472,85 @@ fn input_cursor_row_col(
 }
 
 fn input_area_height(
-    app: &TuiApp,
+    _app: &TuiApp,
     frame_area: Rect,
-    input_prompt: &str,
+    _input_prompt: &str,
     footer_height: u16,
 ) -> u16 {
-    // Input block has top+bottom borders only.
-    let inner_width = frame_area.width as usize;
-    let display_input = format!("{input_prompt}{}", app.input);
-    let line_count = wrap_text_by_display_width(display_input.as_str(), inner_width)
-        .len()
-        .max(1);
-    let desired_height = line_count.saturating_add(2) as u16;
-
     let max_height = frame_area.height.saturating_sub(footer_height).max(1);
-    let min_height = 3u16.min(max_height);
-    desired_height.max(min_height).min(max_height)
+    let desired = INPUT_AREA_FIXED_HEIGHT.max(3);
+    desired.min(max_height)
 }
 
-fn status_bar_height() -> u16 {
-    2
+fn status_bar_height(app: &TuiApp) -> u16 {
+    let status = app.status_for_render();
+    let has_top = if app.status_top.is_empty() {
+        !status.is_empty() && status != "ok" && status != "ready" && !app.is_working
+    } else {
+        true
+    };
+
+    let mut lines = 3u16;
+    if has_top {
+        lines = lines.saturating_add(1);
+    }
+    lines
 }
 
 fn steering_panel_height(app: &TuiApp) -> u16 {
     app.steering_status_lines().len().min(u16::MAX as usize) as u16
 }
 
-fn render_status_bar_lines(app: &TuiApp, width: usize) -> Text<'static> {
+fn render_status_bar_lines(app: &TuiApp, width: usize, theme: TuiTheme) -> Text<'static> {
     let status = app.status_for_render();
-    let mut top = if app.status_top.is_empty() {
-        status.clone()
+
+    let top = if app.status_top.is_empty() {
+        if !status.is_empty() && status != "ok" && status != "ready" && !app.is_working {
+            status.clone()
+        } else {
+            String::new()
+        }
+    } else if !status.is_empty() && status != "ok" && status != "ready" && !app.is_working {
+        format!("{} | {status}", app.status_top)
     } else {
         app.status_top.clone()
     };
-    if !app.status_top.is_empty() && !status.is_empty() && status != "ok" {
-        top = format!("{top} | {status}");
+
+    let mut lines = Vec::new();
+    if !top.is_empty() {
+        lines.push(Line::from(top));
     }
-    let bottom =
-        compose_left_right_status_line(app.status_left.as_str(), app.status_right.as_str(), width);
-    Text::from(vec![Line::from(top), Line::from(bottom)])
+
+    lines.push(compose_left_right_status_line_with_styles(
+        format!(" {}", app.status_left).as_str(),
+        app.status_right.as_str(),
+        width,
+        theme.status_primary_left_style(),
+        theme.status_primary_right_style(),
+    ));
+
+    lines.push(compose_left_right_status_line_with_styles(
+        format!(" {}", STATUS_HINT_LEFT).as_str(),
+        STATUS_HINT_RIGHT,
+        width,
+        theme.status_hint_style(),
+        theme.status_hint_style(),
+    ));
+
+    let bottom_left = if app.is_working {
+        format!(" [⏱ {}]? for help", app.working_elapsed_label())
+    } else {
+        " ? for help".to_string()
+    };
+    lines.push(compose_left_right_status_line_with_styles(
+        bottom_left.as_str(),
+        "IDE ◌",
+        width,
+        theme.status_hint_style(),
+        theme.status_help_right_style(),
+    ));
+
+    Text::from(lines)
 }
 
 fn render_steering_panel_lines(app: &TuiApp, width: usize) -> Text<'static> {
@@ -2412,22 +2575,36 @@ fn right_align_status_line(line: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(width - line_width), line)
 }
 
-fn compose_left_right_status_line(left: &str, right: &str, width: usize) -> String {
+fn compose_left_right_status_line_with_styles(
+    left: &str,
+    right: &str,
+    width: usize,
+    left_style: Style,
+    right_style: Style,
+) -> Line<'static> {
     if width == 0 {
-        return String::new();
+        return Line::from(Vec::<Span>::new());
     }
 
     let left_width = UnicodeWidthStr::width(left);
     let right_width = UnicodeWidthStr::width(right);
     if left_width + right_width >= width {
         if left_width >= width {
-            return left.to_string();
+            return Line::from(vec![Span::styled(left.to_string(), left_style)]);
         }
-        return format!("{left} {right}");
+        return Line::from(vec![
+            Span::styled(left.to_string(), left_style),
+            Span::raw(" "),
+            Span::styled(right.to_string(), right_style),
+        ]);
     }
 
     let gap = width.saturating_sub(left_width + right_width);
-    format!("{left}{}{right}", " ".repeat(gap))
+    Line::from(vec![
+        Span::styled(left.to_string(), left_style),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right.to_string(), right_style),
+    ])
 }
 
 fn matches_keybinding(bindings: &[KeyBinding], key: KeyEvent) -> bool {
@@ -2733,6 +2910,7 @@ struct TerminalRestore {
     mouse_capture_enabled: bool,
     bracketed_paste_enabled: bool,
     selection_colors_applied: bool,
+    alternate_screen_enabled: bool,
 }
 
 impl Drop for TerminalRestore {
@@ -2750,7 +2928,9 @@ impl Drop for TerminalRestore {
         if self.mouse_capture_enabled {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if self.alternate_screen_enabled {
+            let _ = execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        }
     }
 }
 

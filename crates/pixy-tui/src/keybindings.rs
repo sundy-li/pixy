@@ -174,11 +174,11 @@ impl Default for TuiKeyBindings {
                 modifiers: KeyModifiers::SHIFT,
             }],
             cycle_model_forward: vec![KeyBinding {
-                code: KeyCode::Char('p'),
+                code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL,
             }],
             cycle_model_backward: vec![KeyBinding {
-                code: KeyCode::Char('p'),
+                code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             }],
             select_model: vec![KeyBinding {

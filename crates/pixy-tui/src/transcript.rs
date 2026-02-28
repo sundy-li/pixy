@@ -1,5 +1,5 @@
 use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -9,6 +9,8 @@ use crate::keybindings::parse_key_id;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptLineKind {
     Normal,
+    Assistant,
+    Overlay,
     Code,
     UserInput,
     Thinking,
@@ -18,6 +20,7 @@ pub(crate) enum TranscriptLineKind {
 
 const TOOL_COMPACTION_HEAD_LINES: usize = 2;
 const TOOL_COMPACTION_TAIL_LINES: usize = 1;
+const ASSISTANT_OUTPUT_PREFIX: &str = "⛬  ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TranscriptLine {
@@ -154,6 +157,11 @@ impl TranscriptLine {
             );
         }
 
+        if matches!(self.kind, TranscriptLineKind::Overlay) {
+            let text_style = overlay_welcome_style(self.text.as_str(), base, theme);
+            return centered_line_with_padding(self.text.as_str(), width, text_style, base);
+        }
+
         let spans = highlighted_spans(
             self.text.as_str(),
             base,
@@ -165,6 +173,26 @@ impl TranscriptLine {
         );
         line_with_padding(spans, width, base)
     }
+}
+
+fn overlay_welcome_style(text: &str, base: Style, theme: TuiTheme) -> Style {
+    let trimmed = text.trim();
+    if trimmed.contains('█') {
+        return match theme {
+            TuiTheme::Dark => base
+                .fg(Color::Rgb(236, 236, 236))
+                .add_modifier(Modifier::BOLD),
+            TuiTheme::Light => base
+                .fg(Color::Rgb(20, 20, 20))
+                .add_modifier(Modifier::BOLD),
+        };
+    }
+
+    if trimmed.starts_with('v') {
+        return base.fg(Color::DarkGray);
+    }
+
+    base
 }
 
 fn apply_markdown_line_style(base: Style, line_style: &MarkdownLineStyle) -> Style {
@@ -254,6 +282,33 @@ fn line_with_padding(mut spans: Vec<Span<'static>>, width: usize, style: Style) 
         .sum::<usize>();
     if text_width < width {
         spans.push(Span::styled(" ".repeat(width - text_width), style));
+    }
+    Line::from(spans)
+}
+
+fn centered_line_with_padding(
+    text: &str,
+    width: usize,
+    text_style: Style,
+    padding_style: Style,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::from(vec![Span::styled(text.to_string(), text_style)]);
+    }
+    let text_width = UnicodeWidthStr::width(text);
+    if text_width >= width {
+        return line_with_padding(vec![Span::styled(text.to_string(), text_style)], width, text_style);
+    }
+
+    let left_padding = (width - text_width) / 2;
+    let right_padding = width - left_padding - text_width;
+    let mut spans = Vec::with_capacity(3);
+    if left_padding > 0 {
+        spans.push(Span::styled(" ".repeat(left_padding), padding_style));
+    }
+    spans.push(Span::styled(text.to_string(), text_style));
+    if right_padding > 0 {
+        spans.push(Span::styled(" ".repeat(right_padding), padding_style));
     }
     Line::from(spans)
 }
@@ -1040,7 +1095,7 @@ fn render_markdown(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
 fn supports_markdown_render(kind: TranscriptLineKind) -> bool {
     matches!(
         kind,
-        TranscriptLineKind::Normal | TranscriptLineKind::UserInput
+        TranscriptLineKind::Normal | TranscriptLineKind::Assistant | TranscriptLineKind::UserInput
     )
 }
 
@@ -1061,6 +1116,12 @@ fn render_markdown_structural_line(line: &TranscriptLine) -> Option<TranscriptLi
         .sum::<usize>();
     let trimmed = line.text.trim_start();
     if trimmed.is_empty() {
+        return None;
+    }
+
+    if matches!(line.kind, TranscriptLineKind::UserInput)
+        && looks_like_prompt_prefixed_user_input(trimmed)
+    {
         return None;
     }
 
@@ -1093,6 +1154,10 @@ fn render_markdown_structural_line(line: &TranscriptLine) -> Option<TranscriptLi
     }
 
     None
+}
+
+fn looks_like_prompt_prefixed_user_input(trimmed: &str) -> bool {
+    trimmed.starts_with(">  ")
 }
 
 fn parse_markdown_heading(line: &str) -> Option<String> {
@@ -1543,6 +1608,8 @@ pub(crate) fn visible_transcript_lines(
         .iter()
         .filter(|line| match line.kind {
             TranscriptLineKind::Normal => true,
+            TranscriptLineKind::Assistant => true,
+            TranscriptLineKind::Overlay => true,
             TranscriptLineKind::Code => true,
             TranscriptLineKind::UserInput => true,
             TranscriptLineKind::Thinking => show_thinking,
@@ -1562,14 +1629,52 @@ pub(crate) fn visible_transcript_lines(
     let compacted = compact_tool_transcript_lines(&markdown_rendered);
     let spaced = pad_transcript_block_boundaries(&compacted);
     let wrapped = wrap_transcript_lines(&spaced, max_width);
-    let max_scroll = wrapped.len().saturating_sub(max_lines);
+    let prefixed = decorate_assistant_output_prefix(&wrapped);
+    let max_scroll = prefixed.len().saturating_sub(max_lines);
     let scroll = scroll_from_bottom.min(max_scroll);
-    let end = wrapped.len().saturating_sub(scroll);
+    let end = prefixed.len().saturating_sub(scroll);
     let start = end.saturating_sub(max_lines);
-    wrapped[start..end]
+    prefixed[start..end]
         .iter()
         .map(|line| line.to_line(max_width, theme))
         .collect()
+}
+
+fn decorate_assistant_output_prefix(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
+    let mut decorated = Vec::with_capacity(lines.len());
+    let mut should_prefix_current_block = true;
+
+    for line in lines {
+        if line.kind != TranscriptLineKind::Assistant {
+            should_prefix_current_block = true;
+            decorated.push(line.clone());
+            continue;
+        }
+
+        let mut decorated_line = line.clone();
+        if should_prefix_current_block
+            && should_prefix_assistant_output_line(decorated_line.text.as_str())
+            && !decorated_line.text.starts_with(ASSISTANT_OUTPUT_PREFIX)
+        {
+            decorated_line.text = format_assistant_output_line(decorated_line.text.as_str());
+            should_prefix_current_block = false;
+        }
+        decorated.push(decorated_line);
+    }
+
+    decorated
+}
+
+fn format_assistant_output_line(line: &str) -> String {
+    format!("{ASSISTANT_OUTPUT_PREFIX}{line}")
+}
+
+fn should_prefix_assistant_output_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !trimmed.starts_with(['┌', '├', '│', '└'])
 }
 
 fn wrap_transcript_lines(lines: &[TranscriptLine], max_width: usize) -> Vec<TranscriptLine> {
@@ -1815,7 +1920,7 @@ pub(crate) fn render_messages(messages: &[Message]) -> Vec<TranscriptLine> {
                             if !text.trim().is_empty() {
                                 lines.push(TranscriptLine::new(
                                     text.clone(),
-                                    TranscriptLineKind::Normal,
+                                    TranscriptLineKind::Assistant,
                                 ));
                             }
                         }
@@ -1834,7 +1939,7 @@ pub(crate) fn render_messages(messages: &[Message]) -> Vec<TranscriptLine> {
                     if let Some(error) = error_message {
                         lines.push(TranscriptLine::new(
                             format!("[assistant_{}] {error}", stop_reason_label(stop_reason)),
-                            TranscriptLineKind::Normal,
+                            TranscriptLineKind::Assistant,
                         ));
                     }
                 }

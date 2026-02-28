@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pixy_ai::{Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Model};
 use serde::Deserialize;
 
-use crate::{LoadSkillsOptions, Skill, SkillDiagnostic, load_skills};
+use crate::{
+    DeclarativeHookSpec, LoadSkillsOptions, Skill, SkillDiagnostic, SubAgentMode, SubAgentSpec,
+    load_skills,
+};
 
 const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
 
@@ -90,7 +93,7 @@ impl RuntimeLoadOptions {
         } else {
             String::new()
         };
-        let mut local = load_agent_local_config_from_toml(&content)?;
+        let mut local = load_agent_local_config_from_toml_with_base_dir(&content, &conf_dir)?;
         let runtime = RuntimeConfigResolver::new(&self.overrides, &local, router_seed)
             .resolve_runtime_config_with_seed()?;
 
@@ -113,6 +116,12 @@ impl RuntimeLoadOptions {
             model: runtime.model,
             model_catalog: runtime.model_catalog,
             api_key: runtime.api_key,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: local.multi_agent.enabled,
+                agents: local.multi_agent.agents.clone(),
+                plugin_paths: local.multi_agent.plugin_paths.clone(),
+                hooks: local.multi_agent.hooks.clone(),
+            },
             skills,
             skill_diagnostics,
             theme: local.settings.theme.take(),
@@ -129,7 +138,7 @@ impl RuntimeLoadOptions {
         content: &str,
         router_seed: u64,
     ) -> Result<ResolvedRuntime, String> {
-        let mut local = load_agent_local_config_from_toml(content)?;
+        let mut local = load_agent_local_config_from_toml_with_base_dir(content, cwd)?;
         let runtime = RuntimeConfigResolver::new(&self.overrides, &local, router_seed)
             .resolve_runtime_config_with_seed()?;
 
@@ -153,6 +162,12 @@ impl RuntimeLoadOptions {
             model: runtime.model,
             model_catalog: runtime.model_catalog,
             api_key: runtime.api_key,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: local.multi_agent.enabled,
+                agents: local.multi_agent.agents.clone(),
+                plugin_paths: local.multi_agent.plugin_paths.clone(),
+                hooks: local.multi_agent.hooks.clone(),
+            },
             skills,
             skill_diagnostics,
             theme: local.settings.theme.take(),
@@ -169,10 +184,19 @@ pub struct ResolvedRuntime {
     pub model: Model,
     pub model_catalog: Vec<Model>,
     pub api_key: Option<String>,
+    pub multi_agent: ResolvedMultiAgentConfig,
     pub skills: Vec<Skill>,
     pub skill_diagnostics: Vec<SkillDiagnostic>,
     pub theme: Option<String>,
     pub transport_retry_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedMultiAgentConfig {
+    pub enabled: bool,
+    pub agents: Vec<SubAgentSpec>,
+    pub plugin_paths: Vec<PathBuf>,
+    pub hooks: Vec<DeclarativeHookSpec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,6 +206,14 @@ struct AgentSettingsFile {
     transport_retry_count: Option<usize>,
     skills: Vec<String>,
     env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MultiAgentLocalConfig {
+    enabled: bool,
+    agents: Vec<SubAgentSpec>,
+    plugin_paths: Vec<PathBuf>,
+    hooks: Vec<DeclarativeHookSpec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +237,7 @@ struct ProviderConfig {
 struct AgentLocalConfig {
     settings: AgentSettingsFile,
     models: ModelsFile,
+    multi_agent: MultiAgentLocalConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +321,8 @@ struct ProviderModelConfig {
 struct PixyTomlFile {
     #[serde(default)]
     llm: PixyTomlLlm,
+    #[serde(default)]
+    multi_agent: PixyTomlMultiAgent,
     theme: Option<String>,
     #[serde(default)]
     transport_retry_count: Option<usize>,
@@ -303,6 +338,33 @@ struct PixyTomlLlm {
     default_provider: Option<String>,
     #[serde(default)]
     providers: Vec<PixyTomlProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlMultiAgent {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    agents: Vec<PixyTomlSubAgent>,
+    #[serde(default)]
+    plugins: Vec<PixyTomlMultiAgentPlugin>,
+    #[serde(default)]
+    hooks: Vec<DeclarativeHookSpec>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlSubAgent {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    mode: Option<SubAgentMode>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PixyTomlMultiAgentPlugin {
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -336,17 +398,21 @@ fn default_provider_weight() -> u8 {
     1
 }
 
-fn load_agent_local_config_from_toml(content: &str) -> Result<AgentLocalConfig, String> {
+fn load_agent_local_config_from_toml_with_base_dir(
+    content: &str,
+    base_dir: &Path,
+) -> Result<AgentLocalConfig, String> {
     let config = if content.trim().is_empty() {
         PixyTomlFile::default()
     } else {
         toml::from_str::<PixyTomlFile>(content)
             .map_err(|error| format!("parse pixy.toml failed: {error}"))?
     };
-    Ok(convert_pixy_toml_to_local_config(config))
+    Ok(convert_pixy_toml_to_local_config(config, base_dir))
 }
 
-fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
+fn convert_pixy_toml_to_local_config(config: PixyTomlFile, base_dir: &Path) -> AgentLocalConfig {
+    let env_map = config.env.clone();
     let mut providers = HashMap::new();
     for provider in config.llm.providers {
         if provider.name.trim().is_empty() {
@@ -387,15 +453,65 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile) -> AgentLocalConfig {
         providers.insert(provider_key, provider_config);
     }
 
+    let mut multi_agent_specs = Vec::new();
+    for agent in config.multi_agent.agents {
+        let name = agent.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let description = agent
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Configured subagent");
+        let spec = SubAgentSpec {
+            name: name.to_string(),
+            description: description.to_string(),
+            mode: agent.mode.unwrap_or(SubAgentMode::SubAgent),
+        };
+        if spec.validate().is_ok() {
+            multi_agent_specs.push(spec);
+        }
+    }
+
+    let mut plugin_paths = Vec::new();
+    for plugin in config.multi_agent.plugins {
+        let Some(raw_path) = resolve_config_value(&plugin.path, &env_map) else {
+            continue;
+        };
+        let path = PathBuf::from(raw_path);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        };
+        if !resolved.exists() {
+            eprintln!(
+                "warning: configured multi-agent plugin manifest path does not exist yet: {}",
+                resolved.display()
+            );
+        }
+        plugin_paths.push(resolved);
+    }
+
+    let hook_specs = config.multi_agent.hooks;
+
     AgentLocalConfig {
         settings: AgentSettingsFile {
             default_provider: config.llm.default_provider,
             theme: config.theme,
             transport_retry_count: config.transport_retry_count,
             skills: config.skills,
-            env: config.env,
+            env: env_map,
         },
         models: ModelsFile { providers },
+        multi_agent: MultiAgentLocalConfig {
+            enabled: config.multi_agent.enabled,
+            agents: multi_agent_specs,
+            plugin_paths,
+            hooks: hook_specs,
+        },
     }
 }
 
@@ -949,6 +1065,176 @@ weight = 1
         assert_eq!(resolved.transport_retry_count, 7);
         assert_eq!(resolved.theme.as_deref(), Some("light"));
         assert!(resolved.skills.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_parses_multi_agent_agents() {
+        let content = r#"
+[multi_agent]
+enabled = true
+
+[[multi_agent.agents]]
+name = "general"
+description = "General coding helper"
+mode = "subagent"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(resolved.multi_agent.enabled);
+        assert_eq!(resolved.multi_agent.agents.len(), 1);
+        assert_eq!(resolved.multi_agent.agents[0].name, "general");
+        assert_eq!(resolved.multi_agent.agents[0].mode, SubAgentMode::SubAgent);
+        assert!(resolved.multi_agent.hooks.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_parses_multi_agent_plugin_paths() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let content = r#"
+[multi_agent]
+enabled = true
+
+[[multi_agent.plugins]]
+path = "plugins/basic-plugin.toml"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(cwd, content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.multi_agent.plugin_paths.len(), 1);
+        assert_eq!(
+            resolved.multi_agent.plugin_paths[0],
+            cwd.join("plugins/basic-plugin.toml")
+        );
+        assert!(resolved.multi_agent.hooks.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_defaults_multi_agent_to_disabled() {
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(!resolved.multi_agent.enabled);
+        assert!(resolved.multi_agent.agents.is_empty());
+        assert!(resolved.multi_agent.plugin_paths.is_empty());
+        assert!(resolved.multi_agent.hooks.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_parses_multi_agent_hooks() {
+        let content = r#"
+[multi_agent]
+enabled = true
+
+[[multi_agent.agents]]
+name = "general"
+description = "General coding helper"
+mode = "subagent"
+
+[[multi_agent.hooks]]
+name = "route-review"
+stage = "before_task_dispatch"
+prompt_contains = "review"
+
+[[multi_agent.hooks.actions]]
+type = "route_to"
+subagent = "review"
+
+[[multi_agent.hooks]]
+name = "append-bash-output"
+stage = "after_task_result"
+subagent = "review"
+
+[[multi_agent.hooks.actions]]
+type = "bash"
+command = "printf HOOK"
+field = "output.summary"
+append = true
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.multi_agent.hooks.len(), 2);
+        assert_eq!(resolved.multi_agent.hooks[0].name, "route-review");
+        assert_eq!(
+            resolved.multi_agent.hooks[0].stage,
+            crate::DeclarativeHookStage::BeforeTaskDispatch
+        );
+        assert_eq!(resolved.multi_agent.hooks[1].name, "append-bash-output");
+        assert_eq!(
+            resolved.multi_agent.hooks[1].stage,
+            crate::DeclarativeHookStage::AfterTaskResult
+        );
     }
 
     #[test]

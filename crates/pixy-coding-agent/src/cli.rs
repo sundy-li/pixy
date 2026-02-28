@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use crate::cli_app::{
     CliSession, CliSessionFactory, CliSessionRequest, ReplCommand, ReplCommandParser,
 };
-use crate::{AgentSession, AgentSessionStreamUpdate, RuntimeOverrides, Skill, SkillSource};
+use crate::{AgentSession, AgentSessionStreamUpdate, RuntimeOverrides, Skill};
 use clap::{Args, Parser, Subcommand};
 use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
 use pixy_tui::{KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme, parse_key_id};
@@ -15,6 +15,8 @@ use serde::Deserialize;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(test)]
+use crate::SkillSource;
 #[cfg(test)]
 use crate::{LoadSkillsOptions, RuntimeLoadOptions, load_skills};
 #[cfg(test)]
@@ -428,13 +430,6 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         session_factory.create_session(&session_request, &cwd, &agent_dir, &session_dir)?;
     let runtime = session.runtime().clone();
     pixy_ai::set_transport_retry_count(runtime.transport_retry_count);
-    for diagnostic in &runtime.skill_diagnostics {
-        eprintln!(
-            "warning: skill {}: {}",
-            diagnostic.path.display(),
-            diagnostic.message
-        );
-    }
     let runtime_model = runtime.model.clone();
     let discovered_skills = runtime.skills.clone();
     let use_tui = args.prompt.is_none() && !args.no_tui;
@@ -462,11 +457,12 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         let theme = TuiTheme::from_name(theme_name.as_str())
             .ok_or_else(|| format!("unsupported theme '{theme_name}', expected dark or light"))?;
         let status_top = build_status_top_line(&cwd);
-        let status_left = format!(
-            "0.0%/{} (auto)",
-            format_token_window(runtime_model.context_window)
+        let status_left = "Auto (High) - allow all commands".to_string();
+        let status_right = format_status_model_label(
+            runtime_model.name.as_str(),
+            runtime_model.id.as_str(),
+            runtime_model.reasoning,
         );
-        let status_right = format!("{} • medium", runtime_model.id);
         let enable_mouse_capture = std::env::var("PI_TUI_MOUSE_CAPTURE")
             .map(|value| {
                 matches!(
@@ -480,7 +476,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         let mut tui_options = TuiOptions {
             app_name: "pixy".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            show_tool_results: !args.hide_tool_results,
+            show_tool_results: false,
             status_top,
             status_left,
             status_right,
@@ -515,153 +511,50 @@ async fn run(args: ChatArgs) -> Result<(), String> {
 }
 
 fn build_status_top_line(cwd: &Path) -> String {
-    if let Some(branch) = detect_git_branch(cwd) {
-        format!("{} ({branch})", cwd.display())
-    } else {
-        cwd.display().to_string()
-    }
+    cwd.display().to_string()
 }
 
-fn detect_git_branch(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn format_status_model_label(model_name: &str, model: &str, _reasoning: bool) -> String {
+    let model_name = model_name.trim();
+    if !model_name.is_empty() && !model_name.eq_ignore_ascii_case(model) {
+        return format!("{model_name} [custom]");
     }
-    let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if branch.is_empty() || branch == "HEAD" {
-        None
-    } else {
-        Some(branch)
-    }
-}
 
-fn format_token_window(value: u32) -> String {
-    if value >= 1_000 {
-        if value % 1_000 == 0 {
-            return format!("{}k", value / 1_000);
+    if model.eq_ignore_ascii_case("gpt-5.3-codex") {
+        return "Databend GPT-5.3 Codex [custom]".to_string();
+    }
+
+    let mut parts = model.split('-').collect::<Vec<_>>();
+    if parts.is_empty() {
+        return model.to_string();
+    }
+
+    if parts[0].eq_ignore_ascii_case("gpt") && parts.len() >= 2 {
+        let version = parts[1];
+        let suffix = parts
+            .drain(2..)
+            .map(|part| {
+                if part.eq_ignore_ascii_case("codex") {
+                    "Codex".to_string()
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        if suffix.is_empty() {
+            return format!("GPT-{version}");
         }
-        let formatted = format!("{:.1}", value as f64 / 1_000.0);
-        format!("{}k", formatted.trim_end_matches('0').trim_end_matches('.'))
-    } else {
-        value.to_string()
+        return format!("GPT-{version} {}", suffix.join(" "));
     }
+
+    model.to_string()
 }
 
 fn build_startup_resource_lines(cwd: &Path, agent_dir: &Path, skills: &[Skill]) -> Vec<String> {
-    let mut lines = vec![];
-    let contexts = collect_startup_context_files(cwd, agent_dir);
-    if !contexts.is_empty() {
-        lines.push("[Context]".to_string());
-        lines.extend(
-            contexts
-                .iter()
-                .map(|path| format!("  {}", format_display_path(path))),
-        );
-    }
-
-    let mut user_skills = vec![];
-    let mut project_skills = vec![];
-    let mut path_skills = vec![];
-    for skill in skills {
-        let rendered = format_display_path(&skill.file_path);
-        match skill.source {
-            SkillSource::User => user_skills.push(rendered),
-            SkillSource::Project => project_skills.push(rendered),
-            SkillSource::Path => path_skills.push(rendered),
-        }
-    }
-
-    for group in [&mut user_skills, &mut project_skills, &mut path_skills] {
-        group.sort();
-        group.dedup();
-    }
-
-    let has_skills =
-        !user_skills.is_empty() || !project_skills.is_empty() || !path_skills.is_empty();
-    if has_skills {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push("[Skills]".to_string());
-        append_skill_group(&mut lines, "user", &user_skills);
-        append_skill_group(&mut lines, "project", &project_skills);
-        append_skill_group(&mut lines, "path", &path_skills);
-    }
-
-    lines
-}
-
-fn append_skill_group(lines: &mut Vec<String>, label: &str, values: &[String]) {
-    if values.is_empty() {
-        return;
-    }
-    lines.push(format!("  {label}"));
-    lines.extend(values.iter().map(|value| format!("    {value}")));
-}
-
-fn collect_startup_context_files(cwd: &Path, agent_dir: &Path) -> Vec<PathBuf> {
-    let mut contexts = vec![];
-    let mut seen = HashSet::<PathBuf>::new();
-
-    if let Some(global_context) = find_context_file_in_dir(agent_dir) {
-        push_unique_path(&mut contexts, &mut seen, global_context);
-    }
-
-    let mut ancestor_contexts = vec![];
-    let mut current = cwd.to_path_buf();
-    loop {
-        if let Some(context_file) = find_context_file_in_dir(&current) {
-            push_unique_path(&mut ancestor_contexts, &mut seen, context_file);
-        }
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        if parent == current {
-            break;
-        }
-        current = parent.to_path_buf();
-    }
-    ancestor_contexts.reverse();
-    contexts.extend(ancestor_contexts);
-
-    contexts
-}
-
-fn push_unique_path(out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
-    let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    if seen.insert(key) {
-        out.push(path);
-    }
-}
-
-fn find_context_file_in_dir(dir: &Path) -> Option<PathBuf> {
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn format_display_path(path: &Path) -> String {
-    let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return path.display().to_string();
-    };
-    let Ok(stripped) = path.strip_prefix(&home_dir) else {
-        return path.display().to_string();
-    };
-    if stripped.as_os_str().is_empty() {
-        "~".to_string()
-    } else {
-        format!("~/{}", stripped.display())
-    }
+    let _ = cwd;
+    let _ = agent_dir;
+    let _ = skills;
+    vec![]
 }
 
 #[cfg(test)]
@@ -677,13 +570,6 @@ fn load_runtime_skills(
     options.skill_paths.extend(args.skills.clone());
 
     let result = load_skills(options);
-    for diagnostic in &result.diagnostics {
-        eprintln!(
-            "warning: skill {}: {}",
-            diagnostic.path.display(),
-            diagnostic.message
-        );
-    }
     result.skills
 }
 
@@ -3815,77 +3701,50 @@ description: default discovered skill
     }
 
     #[test]
-    fn collect_startup_context_files_prefers_agents_and_orders_scopes() {
-        let dir = tempdir().expect("temp dir");
-        let agent_dir = dir.path().join(".pixy/agent");
-        let project_root = dir.path().join("repo");
-        let nested = project_root.join("nested/workspace");
-        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        std::fs::create_dir_all(&nested).expect("create nested dir");
-
-        std::fs::write(agent_dir.join("AGENTS.md"), "global").expect("write global agents");
-        std::fs::write(agent_dir.join("CLAUDE.md"), "global claude").expect("write global claude");
-        std::fs::write(project_root.join("AGENTS.md"), "project").expect("write project agents");
-        std::fs::write(nested.join("CLAUDE.md"), "nested").expect("write nested claude");
-
-        let contexts = collect_startup_context_files(&nested, &agent_dir);
-        assert_eq!(
-            contexts,
-            vec![
-                agent_dir.join("AGENTS.md"),
-                project_root.join("AGENTS.md"),
-                nested.join("CLAUDE.md"),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_startup_resource_lines_lists_context_and_grouped_skills() {
+    fn build_startup_resource_lines_is_empty_for_d_style_banner() {
         let dir = tempdir().expect("temp dir");
         let agent_dir = dir.path().join(".pixy/agent");
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&agent_dir).expect("create agent dir");
         std::fs::create_dir_all(&cwd).expect("create cwd");
-        std::fs::write(cwd.join("AGENTS.md"), "project").expect("write project agents");
 
-        let skills = vec![
-            Skill {
-                name: "project-skill".to_string(),
-                description: "project".to_string(),
-                file_path: cwd.join(".agents/skills/project/SKILL.md"),
-                base_dir: cwd.join(".agents/skills/project"),
-                source: SkillSource::Project,
-                disable_model_invocation: false,
-            },
-            Skill {
-                name: "path-skill".to_string(),
-                description: "path".to_string(),
-                file_path: cwd.join("custom/path-skill/SKILL.md"),
-                base_dir: cwd.join("custom/path-skill"),
-                source: SkillSource::Path,
-                disable_model_invocation: false,
-            },
-            Skill {
-                name: "user-skill".to_string(),
-                description: "user".to_string(),
-                file_path: agent_dir.join("skills/user/SKILL.md"),
-                base_dir: agent_dir.join("skills/user"),
-                source: SkillSource::User,
-                disable_model_invocation: false,
-            },
-        ];
+        let skills = vec![Skill {
+            name: "project-skill".to_string(),
+            description: "project".to_string(),
+            file_path: cwd.join(".agents/skills/project/SKILL.md"),
+            base_dir: cwd.join(".agents/skills/project"),
+            source: SkillSource::Project,
+            disable_model_invocation: false,
+        }];
 
         let lines = build_startup_resource_lines(&cwd, &agent_dir, &skills);
-        assert!(lines.contains(&"[Context]".to_string()));
-        assert!(lines.contains(&"[Skills]".to_string()));
-        assert!(lines.contains(&"  user".to_string()));
-        assert!(lines.contains(&"  project".to_string()));
-        assert!(lines.contains(&"  path".to_string()));
         assert!(
-            lines
-                .iter()
-                .any(|line| line.ends_with(".agents/skills/project/SKILL.md")),
-            "project skill path should be rendered"
+            lines.is_empty(),
+            "startup banner should omit extra resource rows"
+        );
+    }
+
+    #[test]
+    fn format_status_model_label_prefers_custom_name() {
+        assert_eq!(
+            format_status_model_label("Databend GPT-5.3 Codex", "gpt-5.3-codex", true),
+            "Databend GPT-5.3 Codex [custom]"
+        );
+    }
+
+    #[test]
+    fn format_status_model_label_uses_title_case_model_when_name_missing() {
+        assert_eq!(
+            format_status_model_label("", "gpt-5.3-codex", false),
+            "Databend GPT-5.3 Codex [custom]"
+        );
+    }
+
+    #[test]
+    fn format_status_model_label_uses_title_case_model_when_name_matches_model() {
+        assert_eq!(
+            format_status_model_label("gpt-5.3-codex", "gpt-5.3-codex", true),
+            "Databend GPT-5.3 Codex [custom]"
         );
     }
 

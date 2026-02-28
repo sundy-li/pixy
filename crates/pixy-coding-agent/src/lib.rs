@@ -6,6 +6,7 @@ mod bash_command;
 pub mod cli;
 mod cli_app;
 mod messages;
+mod multi_agent;
 mod runtime_config;
 mod session_manager;
 mod skills;
@@ -22,7 +23,21 @@ pub use messages::{
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CodingMessage, CompactionSummaryMessage,
     CustomMessage, bash_execution_to_text, convert_to_llm,
 };
-pub use runtime_config::{LLMRouter, ResolvedRuntime, RuntimeLoadOptions, RuntimeOverrides};
+pub use multi_agent::{
+    AfterTaskResultHookContext, BeforeTaskDispatchHookContext, BeforeToolDefinitionHookContext,
+    BeforeUserMessageHookContext, ChildSessionStore, DeclarativeHookAction, DeclarativeHookSpec,
+    DeclarativeHookStage, DefaultSubAgentRegistry, DispatchPolicyConfig, DispatchPolicyDecision,
+    DispatchPolicyRule, LoadedPluginManifest, MergedPluginConfig, MultiAgentHook,
+    MultiAgentPluginManifest, MultiAgentPluginRuntime, PluginSubAgentSpec, PolicyRuleEffect,
+    SubAgentMode, SubAgentRegistryBuilder, SubAgentResolver, SubAgentSpec, TaskDispatchResult,
+    TaskDispatcher, TaskDispatcherConfig, TaskToolInput, TaskToolOutput,
+    create_multi_agent_plugin_runtime, create_multi_agent_plugin_runtime_from_specs,
+    create_task_tool, load_and_merge_plugins, load_and_merge_plugins_from_paths,
+    load_plugin_manifests,
+};
+pub use runtime_config::{
+    LLMRouter, ResolvedMultiAgentConfig, ResolvedRuntime, RuntimeLoadOptions, RuntimeOverrides,
+};
 pub use session_manager::{CURRENT_SESSION_VERSION, SessionContext, SessionManager};
 pub use skills::{
     LoadSkillsOptions, LoadSkillsResult, Skill, SkillDiagnostic, SkillDiagnosticKind, SkillSource,
@@ -30,6 +45,6 @@ pub use skills::{
 };
 pub use system_prompt::build_system_prompt;
 pub use tools::{
-    create_bash_tool, create_coding_tools, create_edit_tool, create_list_directory_tool,
-    create_read_tool, create_write_tool,
+    create_bash_tool, create_coding_tools, create_coding_tools_with_extra, create_edit_tool,
+    create_list_directory_tool, create_read_tool, create_write_tool,
 };

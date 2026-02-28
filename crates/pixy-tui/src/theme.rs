@@ -7,7 +7,8 @@ use crate::transcript::TranscriptLineKind;
 
 const DARK_THEME_JSON: &str = include_str!("../themes/dark.json");
 const LIGHT_THEME_JSON: &str = include_str!("../themes/light.json");
-const DEFAULT_INPUT_PROMPT: &str = "› ";
+const DEFAULT_INPUT_PROMPT: &str = "> ";
+const USER_INPUT_FG: Color = Color::Rgb(226, 154, 42);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiTheme {
@@ -69,10 +70,35 @@ impl TuiTheme {
 
     pub(crate) fn footer_style(self) -> Style {
         let palette = self.palette();
-        Style::default()
-            .fg(palette.colors.footer_fg)
-            .bg(palette.colors.footer_bg)
-            .add_modifier(Modifier::DIM)
+        Style::default().bg(palette.colors.footer_bg)
+    }
+
+    pub(crate) fn status_primary_left_style(self) -> Style {
+        match self {
+            Self::Dark => Style::default().fg(Color::Indexed(179)),
+            Self::Light => Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    pub(crate) fn status_primary_right_style(self) -> Style {
+        match self {
+            Self::Dark => Style::default().fg(Color::White),
+            Self::Light => Style::default().fg(Color::Black),
+        }
+    }
+
+    pub(crate) fn status_hint_style(self) -> Style {
+        match self {
+            Self::Dark => Style::default().fg(Color::DarkGray),
+            Self::Light => Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    pub(crate) fn status_help_right_style(self) -> Style {
+        match self {
+            Self::Dark => Style::default().fg(Color::Indexed(217)),
+            Self::Light => Style::default().fg(Color::Magenta),
+        }
     }
 
     pub(crate) fn help_style(self) -> Style {
@@ -92,9 +118,11 @@ impl TuiTheme {
         let palette = self.palette();
         match kind {
             TranscriptLineKind::Normal => Style::default(),
+            TranscriptLineKind::Assistant => Style::default(),
+            TranscriptLineKind::Overlay => Style::default(),
             TranscriptLineKind::Code => self.code_block_style(),
             TranscriptLineKind::UserInput => Style::default()
-                .fg(palette.colors.transcript_fg)
+                .fg(USER_INPUT_FG)
                 .bg(palette.colors.input_block_bg),
             TranscriptLineKind::Thinking => Style::default().fg(palette.colors.thinking_fg),
             TranscriptLineKind::Tool => Style::default().fg(palette.colors.tool_fg),
@@ -456,8 +484,8 @@ mod tests {
 
     #[test]
     fn built_in_themes_default_input_prompt_is_supported() {
-        assert_eq!(TuiTheme::Dark.input_prompt(), "› ");
-        assert_eq!(TuiTheme::Light.input_prompt(), "› ");
+        assert_eq!(TuiTheme::Dark.input_prompt(), "> ");
+        assert_eq!(TuiTheme::Light.input_prompt(), "> ");
     }
 
     #[test]
@@ -523,7 +551,7 @@ mod tests {
         }
         "##;
         let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
-        assert_eq!(palette.input_prompt, "› ");
+        assert_eq!(palette.input_prompt, "> ");
     }
 
     #[test]

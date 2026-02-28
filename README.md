@@ -130,6 +130,36 @@ weight = 1
 
 Full sample: [`pixy.toml.sample`](./pixy.toml.sample)
 
+## Multi-Agent V1 (Task Tool)
+
+Pixy supports multi-agent delegation via a built-in `task` tool when enabled in config.
+
+```toml
+[multi_agent]
+enabled = true
+
+[[multi_agent.agents]]
+name = "general"
+description = "General coding subagent"
+mode = "subagent"
+
+[[multi_agent.plugins]]
+path = "~/.pixy/plugins/basic-plugin.toml"
+```
+
+Notes:
+- `task` tool is added only when `multi_agent.enabled = true` and at least one subagent is available (from `multi_agent.agents` or plugins).
+- Child sessions are linked to parent session and can be reused with `task_id`.
+- Parent prompt includes an extra `<MULTI_AGENT>` section listing available subagents.
+- Plugin manifests can provide subagents, dispatch policy rules, and declarative hooks.
+- Declarative hooks can be configured in `[[multi_agent.hooks]]` (including `type = "bash"` actions) without writing Rust.
+- Programmable hook points are also available in Rust via `MultiAgentHook` (`before_tool_definition`, `before_user_message`, `before_task_dispatch`, `after_task_result`).
+- Parent-child lifecycle telemetry is emitted as `ParentChildRunEvent` (`child_run_start` / `child_run_end` / `child_run_error`) with `task_id` correlation.
+
+Manifest schema and examples: [`docs/multi-agent-plugin-manifest.md`](./docs/multi-agent-plugin-manifest.md)
+Runnable config + plugin example: [`examples/multi-agent`](./examples/multi-agent)
+Declarative hooks + routing example: [`examples/multi-agent-hooks`](./examples/multi-agent-hooks)
+
 ## Gateway Quick Setup (Telegram / Feishu)
 
 Start gateway in foreground:

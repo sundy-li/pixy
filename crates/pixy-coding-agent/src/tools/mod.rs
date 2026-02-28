@@ -25,3 +25,12 @@ pub fn create_coding_tools(cwd: impl AsRef<Path>) -> Vec<AgentTool> {
         create_write_tool(&cwd),
     ]
 }
+
+pub fn create_coding_tools_with_extra(
+    cwd: impl AsRef<Path>,
+    mut extra_tools: Vec<AgentTool>,
+) -> Vec<AgentTool> {
+    let mut tools = create_coding_tools(cwd);
+    tools.append(&mut extra_tools);
+    tools
+}

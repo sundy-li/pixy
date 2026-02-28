@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Local, TimeZone};
 use pixy_agent_core::{
     AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentRetryConfig,
-    AgentTool, IdentityMessageConverter, StreamFn, agent_loop, agent_loop_continue,
+    AgentTool, IdentityMessageConverter, ParentChildRunEvent, StreamFn, agent_loop,
+    agent_loop_continue,
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessageEvent, Context as LlmContext, Message, Model,
@@ -13,14 +14,18 @@ use pixy_ai::{
 };
 use serde_json::Value;
 
+use crate::system_prompt::append_multi_agent_prompt_section;
 use crate::{
-    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, ResolvedRuntime, RuntimeLoadOptions,
-    SessionContext, SessionManager,
+    BRANCH_SUMMARY_PREFIX, BeforeToolDefinitionHookContext, BeforeUserMessageHookContext,
+    COMPACTION_SUMMARY_PREFIX, ChildSessionStore, DefaultSubAgentRegistry, DispatchPolicyConfig,
+    MergedPluginConfig, MultiAgentPluginRuntime, ResolvedRuntime, RuntimeLoadOptions,
+    SessionContext, SessionManager, TaskDispatcher, TaskDispatcherConfig,
     agent_session_services::{
         AutoCompactionService, SessionResumeService, StreamingToolLineRenderer,
     },
     bash_command::normalize_nested_bash_lc,
-    build_system_prompt, create_coding_tools,
+    build_system_prompt, create_coding_tools_with_extra,
+    create_multi_agent_plugin_runtime_from_specs, create_task_tool, load_and_merge_plugins,
 };
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
@@ -69,6 +74,7 @@ impl Default for AutoCompactionConfig {
 pub struct AgentSession {
     session_manager: SessionManager,
     config: AgentSessionConfig,
+    plugin_runtime: Arc<MultiAgentPluginRuntime>,
     auto_compaction: AutoCompactionConfig,
     model_catalog: Vec<Model>,
     current_model_index: usize,
@@ -84,6 +90,7 @@ impl AgentSession {
         Self {
             session_manager,
             config,
+            plugin_runtime: Arc::new(MultiAgentPluginRuntime::default()),
             auto_compaction: AutoCompactionConfig::default(),
             model_catalog: vec![current_model],
             current_model_index: 0,
@@ -100,6 +107,10 @@ impl AgentSession {
 
     pub fn build_session_context(&self) -> SessionContext {
         self.session_manager.build_session_context()
+    }
+
+    pub fn set_multi_agent_plugin_runtime(&mut self, plugin_runtime: Arc<MultiAgentPluginRuntime>) {
+        self.plugin_runtime = plugin_runtime;
     }
 
     pub fn resume(&mut self, target: Option<&str>) -> Result<PathBuf, String> {
@@ -318,8 +329,9 @@ impl AgentSession {
     }
 
     async fn run_prompt_once(&mut self, input: &str) -> Result<Vec<AgentMessage>, String> {
+        let input = self.apply_before_user_message_hooks(input);
         let prompt = Message::User {
-            content: UserContent::Text(input.to_string()),
+            content: UserContent::Text(input),
             timestamp: now_millis(),
         };
 
@@ -341,9 +353,10 @@ impl AgentSession {
         abort_signal: Option<AgentAbortSignal>,
         on_update: Option<&mut dyn FnMut(AgentSessionStreamUpdate)>,
     ) -> Result<Vec<AgentMessage>, String> {
+        let input = self.apply_before_user_message_hooks(input);
         let content = match blocks {
             Some(blocks) => UserContent::Blocks(blocks),
-            None => UserContent::Text(input.to_string()),
+            None => UserContent::Text(input),
         };
         let prompt = Message::User {
             content,
@@ -356,6 +369,14 @@ impl AgentSession {
 
         self.persist_messages_and_maybe_compact(&produced).await?;
         Ok(produced)
+    }
+
+    fn apply_before_user_message_hooks(&self, input: &str) -> String {
+        let mut ctx = BeforeUserMessageHookContext {
+            message: input.to_string(),
+        };
+        self.plugin_runtime.before_user_message(&mut ctx);
+        ctx.message
     }
 
     pub async fn continue_run(&mut self) -> Result<Vec<AgentMessage>, String> {
@@ -808,10 +829,17 @@ pub fn create_session_from_runtime(
     custom_system_prompt: Option<&str>,
     no_tools: bool,
 ) -> AgentSession {
-    let tools = if no_tools {
+    let parent_session_id = session_manager.header().id.clone();
+    let parent_session_dir = session_manager
+        .session_file()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    let mut child_tools = if no_tools {
         vec![]
     } else {
-        create_coding_tools(cwd)
+        create_coding_tools_with_extra(cwd, vec![])
     };
     let runtime_api_key = runtime.api_key.clone();
     let stream_fn = Arc::new(
@@ -823,17 +851,199 @@ pub fn create_session_from_runtime(
             pixy_ai::stream_simple(model, context, Some(resolved_options))
         },
     );
+    let (merged_plugins, plugin_merge_error) =
+        if runtime.multi_agent.enabled && !runtime.multi_agent.plugin_paths.is_empty() {
+            match load_and_merge_plugins(&runtime.multi_agent.plugin_paths) {
+                Ok(merged) => (merged, None),
+                Err(error) => (MergedPluginConfig::default(), Some(error)),
+            }
+        } else {
+            (MergedPluginConfig::default(), None)
+        };
+
+    // Plugin hooks run first; hooks declared in pixy.toml run after them so local config can override.
+    let mut merged_hook_specs = merged_plugins.hooks.clone();
+    merged_hook_specs.extend(runtime.multi_agent.hooks.clone());
+    let plugin_runtime = match create_multi_agent_plugin_runtime_from_specs(&merged_hook_specs) {
+        Ok(runtime) => Arc::new(runtime),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to initialize declarative multi-agent hooks, hooks disabled: {error}"
+            );
+            Arc::new(MultiAgentPluginRuntime::default())
+        }
+    };
+    apply_before_tool_definition_hooks(plugin_runtime.as_ref(), &mut child_tools);
+
+    let mut tools = child_tools.clone();
+    let mut prompt_subagents = vec![];
+    if !no_tools && runtime.multi_agent.enabled {
+        let configured_subagents = runtime
+            .multi_agent
+            .agents
+            .iter()
+            .filter(|spec| spec.validate().is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut registry_builder = DefaultSubAgentRegistry::builder();
+        let mut effective_subagents = Vec::new();
+        let mut merged_policy = DispatchPolicyConfig::default();
+        let mut init_error: Option<String> = None;
+
+        for spec in configured_subagents {
+            match registry_builder.register_builtin_mut(spec.clone()) {
+                Ok(()) => {
+                    effective_subagents.push(spec);
+                }
+                Err(error) => {
+                    init_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if init_error.is_none()
+            && let Some(error) = plugin_merge_error.clone()
+        {
+            init_error = Some(error);
+        }
+
+        if init_error.is_none() {
+            merged_policy.merge_from(&merged_plugins.policy);
+            for plugin_spec in &merged_plugins.subagents {
+                match registry_builder.register_plugin_subagent_mut(
+                    &plugin_spec.plugin_name,
+                    plugin_spec.spec.clone(),
+                ) {
+                    Ok(()) => {
+                        effective_subagents.push(plugin_spec.spec.clone());
+                    }
+                    Err(error) => {
+                        init_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = init_error {
+            eprintln!(
+                "warning: failed to initialize multi-agent registry, task tool disabled: {error}"
+            );
+        } else if !effective_subagents.is_empty() {
+            let registry = registry_builder.build();
+            let dispatch_parent_session_id = parent_session_id.clone();
+            let dispatch_parent_session_dir = parent_session_dir.clone();
+            let dispatcher = TaskDispatcher::new(TaskDispatcherConfig {
+                cwd: cwd.to_path_buf(),
+                parent_session_id: dispatch_parent_session_id.clone(),
+                parent_session_dir: dispatch_parent_session_dir,
+                model: runtime.model.clone(),
+                system_prompt: build_system_prompt(
+                    custom_system_prompt,
+                    cwd,
+                    &child_tools,
+                    &runtime.skills,
+                ),
+                stream_fn: stream_fn.clone(),
+                child_tools: child_tools.clone(),
+                subagent_registry: Arc::new(registry),
+                session_store: Arc::new(tokio::sync::Mutex::new(ChildSessionStore::new(
+                    dispatch_parent_session_id,
+                ))),
+                dispatch_policy: merged_policy,
+                plugin_runtime: plugin_runtime.clone(),
+                lifecycle_event_sink: Some(Arc::new(log_parent_child_run_event)),
+            });
+            let mut task_tool = create_task_tool(Arc::new(dispatcher));
+            apply_before_tool_definition_hooks(
+                plugin_runtime.as_ref(),
+                std::slice::from_mut(&mut task_tool),
+            );
+            tools.push(task_tool);
+            prompt_subagents = effective_subagents;
+        }
+    }
+
+    let mut system_prompt = build_system_prompt(custom_system_prompt, cwd, &tools, &runtime.skills);
+    append_multi_agent_prompt_section(&mut system_prompt, &tools, &prompt_subagents);
+
     let config = AgentSessionConfig {
         model: runtime.model.clone(),
-        system_prompt: build_system_prompt(custom_system_prompt, cwd, &tools, &runtime.skills),
+        system_prompt,
         stream_fn,
         tools,
     };
     let mut session = AgentSession::new(session_manager, config);
+    session.set_multi_agent_plugin_runtime(plugin_runtime);
     if !runtime.model_catalog.is_empty() {
         session.set_model_catalog(runtime.model_catalog.clone());
     }
     session
+}
+
+fn apply_before_tool_definition_hooks(runtime: &MultiAgentPluginRuntime, tools: &mut [AgentTool]) {
+    for tool in tools.iter_mut() {
+        let mut ctx = BeforeToolDefinitionHookContext {
+            tool_name: tool.name.clone(),
+            description: tool.description.clone(),
+        };
+        runtime.before_tool_definition(&mut ctx);
+        tool.description = ctx.description;
+    }
+}
+
+fn log_parent_child_run_event(event: ParentChildRunEvent) {
+    match event {
+        ParentChildRunEvent::ChildRunStart {
+            parent_session_id,
+            child_session_file,
+            task_id,
+            subagent,
+        } => {
+            tracing::info!(
+                parent_session_id,
+                child_session_file,
+                task_id,
+                subagent,
+                "child run started"
+            );
+        }
+        ParentChildRunEvent::ChildRunEnd {
+            parent_session_id,
+            child_session_file,
+            task_id,
+            subagent,
+            duration_ms,
+            summary,
+        } => {
+            tracing::info!(
+                parent_session_id,
+                child_session_file,
+                task_id,
+                subagent,
+                duration_ms,
+                summary,
+                "child run completed"
+            );
+        }
+        ParentChildRunEvent::ChildRunError {
+            parent_session_id,
+            child_session_file,
+            task_id,
+            subagent,
+            error,
+        } => {
+            tracing::warn!(
+                parent_session_id,
+                child_session_file,
+                task_id,
+                subagent,
+                error,
+                "child run failed"
+            );
+        }
+    }
 }
 
 async fn collect_agent_loop_result(
@@ -1547,14 +1757,36 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pixy_ai::{Message, UserContent};
+    use pixy_ai::{Cost, Message, Model, UserContent};
     use serde_json::json;
 
     use super::{
-        build_session_resume_candidate, format_bash_tool_start_line,
-        normalize_session_candidate_title,
+        ResolvedRuntime, build_session_resume_candidate, create_session_from_runtime,
+        format_bash_tool_start_line, normalize_session_candidate_title,
     };
-    use crate::SessionManager;
+    use crate::{ResolvedMultiAgentConfig, SessionManager, SubAgentMode, SubAgentSpec};
+
+    fn sample_model() -> Model {
+        Model {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            base_url: "http://localhost".to_string(),
+            reasoning: false,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 128_000,
+            max_tokens: 8_192,
+        }
+    }
 
     #[test]
     fn format_bash_tool_start_line_unwraps_nested_bash_lc() {
@@ -1589,5 +1821,235 @@ mod tests {
         assert_eq!(candidate.path, session_file);
         assert!(candidate.title.contains("investigate flaky test timeout"));
         assert!(!candidate.updated_at.trim().is_empty());
+    }
+
+    #[test]
+    fn create_session_from_runtime_includes_task_tool_only_when_multi_agent_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+
+        let runtime_disabled = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: false,
+                agents: vec![],
+                plugin_paths: vec![],
+                hooks: vec![],
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+        let session_disabled = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session disabled"),
+            &runtime_disabled,
+            None,
+            false,
+        );
+        assert!(
+            !session_disabled
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool.name == "task")
+        );
+
+        let runtime_enabled = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: true,
+                agents: vec![SubAgentSpec {
+                    name: "general".to_string(),
+                    description: "General helper".to_string(),
+                    mode: SubAgentMode::SubAgent,
+                }],
+                plugin_paths: vec![],
+                hooks: vec![],
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+        let session_enabled = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session enabled"),
+            &runtime_enabled,
+            None,
+            false,
+        );
+        assert!(
+            session_enabled
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool.name == "task")
+        );
+    }
+
+    #[test]
+    fn create_session_from_runtime_appends_subagent_names_to_prompt_when_task_tool_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: true,
+                agents: vec![
+                    SubAgentSpec {
+                        name: "general".to_string(),
+                        description: "General helper".to_string(),
+                        mode: SubAgentMode::SubAgent,
+                    },
+                    SubAgentSpec {
+                        name: "explore".to_string(),
+                        description: "Exploration helper".to_string(),
+                        mode: SubAgentMode::SubAgent,
+                    },
+                ],
+                plugin_paths: vec![],
+                hooks: vec![],
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+
+        assert!(session.config.system_prompt.contains("<MULTI_AGENT>"));
+        assert!(session.config.system_prompt.contains("general"));
+        assert!(session.config.system_prompt.contains("explore"));
+    }
+
+    #[test]
+    fn create_session_from_runtime_can_source_subagents_from_plugin_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+        let plugin_path = dir.path().join("basic-plugin.toml");
+        std::fs::write(
+            &plugin_path,
+            r#"
+name = "basic-plugin"
+
+[[subagents]]
+name = "explore"
+description = "Exploration helper"
+mode = "subagent"
+"#,
+        )
+        .expect("write plugin manifest");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: true,
+                agents: vec![],
+                plugin_paths: vec![plugin_path],
+                hooks: vec![],
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+
+        assert!(session.config.tools.iter().any(|tool| tool.name == "task"));
+        assert!(session.config.system_prompt.contains("explore"));
+    }
+
+    #[test]
+    fn create_session_from_runtime_applies_plugin_manifest_hooks_to_task_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+        let plugin_path = dir.path().join("hook-plugin.toml");
+        std::fs::write(
+            &plugin_path,
+            r#"
+name = "hook-plugin"
+
+[[subagents]]
+name = "review"
+description = "Review helper"
+mode = "subagent"
+
+[[hooks]]
+name = "tag-task-description"
+stage = "before_tool_definition"
+tool_name = "task"
+
+[[hooks.actions]]
+type = "append_field"
+field = "description"
+value = "\n[plugin hook active]"
+"#,
+        )
+        .expect("write plugin manifest");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            multi_agent: ResolvedMultiAgentConfig {
+                enabled: true,
+                agents: vec![],
+                plugin_paths: vec![plugin_path],
+                hooks: vec![],
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+
+        let task_tool = session
+            .config
+            .tools
+            .iter()
+            .find(|tool| tool.name == "task")
+            .expect("task tool");
+        assert!(task_tool.description.contains("[plugin hook active]"));
     }
 }

@@ -10,5 +10,6 @@ pub use types::{
     AgentAbortController, AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig,
     AgentMessage, AgentRetryConfig, AgentRunMetrics, AgentTool, AgentToolExecuteFn,
     AgentToolExecutor, AgentToolResult, ConvertToLlmFn, IdentityMessageConverter, MessageConverter,
-    MessageQueue, MessageQueueFn, StreamExecutor, StreamFn, ToolFuture,
+    MessageQueue, MessageQueueFn, ParentChildRunEvent, ParentChildRunEventSink, StreamExecutor,
+    StreamFn, ToolFuture,
 };

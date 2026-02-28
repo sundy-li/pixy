@@ -1,0 +1,45 @@
+name = "basic-plugin"
+description = "Adds extra subagents and routing policy for task dispatch"
+
+[[subagents]]
+name = "explore"
+description = "Exploration and codebase scanning helper"
+mode = "subagent"
+
+[[subagents]]
+name = "review"
+description = "Code review and risk analysis helper"
+mode = "subagent"
+
+[policy]
+fallback_subagent = "general"
+
+[[policy.rules]]
+tool = "task"
+subagent = "dangerous"
+effect = "deny"
+
+[[hooks]]
+name = "route-review-prompts"
+stage = "before_task_dispatch"
+prompt_contains = "review"
+
+[[hooks.actions]]
+type = "route_to"
+subagent = "review"
+
+[[hooks]]
+name = "append-git-status-summary"
+stage = "after_task_result"
+subagent = "review"
+
+[[hooks.actions]]
+type = "append_field"
+field = "output.summary"
+value = "\n\n[hook git status]\n"
+
+[[hooks.actions]]
+type = "bash"
+command = "git status --short | head -n 20"
+field = "output.summary"
+append = true

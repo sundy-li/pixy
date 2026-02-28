@@ -246,6 +246,14 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn create(cwd: &str, session_dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::create_with_parent(cwd, session_dir, None)
+    }
+
+    pub fn create_with_parent(
+        cwd: &str,
+        session_dir: impl AsRef<Path>,
+        parent_session: Option<&str>,
+    ) -> Result<Self, String> {
         let session_dir = session_dir.as_ref();
         fs::create_dir_all(session_dir)
             .map_err(|error| format!("create session dir failed: {error}"))?;
@@ -259,7 +267,7 @@ impl SessionManager {
             id: session_id,
             timestamp: timestamp.clone(),
             cwd: cwd.to_string(),
-            parent_session: None,
+            parent_session: parent_session.map(ToOwned::to_owned),
         };
 
         let manager = Self {
@@ -557,6 +565,10 @@ impl SessionManager {
         Some(&self.session_file)
     }
 
+    pub fn header(&self) -> &SessionHeader {
+        &self.header
+    }
+
     pub fn cwd(&self) -> &str {
         &self.header.cwd
     }
@@ -724,4 +736,33 @@ fn parse_timestamp_millis(timestamp: &str) -> i64 {
     }
 
     now_millis_i64()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::SessionManager;
+
+    #[test]
+    fn create_with_parent_sets_header_parent_session() {
+        let dir = tempdir().expect("tempdir should be created");
+        let manager =
+            SessionManager::create_with_parent("/workspace", dir.path(), Some("parent-session"))
+                .expect("child session should be created");
+
+        assert_eq!(
+            manager.header().parent_session.as_deref(),
+            Some("parent-session")
+        );
+    }
+
+    #[test]
+    fn create_without_parent_keeps_parent_session_empty() {
+        let dir = tempdir().expect("tempdir should be created");
+        let manager = SessionManager::create("/workspace", dir.path())
+            .expect("root session should be created");
+
+        assert_eq!(manager.header().parent_session, None);
+    }
 }

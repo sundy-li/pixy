@@ -1,0 +1,27 @@
+# Example pixy.toml for multi-agent delegation.
+# Merge this into ~/.pixy/pixy.toml or use it as a starting point.
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"
+model = "gpt-5.3-codex"
+weight = 1
+
+[multi_agent]
+enabled = true
+
+[[multi_agent.agents]]
+name = "general"
+description = "General coding subagent"
+mode = "subagent"
+
+[[multi_agent.plugins]]
+# Relative paths resolve from the pixy.toml directory.
+path = "plugins/basic-plugin.toml"

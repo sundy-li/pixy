@@ -1,0 +1,15 @@
+name = "basic-plugin"
+description = "Adds an exploration subagent and a default dispatch policy"
+
+[[subagents]]
+name = "explore"
+description = "Exploration and codebase scanning helper"
+mode = "subagent"
+
+[policy]
+fallback_subagent = "general"
+
+[[policy.rules]]
+tool = "task"
+subagent = "dangerous"
+effect = "deny"

@@ -61,6 +61,41 @@ api_key = "$OPENAI_API_KEY"
 model = "text-embedding-3-small"
 weight = 0
 
+[multi_agent]
+enabled = false
+
+[[multi_agent.agents]]
+name = "general"
+description = "General coding subagent"
+mode = "subagent"
+
+[[multi_agent.plugins]]
+# Relative paths resolve from pixy.toml directory.
+# Manifest schema: docs/multi-agent-plugin-manifest.md
+# Plugins can also include declarative hooks.
+path = "plugins/basic-plugin.toml"
+
+# Optional: local declarative hooks (run after plugin hooks).
+[[multi_agent.hooks]]
+name = "route-review-prompts"
+stage = "before_task_dispatch"
+prompt_contains = "review"
+
+[[multi_agent.hooks.actions]]
+type = "route_to"
+subagent = "general"
+
+[[multi_agent.hooks]]
+name = "append-git-status"
+stage = "after_task_result"
+subagent = "general"
+
+[[multi_agent.hooks.actions]]
+type = "bash"
+command = "git status --short | head -n 20"
+field = "output.summary"
+append = true
+
 [gateway]
 enabled = true
 bind = "0.0.0.0:8080"

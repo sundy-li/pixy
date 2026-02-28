@@ -157,14 +157,14 @@ fn default_keybindings_match_expected_keys() {
     assert_eq!(
         bindings.cycle_model_forward,
         vec![KeyBinding {
-            code: KeyCode::Char('p'),
+            code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL
         }]
     );
     assert_eq!(
         bindings.cycle_model_backward,
         vec![KeyBinding {
-            code: KeyCode::Char('p'),
+            code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT
         }]
     );
@@ -283,11 +283,11 @@ fn shift_enter_inserts_newline_and_moves_cursor_to_next_input_row() {
         width: 10,
         height: 4,
     };
-    assert_eq!(input_cursor_position(&app, area, "› "), (0, 2));
+    assert_eq!(input_cursor_position(&app, area, "> "), (1, 2));
 }
 
 #[test]
-fn input_area_height_grows_and_shrinks_with_multiline_input() {
+fn input_area_height_is_fixed_with_multiline_input() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     let frame = Rect {
         x: 0,
@@ -295,13 +295,125 @@ fn input_area_height_grows_and_shrinks_with_multiline_input() {
         width: 20,
         height: 24,
     };
-    assert_eq!(input_area_height(&app, frame, "› ", 2), 3);
+    assert_eq!(
+        input_area_height(&app, frame, "> ", 2),
+        INPUT_AREA_FIXED_HEIGHT
+    );
 
     app.input = "line 1\nline 2".to_string();
-    assert_eq!(input_area_height(&app, frame, "› ", 2), 4);
+    assert_eq!(
+        input_area_height(&app, frame, "> ", 2),
+        INPUT_AREA_FIXED_HEIGHT
+    );
 
-    app.input = "line 1".to_string();
-    assert_eq!(input_area_height(&app, frame, "› ", 2), 3);
+    app.input = "line 1\nline 2\nline 3\nline 4".to_string();
+    assert_eq!(
+        input_area_height(&app, frame, "> ", 2),
+        INPUT_AREA_FIXED_HEIGHT
+    );
+}
+
+#[test]
+fn terminal_defaults_to_fullscreen_viewport() {
+    assert!(matches!(
+        default_terminal_options().viewport,
+        Viewport::Fullscreen
+    ));
+}
+
+#[test]
+fn welcome_banner_is_persisted_into_transcript() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+
+    persist_welcome_into_transcript(&mut app);
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.text.contains("Welcome line"))
+    );
+}
+
+#[test]
+fn persisted_welcome_lines_start_as_overlay_transcript_kind() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+
+    persist_welcome_into_transcript(&mut app);
+
+    let welcome = app
+        .transcript
+        .iter()
+        .find(|line| line.text == "Welcome line")
+        .expect("welcome line should be present");
+    assert_eq!(welcome.kind, TranscriptLineKind::Overlay);
+}
+
+#[test]
+fn overlay_welcome_lines_are_center_aligned_in_transcript() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec![
+        "███████   ██  ██      ██  ██      ██".to_string(),
+        "You are standing in an open terminal.".to_string(),
+    ]);
+
+    persist_welcome_into_transcript(&mut app);
+
+    let visible = visible_transcript_lines(
+        &app.transcript,
+        &[],
+        12,
+        80,
+        true,
+        true,
+        None,
+        0,
+        TuiTheme::Dark,
+    );
+    let centered = visible
+        .iter()
+        .map(line_text)
+        .find(|line| line.contains("You are standing in an open terminal."))
+        .expect("welcome line should be visible");
+
+    let left_padding = centered.chars().take_while(|ch| *ch == ' ').count();
+    assert!(
+        left_padding > 0,
+        "overlay welcome line should not be left-aligned when rendered in transcript"
+    );
+}
+
+#[test]
+fn first_submitted_input_keeps_overlay_welcome_lines_as_overlay() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+
+    persist_welcome_into_transcript(&mut app);
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.kind == TranscriptLineKind::Overlay),
+        "welcome line should start as overlay kind before first submission"
+    );
+
+    app.push_user_input_line("hello".to_string());
+
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.kind == TranscriptLineKind::Overlay),
+        "welcome line should remain overlay kind after first submission"
+    );
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.text.contains("Welcome line")),
+        "welcome line should remain in transcript after first submission"
+    );
+    assert!(
+        app.transcript.iter().any(|line| line.text == "hello"),
+        "submitted user line should be appended to transcript"
+    );
 }
 
 #[test]
@@ -421,10 +533,10 @@ fn input_cursor_position_uses_display_width_for_cjk() {
         height: 3,
     };
 
-    assert_eq!(input_cursor_position(&app, area, "› "), (4, 1));
+    assert_eq!(input_cursor_position(&app, area, "> "), (6, 1));
 
     app.cursor_pos = 2;
-    assert_eq!(input_cursor_position(&app, area, "› "), (5, 1));
+    assert_eq!(input_cursor_position(&app, area, "> "), (7, 1));
 }
 
 #[test]
@@ -437,7 +549,7 @@ fn input_cursor_starts_after_default_prompt_prefix() {
         height: 3,
     };
 
-    assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
+    assert_eq!(input_cursor_position(&app, area, "> "), (4, 1));
 }
 
 #[test]
@@ -456,7 +568,7 @@ fn backspace_at_input_start_keeps_prompt_visible() {
         width: 10,
         height: 3,
     };
-    assert_eq!(input_cursor_position(&app, area, "› "), (2, 1));
+    assert_eq!(input_cursor_position(&app, area, "> "), (4, 1));
 }
 
 #[test]
@@ -545,30 +657,53 @@ fn visible_transcript_appends_working_line() {
 }
 
 #[test]
-fn working_line_includes_elapsed_and_interrupt_hint_when_running_tool() {
-    let mut app = TuiApp::new("ready".to_string(), true, false);
-    app.start_working("• Ran read".to_string());
+fn status_separator_keeps_one_blank_line_between_transcript_and_status() {
+    let lines = vec![
+        Line::from("first"),
+        Line::from("second"),
+        Line::from("third"),
+    ];
+    let separated = ensure_bottom_status_separator(lines, 3);
 
-    let working = app
-        .working_line()
-        .expect("working line should be present while working");
-
-    assert!(working.text.contains("• Ran read"));
-    assert!(working.text.contains("s •"));
-    assert!(working.text.contains("to interrupt"));
+    assert_eq!(separated.len(), 3);
+    assert_eq!(line_text(&separated[0]).trim(), "second");
+    assert_eq!(line_text(&separated[1]).trim(), "third");
+    assert!(
+        line_text(separated.last().expect("last line"))
+            .trim()
+            .is_empty(),
+        "last transcript row should be blank so status area is visually separated"
+    );
 }
 
 #[test]
-fn status_bar_shows_elapsed_and_interrupt_hint_while_working() {
+fn status_separator_keeps_existing_blank_tail_unchanged() {
+    let lines = vec![Line::from("first"), Line::from(""), Line::from("")];
+    let separated = ensure_bottom_status_separator(lines.clone(), 3);
+
+    assert_eq!(separated, lines);
+}
+
+#[test]
+fn status_bar_keeps_top_line_stable_while_working() {
     let mut app = TuiApp::new("pi is working...".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "Auto (High) - allow all commands".to_string(),
+        "Databend GPT-5.3 Codex [custom]".to_string(),
+    );
     app.start_working("pi is working...".to_string());
+    app.status_left = "Auto (High) - allow all commands".to_string();
 
-    let status = render_status_bar_lines(&app, 120);
-    let top = line_text(&status.lines[0]);
+    let status = render_status_bar_lines(&app, 120, TuiTheme::Dark);
+    let middle = line_text(&status.lines[0]);
+    let hints = line_text(&status.lines[1]);
+    let bottom = line_text(&status.lines[2]);
 
-    assert!(top.contains("pi is working..."));
-    assert!(top.contains("s •"));
-    assert!(top.contains("to interrupt"));
+    assert!(middle.contains("Auto (High) - allow all commands"));
+    assert!(middle.contains("Databend GPT-5.3 Codex [custom]"));
+    assert!(hints.contains("shift+tab to cycle modes"));
+    assert!(bottom.contains("[⏱"));
 }
 
 #[test]
@@ -590,20 +725,7 @@ fn tool_output_line_resets_working_message_to_generic_state() {
 }
 
 #[test]
-fn working_line_formats_elapsed_time_as_minutes_and_seconds() {
-    let mut app = TuiApp::new("ready".to_string(), true, false);
-    app.start_working("Checking file git status flags".to_string());
-    app.working_started_at = Some(Instant::now() - Duration::from_secs(510));
-
-    let working = app
-        .working_line()
-        .expect("working line should be present while working");
-
-    assert!(working.text.contains("(8m 30s •"));
-}
-
-#[test]
-fn working_line_marquee_highlights_four_chars_and_rotates() {
+fn working_line_marquee_highlights_spinner_text_with_dark_theme_colors() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.start_working("Checking file git status flags".to_string());
     app.working_tick = 0;
@@ -614,18 +736,11 @@ fn working_line_marquee_highlights_four_chars_and_rotates() {
         .to_line(200, TuiTheme::Dark);
     assert!(
         line0.spans.iter().any(|span| {
-            span.content.contains("Chec")
-                && span.style.fg == Some(Color::White)
-                && span.style.bg == Some(Color::Rgb(40, 44, 52))
+            span.content.contains("Thin")
+                && span.style.fg == Some(Color::Rgb(244, 208, 137))
+                && span.style.bg == Some(Color::Black)
         }),
-        "tick=0 should highlight first 4 chars with white-on-black"
-    );
-    assert!(
-        line0.spans.iter().any(|span| {
-            span.style.fg == Some(Color::Rgb(148, 150, 153))
-                && span.style.bg == Some(Color::Rgb(40, 44, 52))
-        }),
-        "non-highlight text should use gray-on-black"
+        "tick=0 should highlight first 4 chars with amber-on-black"
     );
 
     app.working_tick = 1;
@@ -635,9 +750,9 @@ fn working_line_marquee_highlights_four_chars_and_rotates() {
         .to_line(200, TuiTheme::Dark);
     assert!(
         line1.spans.iter().any(|span| {
-            span.content.contains("heck")
-                && span.style.fg == Some(Color::White)
-                && span.style.bg == Some(Color::Rgb(40, 44, 52))
+            span.content.contains("hink")
+                && span.style.fg == Some(Color::Rgb(244, 208, 137))
+                && span.style.bg == Some(Color::Black)
         }),
         "tick=1 should move highlight window forward by one char"
     );
@@ -662,7 +777,7 @@ fn working_line_marquee_uses_light_theme_colors() {
     assert!(
         line.spans
             .iter()
-            .any(|span| { span.content.contains("Chec") && span.style.fg == Some(Color::Black) }),
+            .any(|span| { span.content.contains("Thin") && span.style.fg == Some(Color::Black) }),
         "highlight text should use light theme highlight color"
     );
     assert!(
@@ -832,23 +947,55 @@ fn tool_diff_stat_line_colors_plus_and_minus_segments() {
 fn tool_lines_keep_default_background_and_use_light_text() {
     let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
         .to_line(40, TuiTheme::Dark);
-    assert_eq!(tool.spans[0].style.fg, Some(Color::Gray));
+    assert_eq!(tool.spans[0].style.fg, Some(Color::Rgb(176, 176, 176)));
     assert_eq!(tool.spans[0].style.bg, None);
 }
 
 #[test]
-fn user_input_line_uses_input_block_background_from_theme() {
+fn user_input_line_uses_orange_foreground_with_default_background() {
     let input = TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput)
         .to_line(40, TuiTheme::Dark);
-    assert_eq!(input.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
+    assert_eq!(input.spans[0].style.fg, Some(Color::Rgb(226, 154, 42)));
+    assert_eq!(input.spans[0].style.bg, Some(Color::Black));
+}
+
+#[test]
+fn assistant_output_lines_use_sigil_prefix() {
+    let lines = vec![TranscriptLine::new(
+        "Hello there".to_string(),
+        TranscriptLineKind::Assistant,
+    )];
+    let visible = visible_transcript_lines(&lines, &[], 3, 80, true, true, None, 0, TuiTheme::Dark);
+    let rendered = line_text(&visible[0]);
+    assert!(
+        rendered.contains("⛬  Hello there"),
+        "assistant output should use the ⛬ prefix"
+    );
+}
+
+#[test]
+fn assistant_multiline_block_prefixes_only_first_non_empty_line() {
+    let lines = vec![
+        TranscriptLine::new("first line".to_string(), TranscriptLineKind::Assistant),
+        TranscriptLine::new("second line".to_string(), TranscriptLineKind::Assistant),
+    ];
+    let visible = visible_transcript_lines(&lines, &[], 4, 80, true, true, None, 0, TuiTheme::Dark);
+    let rendered = visible.iter().map(line_text).collect::<Vec<_>>();
+
+    assert!(rendered.iter().any(|line| line.contains("⛬  first line")));
+    assert!(rendered.iter().any(|line| line.contains("second line")));
+    assert!(
+        !rendered.iter().any(|line| line.contains("⛬  second line")),
+        "only the first line in an assistant block should have the prefix"
+    );
 }
 
 #[test]
 fn format_user_input_line_prefixes_prompt() {
-    assert_eq!(format_user_input_line("hello", "› "), "› hello");
+    assert_eq!(format_user_input_line("hello", "> "), ">  hello");
     assert_eq!(
         format_user_input_line("this is second question", "pi> "),
-        "pi> this is second question"
+        "pi>  this is second question"
     );
 }
 
@@ -864,6 +1011,37 @@ fn push_user_input_line_wraps_content_with_blank_padding_lines() {
     assert_eq!(app.transcript[1].kind, TranscriptLineKind::UserInput);
     assert_eq!(app.transcript[2].text, "");
     assert_eq!(app.transcript[2].kind, TranscriptLineKind::UserInput);
+}
+
+#[test]
+fn user_input_prompt_prefix_is_not_rendered_as_markdown_quote() {
+    let lines = vec![TranscriptLine::new(
+        ">  hello".to_string(),
+        TranscriptLineKind::UserInput,
+    )];
+
+    let visible = visible_transcript_lines(&lines, &[], 3, 60, true, true, None, 0, TuiTheme::Dark);
+    let rendered = line_text(&visible[0]);
+    assert!(
+        rendered.contains(">  hello"),
+        "user input prompt prefix should be rendered verbatim"
+    );
+}
+
+#[test]
+fn first_submitted_input_keeps_welcome_banner_in_transcript() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+
+    persist_welcome_into_transcript(&mut app);
+    app.push_user_input_line("hello".to_string());
+
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.text.contains("Welcome line"))
+    );
+    assert!(app.transcript.iter().any(|line| line.text == "hello"));
 }
 
 #[test]
@@ -1146,7 +1324,7 @@ fn multiline_assistant_markdown_tables_are_rendered_in_transcript() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(texts.iter().any(|line| line == "before"));
+    assert!(texts.iter().any(|line| line == "⛬  before"));
     assert!(texts.iter().any(|line| line == "┌──────┬──────┐"));
     assert!(texts.iter().any(|line| line == "│ A    │ BBB  │"));
     assert!(texts.iter().any(|line| line == "after"));
@@ -1176,7 +1354,11 @@ fn streaming_delta_with_chinese_markdown_table_is_rendered_as_table() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(texts.iter().any(|line| line == "给你一个 markdown 表格："));
+    assert!(
+        texts
+            .iter()
+            .any(|line| line == "⛬  给你一个 markdown 表格：")
+    );
     assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
     assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
     assert!(texts.iter().any(|line| line == "│ A1  │ B1  │ C1  │"));
@@ -1247,7 +1429,7 @@ fn assistant_line_with_multiline_markdown_table_is_rendered_as_table() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(texts.iter().any(|line| line == "这里是表格："));
+    assert!(texts.iter().any(|line| line == "⛬  这里是表格："));
     assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
     assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
     assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
@@ -2118,22 +2300,46 @@ fn streaming_ctrl_d_sets_force_exit_status() {
 }
 
 #[test]
-fn welcome_banner_mentions_force_exit_for_quit_key() {
+fn welcome_banner_includes_block_pixy_logo() {
     let lines = build_welcome_banner(&TuiOptions::default());
+    let logo_rows = lines.iter().take_while(|line| line.contains('█')).count();
+    assert_eq!(logo_rows, 7, "PIXY logo should use 7 block rows");
     assert!(
-        lines.iter().any(|line| line.contains("to force exit")),
-        "welcome banner should explicitly advertise force-exit behavior"
+        lines.iter().any(|line| line.contains("████")),
+        "welcome banner should render the PIXY logo with block glyphs"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("PPPP")),
+        "welcome banner should not fall back to letter-based art"
     );
 }
 
 #[test]
-fn welcome_banner_omits_standalone_version_line() {
-    let lines = build_welcome_banner(&TuiOptions::default());
+fn welcome_banner_includes_version_line_when_present() {
+    let mut options = TuiOptions::default();
+    options.version = "0.1.0".to_string();
+    let lines = build_welcome_banner(&options);
     assert!(
-        !lines
-            .iter()
-            .any(|line| line.trim_start().starts_with("pixy v")),
-        "version should be rendered in the title instead of a standalone welcome line"
+        lines.iter().any(|line| line.contains("v0.1.0")),
+        "version should be shown in concise welcome card"
+    );
+}
+
+#[test]
+fn welcome_banner_omits_skill_file_names() {
+    let mut options = TuiOptions::default();
+    options.startup_resource_lines = vec![
+        "Loaded skills: 2".to_string(),
+        "/workspace/.agents/skills/demo/SKILL.md".to_string(),
+    ];
+    let lines = build_welcome_banner(&options);
+    assert!(
+        lines.iter().any(|line| line == "Loaded skills: 2"),
+        "banner should include loaded skills summary"
+    );
+    assert!(
+        lines.iter().all(|line| !line.trim().ends_with("SKILL.md")),
+        "banner should not enumerate individual skill file names"
     );
 }
 
@@ -2149,35 +2355,58 @@ fn transcript_title_includes_version_when_present() {
 #[test]
 fn welcome_banner_includes_startup_resource_lines() {
     let mut options = TuiOptions::default();
-    options.startup_resource_lines = vec![
-        "[Context]".to_string(),
-        "  /workspace/AGENTS.md".to_string(),
-        String::new(),
-        "[Skills]".to_string(),
-        "  user".to_string(),
-        "    /workspace/.agents/skills/demo/SKILL.md".to_string(),
-    ];
+    options.startup_resource_lines = vec!["Loaded skills: 4".to_string()];
 
     let lines = build_welcome_banner(&options);
-    assert!(lines.contains(&" [Context]".to_string()));
-    assert!(lines.contains(&"   /workspace/AGENTS.md".to_string()));
-    assert!(lines.contains(&" [Skills]".to_string()));
-    assert!(lines.contains(&"   user".to_string()));
-    assert!(lines.contains(&"     /workspace/.agents/skills/demo/SKILL.md".to_string()));
+    assert!(lines.contains(&"Loaded skills: 4".to_string()));
+}
+
+#[test]
+fn startup_status_defaults_to_ready_even_when_session_exists() {
+    let backend = TestBackend {
+        resume_result: Ok(None),
+        resume_targets: vec![],
+        session_messages: None,
+        recent_sessions_result: Ok(None),
+        recent_sessions_limits: vec![],
+        new_session_result: Ok(None),
+        new_session_calls: 0,
+    };
+
+    assert_eq!(startup_status_label(&backend), "ready");
 }
 
 #[test]
 fn status_bar_shows_working_without_steering_rows() {
     let mut app = TuiApp::new("pixy is working...".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "Auto (High) - allow all commands".to_string(),
+        "Databend GPT-5.3 Codex [custom]".to_string(),
+    );
     app.start_working("pixy is working...".to_string());
     app.queue_follow_up("43".to_string());
     app.queue_follow_up("434".to_string());
 
-    let status = render_status_bar_lines(&app, 40);
-    assert_eq!(status.lines.len(), 2);
-    assert!(line_text(&status.lines[0]).contains("pixy is working..."));
+    let status = render_status_bar_lines(&app, 40, TuiTheme::Dark);
+    assert_eq!(status.lines.len(), 3);
     assert!(!line_text(&status.lines[0]).contains("Steering:"));
-    assert!(!line_text(&status.lines[1]).contains("Steering:"));
+    assert!(line_text(&status.lines[0]).contains("Auto (High)"));
+    assert!(line_text(&status.lines[1]).contains("shift+tab"));
+    assert!(line_text(&status.lines[2]).contains("? for help"));
+}
+
+#[test]
+fn status_bar_hides_ready_suffix_when_status_top_present() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_status_bar_meta(
+        "/data/work/pixy (main)".to_string(),
+        "Auto (High) - allow all commands".to_string(),
+        "databend/gpt-5.3-codex".to_string(),
+    );
+
+    let status = render_status_bar_lines(&app, 80, TuiTheme::Dark);
+    assert_eq!(line_text(&status.lines[0]), "/data/work/pixy (main)");
 }
 
 #[test]
