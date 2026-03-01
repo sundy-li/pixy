@@ -14,9 +14,9 @@ use pixy_agent_core::AgentAbortController;
 use pixy_ai::{Message, StopReason, UserContentBlock};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 #[cfg(test)]
 use ratatui::style::Color;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -156,7 +156,6 @@ struct TuiApp {
     status: String,
     show_help: bool,
     show_tool_results: bool,
-    show_thinking: bool,
     assistant_stream_open: bool,
     is_working: bool,
     working_message: String,
@@ -190,7 +189,6 @@ impl TuiApp {
             status,
             show_help,
             show_tool_results,
-            show_thinking: true,
             assistant_stream_open: false,
             is_working: false,
             working_message: String::new(),
@@ -307,13 +305,13 @@ impl TuiApp {
     }
 
     fn maybe_update_status_left_from_backend_status(&mut self, status: &str) {
-        let Some(permission_label) = status.strip_prefix("permission: ").map(str::trim) else {
+        let Some(mode_label) = status.strip_prefix("mode: ").map(str::trim) else {
             return;
         };
-        if permission_label.is_empty() {
+        if mode_label.is_empty() {
             return;
         }
-        self.status_left = permission_label.to_string();
+        self.status_left = mode_label.to_string();
     }
 
     fn input_char_count(&self) -> usize {
@@ -592,11 +590,6 @@ impl TuiApp {
         self.show_tool_results
     }
 
-    fn toggle_thinking(&mut self) -> bool {
-        self.show_thinking = !self.show_thinking;
-        self.show_thinking
-    }
-
     fn start_working(&mut self, _message: String) {
         self.is_working = true;
         self.working_message = "Thinking...".to_string();
@@ -761,8 +754,18 @@ impl TuiApp {
 
     fn note_working_from_update(&mut self, _app_name: &str, update: &StreamUpdate) {
         match update {
-            StreamUpdate::AssistantTextDelta(_) | StreamUpdate::AssistantLine(_) => {
+            StreamUpdate::AssistantTextDelta(_) => {
                 self.working_message = "Streaming...".to_string();
+            }
+            StreamUpdate::AssistantThinkingDelta(_) => {
+                self.working_message = "Thinking...".to_string();
+            }
+            StreamUpdate::AssistantLine(line) => {
+                self.working_message = if is_thinking_line(line) {
+                    "Thinking...".to_string()
+                } else {
+                    "Streaming...".to_string()
+                };
             }
             StreamUpdate::ToolLine(line) => {
                 if is_tool_run_line(line) {
@@ -818,6 +821,9 @@ impl TuiApp {
             StreamUpdate::AssistantTextDelta(delta) => {
                 self.append_assistant_delta(&delta);
             }
+            StreamUpdate::AssistantThinkingDelta(delta) => {
+                self.append_thinking_delta(&delta);
+            }
             StreamUpdate::AssistantLine(line) => {
                 self.assistant_stream_open = false;
                 if !line.is_empty() {
@@ -855,6 +861,25 @@ impl TuiApp {
                 }
             }
         }
+    }
+
+    fn append_thinking_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        self.assistant_stream_open = false;
+        if let Some(last) = self.transcript.last_mut() {
+            if last.kind == TranscriptLineKind::Thinking {
+                last.text.push_str(delta);
+                return;
+            }
+        }
+
+        self.transcript.push(TranscriptLine::new(
+            format!("[thinking] {delta}"),
+            TranscriptLineKind::Thinking,
+        ));
     }
 
     fn append_assistant_delta(&mut self, delta: &str) {
@@ -916,6 +941,14 @@ fn handle_editor_key_event(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {
             app.insert_char('\n');
+            true
+        }
+        KeyCode::Char('?')
+            if is_plain_char_input(key.modifiers)
+                && app.input.is_empty()
+                && !app.has_non_text_input_blocks() =>
+        {
+            app.show_help = true;
             true
         }
         KeyCode::Char(c) if is_plain_char_input(key.modifiers) => {
@@ -1904,7 +1937,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
         transcript_area.height.saturating_sub(2) as usize,
         transcript_area.width.saturating_sub(2) as usize,
         app.show_tool_results,
-        app.show_thinking,
+        true,
         app.working_line(),
         app.transcript_scroll_from_bottom,
         options.theme,
@@ -1955,16 +1988,20 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     frame.render_widget(status_top, status_top_area);
 
     let input_scroll = input_scroll_offset(app, input_area, input_prompt);
+    let (input_style, input_border_style, input_title) =
+        resolve_input_box_visual_style(app, options.theme);
+    let mut input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(input_border_style);
+    if let Some(title) = input_title {
+        input_block = input_block.title(title);
+    }
     let input = Paragraph::new(build_input_line(app, input_prompt, options.theme))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(options.theme.input_border_style()),
-        )
+        .block(input_block)
         .wrap(Wrap { trim: false })
         .scroll((input_scroll, 0))
-        .style(options.theme.input_style());
+        .style(input_style);
     frame.render_widget(input, input_area);
 
     if !app.show_help && !app.has_resume_picker() {
@@ -2002,12 +2039,8 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
                 keybinding_label(&options.keybindings.dequeue)
             )),
             Line::from(format!(
-                "  {:<14} cycle thinking level (mapped)",
+                "  {:<14} cycle mode (PLAN/ACT)",
                 keybinding_label(&options.keybindings.cycle_thinking_level)
-            )),
-            Line::from(format!(
-                "  {:<14} toggle thinking",
-                keybinding_label(&options.keybindings.toggle_thinking)
             )),
             Line::from(format!(
                 "  {:<14} cycle model forward",
@@ -2016,10 +2049,6 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             Line::from(format!(
                 "  {:<14} cycle model backward",
                 keybinding_label(&options.keybindings.cycle_model_backward)
-            )),
-            Line::from(format!(
-                "  {:<14} cycle permission mode",
-                keybinding_label(&options.keybindings.cycle_permission_mode)
             )),
             Line::from(format!(
                 "  {:<14} select model",
@@ -2107,14 +2136,44 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     }
 }
 
+fn is_plan_mode(status_left: &str) -> bool {
+    status_left
+        .trim()
+        .to_ascii_uppercase()
+        .starts_with("PLAN")
+}
+
+fn resolve_input_box_visual_style(
+    app: &TuiApp,
+    theme: TuiTheme,
+) -> (Style, Style, Option<Line<'static>>) {
+    if is_plan_mode(app.status_left.as_str()) {
+        let accent = theme.plan_mode_input_accent_color();
+        let input_style = theme.input_style().fg(accent);
+        let border_style = Style::default().fg(accent);
+        let title_style = Style::default()
+            .fg(accent)
+            .add_modifier(Modifier::BOLD);
+        let title = Line::from(vec![Span::styled(" Plan ".to_string(), title_style)]);
+        (input_style, border_style, Some(title))
+    } else {
+        (theme.input_style(), theme.input_border_style(), None)
+    }
+}
+
 fn build_input_line(app: &TuiApp, input_prompt: &str, theme: TuiTheme) -> Line<'static> {
+    let placeholder_style = if is_plan_mode(app.status_left.as_str()) {
+        Style::default().fg(theme.plan_mode_input_accent_color())
+    } else {
+        theme.input_placeholder_style()
+    };
     if app.should_show_input_placeholder() {
         return Line::from(vec![
             Span::raw(INPUT_RENDER_LEFT_PADDING),
             Span::raw(input_prompt.to_string()),
             Span::styled(
                 primary_input_placeholder_hint().to_string(),
-                theme.input_placeholder_style(),
+                placeholder_style,
             ),
         ]);
     }
@@ -2269,7 +2328,7 @@ fn render_status_bar_lines(app: &TuiApp, width: usize, theme: TuiTheme) -> Text<
     }
 
     lines.push(compose_left_right_status_line_with_styles(
-        format!(" {}", app.status_left).as_str(),
+        primary_status_left_label_for_render(app.status_left.as_str()).as_str(),
         app.status_right.as_str(),
         width,
         theme.status_primary_left_style(),
@@ -2298,6 +2357,20 @@ fn render_status_bar_lines(app: &TuiApp, width: usize, theme: TuiTheme) -> Text<
     ));
 
     Text::from(lines)
+}
+
+fn primary_status_left_label_for_render(status_left: &str) -> String {
+    let trimmed = status_left.trim();
+    if trimmed.is_empty() || is_mode_status_label(trimmed) {
+        String::new()
+    } else {
+        format!(" {trimmed}")
+    }
+}
+
+fn is_mode_status_label(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_uppercase();
+    normalized.starts_with("ACT") || normalized.starts_with("PLAN")
 }
 
 fn render_steering_panel_lines(app: &TuiApp, width: usize) -> Text<'static> {

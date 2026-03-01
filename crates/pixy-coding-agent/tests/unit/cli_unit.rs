@@ -1463,10 +1463,8 @@ fn load_tui_keybindings_reads_supported_actions() {
   "cycleThinkingLevel": "shift+tab",
   "cycleModelForward": "ctrl+p",
   "cycleModelBackward": "shift+ctrl+p",
-  "cyclePermissionMode": "ctrl+l",
   "selectModel": "ctrl+k",
   "expandTools": ["invalid", "ctrl+e"],
-  "toggleThinking": "ctrl+y",
   "followUp": "alt+enter",
   "dequeue": "alt+up"
 }"#,
@@ -1502,20 +1500,12 @@ fn load_tui_keybindings_reads_supported_actions() {
         vec![parse_key_id("shift+ctrl+p").expect("parse shift+ctrl+p")]
     );
     assert_eq!(
-        bindings.cycle_permission_mode,
-        vec![parse_key_id("ctrl+l").expect("parse ctrl+l")]
-    );
-    assert_eq!(
         bindings.select_model,
         vec![parse_key_id("ctrl+k").expect("parse ctrl+k")]
     );
     assert_eq!(
         bindings.expand_tools,
         vec![parse_key_id("ctrl+e").expect("parse ctrl+e")]
-    );
-    assert_eq!(
-        bindings.toggle_thinking,
-        vec![parse_key_id("ctrl+y").expect("parse ctrl+y")]
     );
     assert_eq!(
         bindings.continue_run,

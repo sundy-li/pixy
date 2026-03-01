@@ -8,12 +8,28 @@ pub struct KeyBinding {
 
 impl KeyBinding {
     pub(crate) fn matches(self, key: KeyEvent) -> bool {
+        let expected = normalize_modifiers(self.modifiers);
+        let actual = normalize_modifiers(key.modifiers);
+        if key.code == self.code && actual == expected {
+            return true;
+        }
+
+        // Some terminals emit Shift+Tab as BackTab with no explicit Shift modifier.
+        if self.code == KeyCode::Tab
+            && expected.contains(KeyModifiers::SHIFT)
+            && key.code == KeyCode::BackTab
+        {
+            let mut expected_without_shift = expected;
+            expected_without_shift.remove(KeyModifiers::SHIFT);
+            if actual == expected || actual == expected_without_shift {
+                return true;
+            }
+        }
+
         if key.code != self.code {
             return false;
         }
 
-        let expected = normalize_modifiers(self.modifiers);
-        let actual = normalize_modifiers(key.modifiers);
         if actual == expected {
             return true;
         }
@@ -119,10 +135,8 @@ pub struct TuiKeyBindings {
     pub cycle_thinking_level: Vec<KeyBinding>,
     pub cycle_model_forward: Vec<KeyBinding>,
     pub cycle_model_backward: Vec<KeyBinding>,
-    pub cycle_permission_mode: Vec<KeyBinding>,
     pub select_model: Vec<KeyBinding>,
     pub expand_tools: Vec<KeyBinding>,
-    pub toggle_thinking: Vec<KeyBinding>,
 }
 
 impl Default for TuiKeyBindings {
@@ -182,20 +196,12 @@ impl Default for TuiKeyBindings {
                 code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             }],
-            cycle_permission_mode: vec![KeyBinding {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
             select_model: vec![KeyBinding {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::CONTROL,
             }],
             expand_tools: vec![KeyBinding {
                 code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
-            }],
-            toggle_thinking: vec![KeyBinding {
-                code: KeyCode::Char('t'),
                 modifiers: KeyModifiers::CONTROL,
             }],
         }

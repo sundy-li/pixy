@@ -161,6 +161,57 @@ fn text_delta_stream(deltas: &[&str], final_text: &str, ts: i64) -> AssistantMes
     stream
 }
 
+fn text_delta_stream_with_final_thinking(
+    deltas: &[&str],
+    final_text: &str,
+    final_thinking: &str,
+    ts: i64,
+) -> AssistantMessageEventStream {
+    let partial = assistant_message(
+        vec![AssistantContentBlock::Text {
+            text: String::new(),
+            text_signature: None,
+        }],
+        StopReason::Stop,
+        ts,
+    );
+    let final_message = assistant_message(
+        vec![
+            AssistantContentBlock::Text {
+                text: final_text.to_string(),
+                text_signature: None,
+            },
+            AssistantContentBlock::Thinking {
+                thinking: final_thinking.to_string(),
+                thinking_signature: None,
+            },
+        ],
+        StopReason::Stop,
+        ts,
+    );
+
+    let stream = AssistantMessageEventStream::new();
+    stream.push(AssistantMessageEvent::Start {
+        partial: partial.clone(),
+    });
+    stream.push(AssistantMessageEvent::TextStart {
+        content_index: 0,
+        partial: partial.clone(),
+    });
+    for delta in deltas {
+        stream.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: (*delta).to_string(),
+            partial: partial.clone(),
+        });
+    }
+    stream.push(AssistantMessageEvent::Done {
+        reason: DoneReason::Stop,
+        message: final_message,
+    });
+    stream
+}
+
 fn thinking_delta_stream(
     deltas: &[&str],
     final_thinking: &str,
@@ -1414,6 +1465,51 @@ async fn agent_session_prompt_streaming_updates_thinking_without_duplicate_appen
         vec![
             AgentSessionStreamUpdate::AssistantLine("[thinking] Analy".to_string()),
             AgentSessionStreamUpdate::AssistantLine("[thinking] Analyzing".to_string()),
+        ]
+    );
+    assert_eq!(produced.len(), 2, "user + assistant");
+}
+
+#[tokio::test]
+async fn agent_session_prompt_streaming_keeps_final_thinking_when_only_text_delta_streamed() {
+    let dir = tempdir().expect("tempdir");
+    let session_dir = dir.path().join("sessions");
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            Ok(text_delta_stream_with_final_thinking(
+                &["hello", " world"],
+                "hello world",
+                "Need to inspect repository structure first.",
+                1_700_000_000_030,
+            ))
+        },
+    );
+
+    let manager = SessionManager::create(dir.path().to_str().expect("cwd utf-8"), &session_dir)
+        .expect("create manager");
+    let config = AgentSessionConfig {
+        model: sample_model("test-api"),
+        system_prompt: "You are helpful".to_string(),
+        stream_fn,
+        tools: create_coding_tools(dir.path()),
+    };
+    let mut session = AgentSession::new(manager, config);
+
+    let mut updates = vec![];
+    let produced = session
+        .prompt_streaming("hi", |update| updates.push(update))
+        .await
+        .expect("prompt streaming succeeds");
+
+    assert_eq!(
+        updates,
+        vec![
+            AgentSessionStreamUpdate::AssistantTextDelta("hello".to_string()),
+            AgentSessionStreamUpdate::AssistantTextDelta(" world".to_string()),
+            AgentSessionStreamUpdate::AssistantLine(String::new()),
+            AgentSessionStreamUpdate::AssistantLine(
+                "[thinking] Need to inspect repository structure first.".to_string(),
+            ),
         ]
     );
     assert_eq!(produced.len(), 2, "user + assistant");

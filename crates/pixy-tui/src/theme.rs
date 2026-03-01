@@ -79,6 +79,10 @@ impl TuiTheme {
         Style::default().fg(palette.colors.input_border)
     }
 
+    pub(crate) fn plan_mode_input_accent_color(self) -> Color {
+        self.palette().colors.plan_mode_input_border_fg
+    }
+
     pub(crate) fn footer_style(self) -> Style {
         let palette = self.palette();
         Style::default()
@@ -231,6 +235,7 @@ struct ThemeColors {
     user_input_fg: Color,
     input_placeholder_fg: Color,
     input_border: Color,
+    plan_mode_input_border_fg: Color,
     footer_fg: Color,
     footer_bg: Color,
     status_primary_left_fg: Color,
@@ -328,6 +333,15 @@ impl ThemePalette {
             .transpose()?;
         let input_border = parse_color(&colors.input_border)
             .map_err(|error| format!("invalid inputBorder: {error}"))?;
+        let plan_mode_input_border_fg = colors
+            .plan_mode_input_border_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid planModeInputBorderFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(input_border);
         let footer_fg =
             parse_color(&colors.footer_fg).map_err(|error| format!("invalid footerFg: {error}"))?;
         let footer_bg =
@@ -497,6 +511,7 @@ impl ThemePalette {
                 user_input_fg,
                 input_placeholder_fg,
                 input_border,
+                plan_mode_input_border_fg,
                 footer_fg,
                 footer_bg,
                 status_primary_left_fg,
@@ -560,6 +575,8 @@ struct ThemeFileColors {
     user_input_fg: Option<String>,
     input_placeholder_fg: Option<String>,
     input_border: String,
+    #[serde(alias = "planModeInputBoarderFg")]
+    plan_mode_input_border_fg: Option<String>,
     footer_fg: String,
     footer_bg: String,
     status_primary_left_fg: Option<String>,
@@ -687,7 +704,7 @@ mod tests {
         );
         assert_eq!(
             TuiTheme::Dark.line_style(TranscriptLineKind::Thinking),
-            Style::default().fg(Color::Rgb(86, 95, 137))
+            Style::default().fg(Color::Rgb(125, 207, 255))
         );
         assert_eq!(
             TuiTheme::Dark.line_style(TranscriptLineKind::Tool),
@@ -728,6 +745,10 @@ mod tests {
         assert_eq!(
             TuiTheme::Dark.input_placeholder_style(),
             Style::default().fg(Color::Rgb(86, 95, 137))
+        );
+        assert_eq!(
+            TuiTheme::Dark.plan_mode_input_accent_color(),
+            Color::Rgb(184, 183, 255)
         );
     }
 
@@ -930,5 +951,37 @@ mod tests {
         "##;
         let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
         assert_eq!(palette.colors.working_highlight_fg, Color::Rgb(18, 52, 86));
+    }
+
+    #[test]
+    fn parse_theme_file_accepts_plan_mode_input_boarder_fg_alias() {
+        let raw = r##"
+        {
+          "name": "dark",
+          "colors": {
+            "transcriptFg": "white",
+            "transcriptBg": "black",
+            "inputBlockBg": "#343541",
+            "inputBorder": "green",
+            "planModeInputBoarderFg": "#123456",
+            "footerFg": "darkGray",
+            "footerBg": "black",
+            "helpBorder": null,
+            "thinkingFg": "darkGray",
+            "toolFg": "gray",
+            "workingFg": "#949699",
+            "workingBg": "#282c34",
+            "toolDiffAdded": "yellow",
+            "toolDiffRemoved": "red",
+            "filePathFg": "cyan",
+            "keyTokenFg": "lightYellow"
+          }
+        }
+        "##;
+        let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
+        assert_eq!(
+            palette.colors.plan_mode_input_border_fg,
+            Color::Rgb(18, 52, 86)
+        );
     }
 }

@@ -21,8 +21,11 @@ impl TuiBackend for AgentSession {
         on_update: &'a mut dyn FnMut(StreamUpdate),
     ) -> BackendFuture<'a> {
         Box::pin(async move {
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::prompt_streaming_with_abort(self, input, abort_signal, |update| {
-                on_update(map_stream_update(update))
+                if let Some(mapped) = mapper.map(update) {
+                    on_update(mapped);
+                }
             })
             .await
         })
@@ -36,12 +39,17 @@ impl TuiBackend for AgentSession {
         on_update: &'a mut dyn FnMut(StreamUpdate),
     ) -> BackendFuture<'a> {
         Box::pin(async move {
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::prompt_streaming_blocks_with_abort(
                 self,
                 input,
                 blocks,
                 abort_signal,
-                |update| on_update(map_stream_update(update)),
+                |update| {
+                    if let Some(mapped) = mapper.map(update) {
+                        on_update(mapped);
+                    }
+                },
             )
             .await
         })
@@ -53,8 +61,11 @@ impl TuiBackend for AgentSession {
         on_update: &'a mut dyn FnMut(StreamUpdate),
     ) -> BackendFuture<'a> {
         Box::pin(async move {
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::continue_run_streaming_with_abort(self, abort_signal, |update| {
-                on_update(map_stream_update(update))
+                if let Some(mapped) = mapper.map(update) {
+                    on_update(mapped);
+                }
             })
             .await
         })
@@ -78,9 +89,9 @@ impl TuiBackend for AgentSession {
         })
     }
 
-    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
-        let mode = AgentSession::cycle_permission_mode(self);
-        Ok(Some(format!("permission: {}", mode.status_line())))
+    fn cycle_mode(&mut self) -> Result<Option<String>, String> {
+        let mode = AgentSession::cycle_mode(self);
+        Ok(Some(format!("mode: {}", mode.label())))
     }
 
     fn recent_resumable_sessions(
@@ -143,8 +154,11 @@ impl TuiBackend for CliSession {
     ) -> BackendFuture<'a> {
         Box::pin(async move {
             let session = self.ensure_session()?;
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::prompt_streaming_with_abort(session, input, abort_signal, |update| {
-                on_update(map_stream_update(update))
+                if let Some(mapped) = mapper.map(update) {
+                    on_update(mapped);
+                }
             })
             .await
         })
@@ -159,12 +173,17 @@ impl TuiBackend for CliSession {
     ) -> BackendFuture<'a> {
         Box::pin(async move {
             let session = self.ensure_session()?;
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::prompt_streaming_blocks_with_abort(
                 session,
                 input,
                 blocks,
                 abort_signal,
-                |update| on_update(map_stream_update(update)),
+                |update| {
+                    if let Some(mapped) = mapper.map(update) {
+                        on_update(mapped);
+                    }
+                },
             )
             .await
         })
@@ -177,8 +196,11 @@ impl TuiBackend for CliSession {
     ) -> BackendFuture<'a> {
         Box::pin(async move {
             let session = self.ensure_session()?;
+            let mut mapper = ThinkingStreamMapper::default();
             AgentSession::continue_run_streaming_with_abort(session, abort_signal, |update| {
-                on_update(map_stream_update(update))
+                if let Some(mapped) = mapper.map(update) {
+                    on_update(mapped);
+                }
             })
             .await
         })
@@ -205,10 +227,10 @@ impl TuiBackend for CliSession {
         })
     }
 
-    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
+    fn cycle_mode(&mut self) -> Result<Option<String>, String> {
         let session = self.ensure_session()?;
-        let mode = AgentSession::cycle_permission_mode(session);
-        Ok(Some(format!("permission: {}", mode.status_line())))
+        let mode = AgentSession::cycle_mode(session);
+        Ok(Some(format!("mode: {}", mode.label())))
     }
 
     fn recent_resumable_sessions(
@@ -249,12 +271,108 @@ impl TuiBackend for CliSession {
     }
 }
 
-fn map_stream_update(update: AgentSessionStreamUpdate) -> StreamUpdate {
-    match update {
-        AgentSessionStreamUpdate::AssistantTextDelta(delta) => {
-            StreamUpdate::AssistantTextDelta(delta)
+#[derive(Default)]
+struct ThinkingStreamMapper {
+    thinking_buffer: String,
+}
+
+impl ThinkingStreamMapper {
+    fn map(&mut self, update: AgentSessionStreamUpdate) -> Option<StreamUpdate> {
+        match update {
+            AgentSessionStreamUpdate::AssistantTextDelta(delta) => {
+                self.thinking_buffer.clear();
+                Some(StreamUpdate::AssistantTextDelta(delta))
+            }
+            AgentSessionStreamUpdate::AssistantLine(line) => self.map_assistant_line(line),
+            AgentSessionStreamUpdate::ToolLine(line) => {
+                self.thinking_buffer.clear();
+                Some(StreamUpdate::ToolLine(line))
+            }
         }
-        AgentSessionStreamUpdate::AssistantLine(line) => StreamUpdate::AssistantLine(line),
-        AgentSessionStreamUpdate::ToolLine(line) => StreamUpdate::ToolLine(line),
+    }
+
+    fn map_assistant_line(&mut self, line: String) -> Option<StreamUpdate> {
+        let Some(next_thinking) = parse_thinking_line_content(line.as_str()) else {
+            self.thinking_buffer.clear();
+            return Some(StreamUpdate::AssistantLine(line));
+        };
+
+        if let Some(delta) = next_thinking.strip_prefix(self.thinking_buffer.as_str()) {
+            self.thinking_buffer = next_thinking.to_string();
+            if delta.is_empty() {
+                None
+            } else {
+                Some(StreamUpdate::AssistantThinkingDelta(delta.to_string()))
+            }
+        } else {
+            self.thinking_buffer = next_thinking.to_string();
+            Some(StreamUpdate::AssistantLine(line))
+        }
+    }
+}
+
+fn parse_thinking_line_content(line: &str) -> Option<&str> {
+    line.strip_prefix("[thinking]")
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentSessionStreamUpdate, StreamUpdate, ThinkingStreamMapper};
+
+    #[test]
+    fn mapper_turns_prefix_growing_thinking_snapshots_into_deltas() {
+        let mut mapper = ThinkingStreamMapper::default();
+
+        let first = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] Ana".to_string(),
+        ));
+        let second = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] Analyzing".to_string(),
+        ));
+
+        assert_eq!(
+            first,
+            Some(StreamUpdate::AssistantThinkingDelta("Ana".to_string()))
+        );
+        assert_eq!(
+            second,
+            Some(StreamUpdate::AssistantThinkingDelta("lyzing".to_string()))
+        );
+    }
+
+    #[test]
+    fn mapper_suppresses_duplicate_thinking_snapshot() {
+        let mut mapper = ThinkingStreamMapper::default();
+
+        let first = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] same".to_string(),
+        ));
+        let duplicate = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] same".to_string(),
+        ));
+
+        assert_eq!(
+            first,
+            Some(StreamUpdate::AssistantThinkingDelta("same".to_string()))
+        );
+        assert_eq!(duplicate, None);
+    }
+
+    #[test]
+    fn mapper_falls_back_to_full_line_when_snapshot_is_not_prefix_growth() {
+        let mut mapper = ThinkingStreamMapper::default();
+        let _ = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] abc".to_string(),
+        ));
+
+        let replacement = mapper.map(AgentSessionStreamUpdate::AssistantLine(
+            "[thinking] ax".to_string(),
+        ));
+
+        assert_eq!(
+            replacement,
+            Some(StreamUpdate::AssistantLine("[thinking] ax".to_string()))
+        );
     }
 }

@@ -10,6 +10,7 @@ pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Message>, St
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamUpdate {
     AssistantTextDelta(String),
+    AssistantThinkingDelta(String),
     AssistantLine(String),
     ToolLine(String),
 }
@@ -54,7 +55,7 @@ pub trait TuiBackend {
     fn select_model(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
-    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
+    fn cycle_mode(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
     fn recent_resumable_sessions(

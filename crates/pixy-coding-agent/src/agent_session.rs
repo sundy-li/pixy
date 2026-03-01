@@ -15,10 +15,6 @@ use pixy_ai::{
 };
 use serde_json::Value;
 
-use crate::permission::{
-    apply_permission_mode_to_tools, current_permission_mode_state, cycle_permission_mode_state,
-    new_shared_permission_mode,
-};
 use crate::system_prompt::append_multi_agent_prompt_section;
 use crate::{
     agent_session_services::{
@@ -30,13 +26,13 @@ use crate::{
     memory::{MemoryConfig as PersistMemoryConfig, MemoryFlushContext, MemoryManager},
     BeforeToolDefinitionHookContext, BeforeUserMessageHookContext, ChildSessionStore,
     DefaultSubAgentRegistry, DispatchPolicyConfig, MergedPluginConfig, MultiAgentPluginRuntime,
-    PermissionMode, ResolvedRuntime, RuntimeLoadOptions, SessionContext, SessionManager,
-    SharedPermissionMode, TaskDispatcher, TaskDispatcherConfig, BRANCH_SUMMARY_PREFIX,
-    COMPACTION_SUMMARY_PREFIX,
+    ResolvedRuntime, RuntimeLoadOptions, SessionContext, SessionManager, TaskDispatcher,
+    TaskDispatcherConfig, BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX,
 };
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
 const AUTO_COMPACTION_SUMMARIZATION_PROMPT: &str = "Summarize the conversation above so another LLM can continue the task. Include: user goal, completed work, current status, and concrete next steps. Preserve exact file paths, commands, and error messages where relevant. Keep it concise.";
+const PLAN_MODE_PROMPT_INSTRUCTION: &str = "You are in PLAN MODE. Your output must be a bulleted list of technical steps. Do not emit any tool calls that modify the filesystem. Wrap your plan in <plan>";
 
 pub struct AgentSessionConfig {
     pub model: Model,
@@ -50,6 +46,34 @@ pub enum AgentSessionStreamUpdate {
     AssistantTextDelta(String),
     AssistantLine(String),
     ToolLine(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    Plan,
+    Act,
+}
+
+impl Default for AgentMode {
+    fn default() -> Self {
+        Self::Act
+    }
+}
+
+impl AgentMode {
+    fn cycle(self) -> Self {
+        match self {
+            Self::Act => Self::Plan,
+            Self::Plan => Self::Act,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "PLAN mode",
+            Self::Act => "ACT mode",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,13 +105,15 @@ impl Default for AutoCompactionConfig {
 pub struct AgentSession {
     session_manager: SessionManager,
     config: AgentSessionConfig,
+    act_system_prompt: String,
+    act_tools: Vec<AgentTool>,
+    mode: AgentMode,
     plugin_runtime: Arc<MultiAgentPluginRuntime>,
     memory_runtime: Option<SessionMemoryRuntime>,
     auto_compaction: AutoCompactionConfig,
     model_catalog: Vec<Model>,
     current_model_index: usize,
     retry_config: AgentRetryConfig,
-    permission_mode: SharedPermissionMode,
     resume_service: SessionResumeService,
     compaction_service: AutoCompactionService,
     stream_renderer: StreamingToolLineRenderer,
@@ -103,16 +129,20 @@ struct SessionMemoryRuntime {
 impl AgentSession {
     pub fn new(session_manager: SessionManager, config: AgentSessionConfig) -> Self {
         let current_model = config.model.clone();
+        let act_system_prompt = config.system_prompt.clone();
+        let act_tools = config.tools.clone();
         Self {
             session_manager,
             config,
+            act_system_prompt,
+            act_tools,
+            mode: AgentMode::default(),
             plugin_runtime: Arc::new(MultiAgentPluginRuntime::default()),
             memory_runtime: None,
             auto_compaction: AutoCompactionConfig::default(),
             model_catalog: vec![current_model],
             current_model_index: 0,
             retry_config: AgentRetryConfig::default(),
-            permission_mode: new_shared_permission_mode(PermissionMode::default()),
             resume_service: SessionResumeService::new(),
             compaction_service: AutoCompactionService::new(),
             stream_renderer: StreamingToolLineRenderer::new(),
@@ -232,16 +262,36 @@ impl AgentSession {
         self.retry_config = retry_config;
     }
 
-    pub fn current_permission_mode(&self) -> PermissionMode {
-        current_permission_mode_state(&self.permission_mode)
+    pub fn current_mode(&self) -> AgentMode {
+        self.mode
     }
 
-    pub fn cycle_permission_mode(&mut self) -> PermissionMode {
-        cycle_permission_mode_state(&self.permission_mode)
+    pub fn cycle_mode(&mut self) -> AgentMode {
+        let next = self.mode.cycle();
+        self.set_mode(next);
+        next
     }
 
-    fn set_permission_mode_state(&mut self, permission_mode: SharedPermissionMode) {
-        self.permission_mode = permission_mode;
+    pub fn set_mode(&mut self, mode: AgentMode) {
+        self.mode = mode;
+        match mode {
+            AgentMode::Act => {
+                self.config.system_prompt = self.act_system_prompt.clone();
+                self.config.tools = self.act_tools.clone();
+            }
+            AgentMode::Plan => {
+                self.config.system_prompt = format!(
+                    "{}\n\n{PLAN_MODE_PROMPT_INSTRUCTION}",
+                    self.act_system_prompt.trim_end()
+                );
+                self.config.tools = self
+                    .act_tools
+                    .iter()
+                    .filter(|tool| tool.name != "edit")
+                    .cloned()
+                    .collect();
+            }
+        }
     }
 
     pub fn set_model_catalog(&mut self, models: Vec<Model>) {
@@ -945,16 +995,13 @@ fn resolve_runtime_api_key_for_model(
     default_provider: &str,
     runtime_api_key: Option<&String>,
 ) -> Option<String> {
-    provider_api_keys
-        .get(model_provider)
-        .cloned()
-        .or_else(|| {
-            if model_provider == default_provider {
-                runtime_api_key.cloned()
-            } else {
-                None
-            }
-        })
+    provider_api_keys.get(model_provider).cloned().or_else(|| {
+        if model_provider == default_provider {
+            runtime_api_key.cloned()
+        } else {
+            None
+        }
+    })
 }
 
 pub fn create_session_from_runtime(
@@ -1028,8 +1075,6 @@ pub fn create_session_from_runtime(
         }
     };
     apply_before_tool_definition_hooks(plugin_runtime.as_ref(), &mut child_tools);
-    let permission_mode = new_shared_permission_mode(PermissionMode::default());
-    apply_permission_mode_to_tools(&mut child_tools, cwd, permission_mode.clone());
 
     let mut tools = child_tools.clone();
     let mut prompt_subagents = vec![];
@@ -1133,7 +1178,6 @@ pub fn create_session_from_runtime(
     let mut session = AgentSession::new(session_manager, config);
     session.set_multi_agent_plugin_runtime(plugin_runtime);
     session.set_memory_runtime(session_memory_runtime);
-    session.set_permission_mode_state(permission_mode);
     if !runtime.model_catalog.is_empty() {
         session.set_model_catalog(runtime.model_catalog.clone());
     }
@@ -1424,23 +1468,23 @@ fn render_assistant_message_for_streaming(
 
     if had_text_delta {
         updates.push(AgentSessionStreamUpdate::AssistantLine(String::new()));
-    } else {
-        for block in content {
-            match block {
-                AssistantContentBlock::Text { text, .. } => {
-                    if !text.trim().is_empty() {
-                        updates.push(AgentSessionStreamUpdate::AssistantLine(text.clone()));
-                    }
+    }
+
+    for block in content {
+        match block {
+            AssistantContentBlock::Text { text, .. } => {
+                if !had_text_delta && !text.trim().is_empty() {
+                    updates.push(AgentSessionStreamUpdate::AssistantLine(text.clone()));
                 }
-                AssistantContentBlock::Thinking { thinking, .. } => {
-                    if !had_thinking_delta && !thinking.trim().is_empty() {
-                        updates.push(AgentSessionStreamUpdate::AssistantLine(format!(
-                            "[thinking] {thinking}"
-                        )));
-                    }
-                }
-                AssistantContentBlock::ToolCall { .. } => {}
             }
+            AssistantContentBlock::Thinking { thinking, .. } => {
+                if !had_thinking_delta && !thinking.trim().is_empty() {
+                    updates.push(AgentSessionStreamUpdate::AssistantLine(format!(
+                        "[thinking] {thinking}"
+                    )));
+                }
+            }
+            AssistantContentBlock::ToolCall { .. } => {}
         }
     }
 
@@ -1922,7 +1966,8 @@ mod tests {
 
     use super::{
         build_session_resume_candidate, create_session_from_runtime, format_bash_tool_start_line,
-        normalize_session_candidate_title, resolve_runtime_api_key_for_model, ResolvedRuntime,
+        normalize_session_candidate_title, resolve_runtime_api_key_for_model, AgentMode,
+        ResolvedRuntime,
     };
     use crate::{
         ResolvedMemoryConfig, ResolvedMemorySearchConfig, ResolvedMultiAgentConfig, SessionManager,
@@ -2368,5 +2413,68 @@ value = "\n[plugin hook active]"
         assert!(content.contains("Memory Flush"));
         assert!(content.contains("compaction recap for memory flush"));
         assert!(content.contains("Compaction Count"));
+    }
+
+    #[test]
+    fn cycle_mode_plan_removes_edit_tool_and_restores_it_in_act() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            provider_api_keys: HashMap::new(),
+            multi_agent: ResolvedMultiAgentConfig::default(),
+            memory: default_memory_config(),
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let mut session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+
+        assert_eq!(session.current_mode(), AgentMode::Act);
+        assert!(
+            session.config.tools.iter().any(|tool| tool.name == "edit"),
+            "edit tool should be available in ACT mode"
+        );
+        assert!(!session
+            .config
+            .system_prompt
+            .contains("You are in PLAN MODE."));
+
+        assert_eq!(session.cycle_mode(), AgentMode::Plan);
+        assert!(
+            !session.config.tools.iter().any(|tool| tool.name == "edit"),
+            "edit tool should be removed in PLAN mode"
+        );
+        assert!(session
+            .config
+            .system_prompt
+            .contains("You are in PLAN MODE."));
+        assert!(session
+            .config
+            .system_prompt
+            .contains("Wrap your plan in <plan>"));
+
+        assert_eq!(session.cycle_mode(), AgentMode::Act);
+        assert!(
+            session.config.tools.iter().any(|tool| tool.name == "edit"),
+            "edit tool should be restored after returning to ACT mode"
+        );
+        assert!(!session
+            .config
+            .system_prompt
+            .contains("You are in PLAN MODE."));
     }
 }

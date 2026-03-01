@@ -134,13 +134,6 @@ fn default_keybindings_match_expected_keys() {
         }]
     );
     assert_eq!(
-        bindings.toggle_thinking,
-        vec![KeyBinding {
-            code: KeyCode::Char('t'),
-            modifiers: KeyModifiers::CONTROL
-        }]
-    );
-    assert_eq!(
         bindings.interrupt,
         vec![KeyBinding {
             code: KeyCode::Esc,
@@ -172,13 +165,6 @@ fn default_keybindings_match_expected_keys() {
         bindings.select_model,
         vec![KeyBinding {
             code: KeyCode::Char('k'),
-            modifiers: KeyModifiers::CONTROL
-        }]
-    );
-    assert_eq!(
-        bindings.cycle_permission_mode,
-        vec![KeyBinding {
-            code: KeyCode::Char('l'),
             modifiers: KeyModifiers::CONTROL
         }]
     );
@@ -226,6 +212,18 @@ fn parse_key_id_supports_common_shortcuts() {
 }
 
 #[test]
+fn shift_tab_binding_matches_backtab_terminal_events() {
+    let binding = KeyBinding {
+        code: KeyCode::Tab,
+        modifiers: KeyModifiers::SHIFT,
+    };
+
+    assert!(binding.matches(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+    assert!(binding.matches(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+    assert!(!binding.matches(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+}
+
+#[test]
 fn editor_supports_common_emacs_shortcuts() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.input = "hello rust world".to_string();
@@ -269,6 +267,37 @@ fn editing_input_resets_transcript_scroll_to_latest() {
         KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
     ));
     assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[test]
+fn first_question_mark_opens_help_menu_without_inserting_input() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    assert!(!app.show_help);
+
+    assert!(handle_editor_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+    ));
+
+    assert!(app.show_help);
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor_pos, 0);
+}
+
+#[test]
+fn question_mark_after_existing_input_is_typed_normally() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.input = "hello".to_string();
+    app.cursor_pos = app.input_char_count();
+
+    assert!(handle_editor_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+    ));
+
+    assert!(!app.show_help);
+    assert_eq!(app.input, "hello?");
+    assert_eq!(app.cursor_pos, "hello?".chars().count());
 }
 
 #[test]
@@ -641,6 +670,44 @@ fn input_line_hides_placeholder_after_first_submission() {
 }
 
 #[test]
+fn plan_mode_input_line_uses_purple_placeholder_style() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.status_left = "PLAN mode".to_string();
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+    persist_welcome_into_transcript(&mut app);
+
+    let line = build_input_line(&app, "> ", TuiTheme::Dark);
+    let expected = crate::constants::INPUT_PLACEHOLDER_HINTS
+        .first()
+        .copied()
+        .expect("placeholder hints should not be empty");
+    assert!(line.spans.iter().any(|span| {
+        span.content.contains(expected)
+            && span.style.fg == Some(TuiTheme::Dark.plan_mode_input_accent_color())
+    }));
+}
+
+#[test]
+fn plan_mode_input_box_uses_purple_border_and_plan_title() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.status_left = "PLAN mode".to_string();
+
+    let (input_style, border_style, title) = resolve_input_box_visual_style(&app, TuiTheme::Dark);
+    let title = title.expect("plan mode should set input title");
+    let title_text = line_text(&title);
+
+    assert_eq!(
+        border_style.fg,
+        Some(TuiTheme::Dark.plan_mode_input_accent_color())
+    );
+    assert_eq!(
+        input_style.fg,
+        Some(TuiTheme::Dark.plan_mode_input_accent_color())
+    );
+    assert!(title_text.contains("Plan"));
+}
+
+#[test]
 fn visible_transcript_picks_latest_lines() {
     let lines = vec![
         TranscriptLine::new("l1".to_string(), TranscriptLineKind::Normal),
@@ -758,21 +825,18 @@ fn status_bar_keeps_top_line_stable_while_working() {
     let mut app = TuiApp::new("pi is working...".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        String::new(),
         "Databend GPT-5.3 Codex [custom]".to_string(),
     );
     app.start_working("pi is working...".to_string());
-    app.status_left =
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string();
 
     let status = render_status_bar_lines(&app, 120, TuiTheme::Dark);
     let middle = line_text(&status.lines[0]);
     let hints = line_text(&status.lines[1]);
     let bottom = line_text(&status.lines[2]);
 
-    assert!(middle.contains("Auto (off) - workspace edits/commands"));
     assert!(middle.contains("Databend GPT-5.3 Codex [custom]"));
-    assert!(hints.contains("shift+tab to toggle thinking"));
+    assert!(hints.contains("shift+tab to cycle mode"));
     assert!(bottom.contains("[⏱"));
 }
 
@@ -781,7 +845,7 @@ fn backend_model_status_updates_status_right_with_provider_and_model() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        String::new(),
         "Databend GPT-5.3 Codex".to_string(),
     );
 
@@ -795,7 +859,7 @@ fn backend_model_status_replaces_previous_label_with_provider_and_model() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        String::new(),
         "openai:gpt-5.3-codex".to_string(),
     );
 
@@ -805,22 +869,33 @@ fn backend_model_status_replaces_previous_label_with_provider_and_model() {
 }
 
 #[test]
-fn backend_permission_status_updates_status_left_label() {
+fn backend_mode_status_updates_status_left_label() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        "ACT".to_string(),
         "openai:gpt-5.3-codex".to_string(),
     );
 
-    app.maybe_update_status_left_from_backend_status(
-        "permission: Auto (full) - internet and outside-workspace edits are allowed without approval",
+    app.maybe_update_status_left_from_backend_status("mode: PLAN");
+
+    assert_eq!(app.status_left, "PLAN");
+}
+
+#[test]
+fn status_bar_hides_mode_label_when_status_left_is_mode() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "PLAN mode".to_string(),
+        "openai:gpt-5.3-codex".to_string(),
     );
 
-    assert_eq!(
-        app.status_left,
-        "Auto (full) - internet and outside-workspace edits are allowed without approval"
-    );
+    let status = render_status_bar_lines(&app, 80, TuiTheme::Dark);
+    let primary = line_text(&status.lines[0]);
+
+    assert!(primary.contains("openai:gpt-5.3-codex"));
+    assert!(!primary.contains("PLAN"));
 }
 
 #[test]
@@ -845,6 +920,18 @@ fn assistant_stream_update_switches_working_message_to_streaming() {
 
     app.note_working_from_update("pixy", &StreamUpdate::AssistantTextDelta("h".to_string()));
     assert_eq!(app.working_message, "Streaming...");
+}
+
+#[test]
+fn thinking_stream_update_keeps_working_message_as_thinking() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.start_working("pixy is working...".to_string());
+
+    app.note_working_from_update(
+        "pixy",
+        &StreamUpdate::AssistantThinkingDelta("ana".to_string()),
+    );
+    assert_eq!(app.working_message, "Thinking...");
 }
 
 #[test]
@@ -1476,7 +1563,7 @@ fn streaming_delta_with_chinese_markdown_table_is_rendered_as_table() {
         40,
         120,
         app.show_tool_results,
-        app.show_thinking,
+        true,
         app.working_line(),
         app.transcript_scroll_from_bottom,
         TuiTheme::Dark,
@@ -1517,7 +1604,7 @@ fn user_input_markdown_table_is_rendered_as_table() {
         40,
         120,
         app.show_tool_results,
-        app.show_thinking,
+        true,
         app.working_line(),
         app.transcript_scroll_from_bottom,
         TuiTheme::Dark,
@@ -1552,7 +1639,7 @@ fn assistant_line_with_multiline_markdown_table_is_rendered_as_table() {
         40,
         120,
         app.show_tool_results,
-        app.show_thinking,
+        true,
         app.working_line(),
         app.transcript_scroll_from_bottom,
         TuiTheme::Dark,
@@ -1590,7 +1677,7 @@ fn markdown_fenced_markdown_table_is_rendered_as_table_not_code() {
         40,
         120,
         app.show_tool_results,
-        app.show_thinking,
+        true,
         app.working_line(),
         app.transcript_scroll_from_bottom,
         TuiTheme::Dark,
@@ -1951,6 +2038,18 @@ fn apply_stream_update_updates_thinking_line_in_place_while_streaming() {
     app.stop_working();
     app.apply_stream_update(StreamUpdate::AssistantLine("[thinking] done".to_string()));
     assert_eq!(app.transcript.len(), 2);
+}
+
+#[test]
+fn apply_stream_update_appends_thinking_delta_with_typewriter_effect() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.start_working("pixy is reasoning...".to_string());
+    app.apply_stream_update(StreamUpdate::AssistantThinkingDelta("Ana".to_string()));
+    app.apply_stream_update(StreamUpdate::AssistantThinkingDelta("lyzing".to_string()));
+
+    assert_eq!(app.transcript.len(), 1);
+    assert_eq!(app.transcript[0].text, "[thinking] Analyzing");
+    assert_eq!(app.transcript[0].kind, TranscriptLineKind::Thinking);
 }
 
 #[tokio::test]
@@ -2517,7 +2616,7 @@ fn status_bar_shows_working_without_steering_rows() {
     let mut app = TuiApp::new("pixy is working...".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        String::new(),
         "Databend GPT-5.3 Codex [custom]".to_string(),
     );
     app.start_working("pixy is working...".to_string());
@@ -2527,8 +2626,8 @@ fn status_bar_shows_working_without_steering_rows() {
     let status = render_status_bar_lines(&app, 40, TuiTheme::Dark);
     assert_eq!(status.lines.len(), 3);
     assert!(!line_text(&status.lines[0]).contains("Steering:"));
-    assert!(line_text(&status.lines[0]).contains("Auto (off)"));
     assert!(line_text(&status.lines[1]).contains("shift+tab"));
+    assert!(!line_text(&status.lines[1]).contains("ctrl+L"));
     assert!(line_text(&status.lines[2]).contains("? for help"));
 }
 
@@ -2537,7 +2636,7 @@ fn status_bar_hides_ready_suffix_when_status_top_present() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_status_bar_meta(
         "/data/work/pixy (main)".to_string(),
-        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        String::new(),
         "databend/gpt-5.3-codex".to_string(),
     );
 

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use crate::cli_app::{
     CliSession, CliSessionFactory, CliSessionRequest, ReplCommand, ReplCommandParser,
 };
-use crate::{AgentSession, AgentSessionStreamUpdate, PermissionMode, RuntimeOverrides, Skill};
+use crate::{AgentMode, AgentSession, AgentSessionStreamUpdate, RuntimeOverrides, Skill};
 use clap::{Args, Parser, Subcommand};
 use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
 use pixy_tui::{parse_key_id, KeyBinding, TuiKeyBindings, TuiOptions, TuiTheme};
@@ -448,7 +448,7 @@ async fn run(args: ChatArgs) -> Result<(), String> {
         let theme = TuiTheme::from_name(theme_name.as_str())
             .ok_or_else(|| format!("unsupported theme '{theme_name}', expected dark or light"))?;
         let status_top = build_status_top_line(&cwd);
-        let status_left = PermissionMode::default().status_line().to_string();
+        let status_left = AgentMode::default().label().to_string();
         let status_right = format_status_model_label(
             runtime_model.provider.as_str(),
             runtime_model.id.as_str(),
@@ -1483,22 +1483,8 @@ fn load_tui_keybindings(agent_dir: &Path) -> Option<TuiKeyBindings> {
         keybindings.cycle_model_backward = bindings;
         changed = true;
     }
-    if let Some(bindings) = object
-        .get("cyclePermissionMode")
-        .and_then(parse_keybinding_values)
-    {
-        keybindings.cycle_permission_mode = bindings;
-        changed = true;
-    }
     if let Some(bindings) = object.get("selectModel").and_then(parse_keybinding_values) {
         keybindings.select_model = bindings;
-        changed = true;
-    }
-    if let Some(bindings) = object
-        .get("toggleThinking")
-        .and_then(parse_keybinding_values)
-    {
-        keybindings.toggle_thinking = bindings;
         changed = true;
     }
     if let Some(bindings) = object.get("followUp").and_then(parse_keybinding_values) {

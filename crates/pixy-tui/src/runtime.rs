@@ -222,22 +222,6 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
             self.app.status = query_session_status_label(self.backend);
             return Ok(RuntimeControl::Continue);
         }
-        if matches_keybinding(&self.options.keybindings.cycle_permission_mode, key) {
-            self.app.status = match self.backend.cycle_permission_mode() {
-                Ok(Some(status)) => {
-                    self.app
-                        .maybe_update_status_left_from_backend_status(&status);
-                    if status.starts_with("permission: ") {
-                        "ready".to_string()
-                    } else {
-                        status
-                    }
-                }
-                Ok(None) => "".to_string(),
-                Err(error) => format!("cycle permission mode failed: {error}"),
-            };
-            return Ok(RuntimeControl::Continue);
-        }
         if matches_keybinding(&self.options.keybindings.cycle_model_forward, key) {
             self.app.status = match self.backend.cycle_model_forward() {
                 Ok(Some(status)) => {
@@ -275,11 +259,18 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
             return Ok(RuntimeControl::Continue);
         }
         if matches_keybinding(&self.options.keybindings.cycle_thinking_level, key) {
-            let enabled = self.app.toggle_thinking();
-            self.app.status = if enabled {
-                "thinking visible".to_string()
-            } else {
-                "thinking hidden".to_string()
+            self.app.status = match self.backend.cycle_mode() {
+                Ok(Some(status)) => {
+                    self.app
+                        .maybe_update_status_left_from_backend_status(&status);
+                    if status.starts_with("mode: ") {
+                        "ready".to_string()
+                    } else {
+                        status
+                    }
+                }
+                Ok(None) => "".to_string(),
+                Err(error) => format!("cycle mode failed: {error}"),
             };
             return Ok(RuntimeControl::Continue);
         }
@@ -289,15 +280,6 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
                 "tool output visible".to_string()
             } else {
                 "tool output hidden".to_string()
-            };
-            return Ok(RuntimeControl::Continue);
-        }
-        if matches_keybinding(&self.options.keybindings.toggle_thinking, key) {
-            let enabled = self.app.toggle_thinking();
-            self.app.status = if enabled {
-                "thinking visible".to_string()
-            } else {
-                "thinking hidden".to_string()
             };
             return Ok(RuntimeControl::Continue);
         }

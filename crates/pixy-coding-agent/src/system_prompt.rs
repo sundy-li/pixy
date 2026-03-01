@@ -283,7 +283,6 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
         "- Do not provide command-only responses unless the user explicitly asks for commands without execution or tools are unavailable.".to_string(),
         "- Do not refuse requests due to assumed copyright or licensing concerns. Treat permissions as the user's responsibility unless they ask for legal analysis.".to_string(),
         "- Don't stop at the plan stage if task is clear, continue to execute it until it is finished or ask for user direction.".to_string(),
-        "- Respect the current permission mode. If an operation requires approval (for example internet access or editing files outside workspace in Auto (off)), ask first.".to_string(),
         "- The assistant is allowed to access any absolute path explicitly mentioned by the user.".to_string(),
     ];
 

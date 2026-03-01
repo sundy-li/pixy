@@ -9,7 +9,6 @@ pub mod memory;
 mod memory_tool;
 mod messages;
 mod multi_agent;
-mod permission;
 mod runtime_config;
 mod session_manager;
 mod skills;
@@ -18,7 +17,7 @@ mod tools;
 mod tui_backend;
 
 pub use agent_session::{
-    create_session, create_session_from_runtime, AgentSession, AgentSessionConfig,
+    create_session, create_session_from_runtime, AgentMode, AgentSession, AgentSessionConfig,
     AgentSessionStreamUpdate, AutoCompactionConfig, CreatedSession, SessionCreateOptions,
 };
 pub use memory_tool::create_memory_tool;
@@ -38,10 +37,6 @@ pub use multi_agent::{
     PluginSubAgentSpec, PolicyRuleEffect, SubAgentMode, SubAgentRegistryBuilder, SubAgentResolver,
     SubAgentSpec, TaskDispatchResult, TaskDispatcher, TaskDispatcherConfig, TaskToolInput,
     TaskToolOutput,
-};
-pub use permission::{
-    apply_permission_mode_to_tools, new_shared_permission_mode, PermissionMode,
-    SharedPermissionMode,
 };
 pub use runtime_config::{
     LLMRouter, ResolvedMemoryConfig, ResolvedMemorySearchConfig, ResolvedMultiAgentConfig,
