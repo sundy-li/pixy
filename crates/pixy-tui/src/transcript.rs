@@ -1,5 +1,5 @@
 use pixy_ai::{AssistantContentBlock, Message, StopReason, ToolResultContentBlock};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -20,7 +20,6 @@ pub(crate) enum TranscriptLineKind {
 
 const TOOL_COMPACTION_HEAD_LINES: usize = 2;
 const TOOL_COMPACTION_TAIL_LINES: usize = 1;
-const ASSISTANT_OUTPUT_PREFIX: &str = "⛬  ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TranscriptLine {
@@ -178,18 +177,11 @@ impl TranscriptLine {
 fn overlay_welcome_style(text: &str, base: Style, theme: TuiTheme) -> Style {
     let trimmed = text.trim();
     if trimmed.contains('█') {
-        return match theme {
-            TuiTheme::Dark => base
-                .fg(Color::Rgb(236, 236, 236))
-                .add_modifier(Modifier::BOLD),
-            TuiTheme::Light => base
-                .fg(Color::Rgb(20, 20, 20))
-                .add_modifier(Modifier::BOLD),
-        };
+        return theme.overlay_logo_style(base);
     }
 
     if trimmed.starts_with('v') {
-        return base.fg(Color::DarkGray);
+        return theme.overlay_version_style(base);
     }
 
     base
@@ -297,7 +289,11 @@ fn centered_line_with_padding(
     }
     let text_width = UnicodeWidthStr::width(text);
     if text_width >= width {
-        return line_with_padding(vec![Span::styled(text.to_string(), text_style)], width, text_style);
+        return line_with_padding(
+            vec![Span::styled(text.to_string(), text_style)],
+            width,
+            text_style,
+        );
     }
 
     let left_padding = (width - text_width) / 2;
@@ -1629,7 +1625,7 @@ pub(crate) fn visible_transcript_lines(
     let compacted = compact_tool_transcript_lines(&markdown_rendered);
     let spaced = pad_transcript_block_boundaries(&compacted);
     let wrapped = wrap_transcript_lines(&spaced, max_width);
-    let prefixed = decorate_assistant_output_prefix(&wrapped);
+    let prefixed = decorate_assistant_output_prefix(&wrapped, theme.output_prompt());
     let max_scroll = prefixed.len().saturating_sub(max_lines);
     let scroll = scroll_from_bottom.min(max_scroll);
     let end = prefixed.len().saturating_sub(scroll);
@@ -1640,7 +1636,10 @@ pub(crate) fn visible_transcript_lines(
         .collect()
 }
 
-fn decorate_assistant_output_prefix(lines: &[TranscriptLine]) -> Vec<TranscriptLine> {
+fn decorate_assistant_output_prefix(
+    lines: &[TranscriptLine],
+    output_prompt: &str,
+) -> Vec<TranscriptLine> {
     let mut decorated = Vec::with_capacity(lines.len());
     let mut should_prefix_current_block = true;
 
@@ -1654,9 +1653,10 @@ fn decorate_assistant_output_prefix(lines: &[TranscriptLine]) -> Vec<TranscriptL
         let mut decorated_line = line.clone();
         if should_prefix_current_block
             && should_prefix_assistant_output_line(decorated_line.text.as_str())
-            && !decorated_line.text.starts_with(ASSISTANT_OUTPUT_PREFIX)
+            && !decorated_line.text.starts_with(output_prompt)
         {
-            decorated_line.text = format_assistant_output_line(decorated_line.text.as_str());
+            decorated_line.text =
+                format_assistant_output_line(decorated_line.text.as_str(), output_prompt);
             should_prefix_current_block = false;
         }
         decorated.push(decorated_line);
@@ -1665,8 +1665,8 @@ fn decorate_assistant_output_prefix(lines: &[TranscriptLine]) -> Vec<TranscriptL
     decorated
 }
 
-fn format_assistant_output_line(line: &str) -> String {
-    format!("{ASSISTANT_OUTPUT_PREFIX}{line}")
+fn format_assistant_output_line(line: &str, output_prompt: &str) -> String {
+    format!("{output_prompt}{line}")
 }
 
 fn should_prefix_assistant_output_line(line: &str) -> bool {

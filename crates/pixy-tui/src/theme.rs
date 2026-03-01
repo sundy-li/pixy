@@ -8,7 +8,7 @@ use crate::transcript::TranscriptLineKind;
 const DARK_THEME_JSON: &str = include_str!("../themes/dark.json");
 const LIGHT_THEME_JSON: &str = include_str!("../themes/light.json");
 const DEFAULT_INPUT_PROMPT: &str = "> ";
-const USER_INPUT_FG: Color = Color::Rgb(226, 154, 42);
+const DEFAULT_OUTPUT_PROMPT: &str = "⛬  ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiTheme {
@@ -56,11 +56,22 @@ impl TuiTheme {
     }
 
     pub(crate) fn input_style(self) -> Style {
-        self.transcript_style()
+        let palette = self.palette();
+        Style::default()
+            .fg(palette.colors.user_input_fg)
+            .bg(palette.colors.input_block_bg)
+    }
+
+    pub(crate) fn input_placeholder_style(self) -> Style {
+        Style::default().fg(self.palette().colors.input_placeholder_fg)
     }
 
     pub(crate) fn input_prompt(self) -> &'static str {
         self.palette().input_prompt.as_str()
+    }
+
+    pub(crate) fn output_prompt(self) -> &'static str {
+        self.palette().output_prompt.as_str()
     }
 
     pub(crate) fn input_border_style(self) -> Style {
@@ -70,35 +81,25 @@ impl TuiTheme {
 
     pub(crate) fn footer_style(self) -> Style {
         let palette = self.palette();
-        Style::default().bg(palette.colors.footer_bg)
+        Style::default()
+            .fg(palette.colors.footer_fg)
+            .bg(palette.colors.footer_bg)
     }
 
     pub(crate) fn status_primary_left_style(self) -> Style {
-        match self {
-            Self::Dark => Style::default().fg(Color::Indexed(179)),
-            Self::Light => Style::default().fg(Color::DarkGray),
-        }
+        Style::default().fg(self.palette().colors.status_primary_left_fg)
     }
 
     pub(crate) fn status_primary_right_style(self) -> Style {
-        match self {
-            Self::Dark => Style::default().fg(Color::White),
-            Self::Light => Style::default().fg(Color::Black),
-        }
+        Style::default().fg(self.palette().colors.status_primary_right_fg)
     }
 
     pub(crate) fn status_hint_style(self) -> Style {
-        match self {
-            Self::Dark => Style::default().fg(Color::DarkGray),
-            Self::Light => Style::default().fg(Color::DarkGray),
-        }
+        Style::default().fg(self.palette().colors.status_hint_fg)
     }
 
     pub(crate) fn status_help_right_style(self) -> Style {
-        match self {
-            Self::Dark => Style::default().fg(Color::Indexed(217)),
-            Self::Light => Style::default().fg(Color::Magenta),
-        }
+        Style::default().fg(self.palette().colors.status_help_right_fg)
     }
 
     pub(crate) fn help_style(self) -> Style {
@@ -122,7 +123,7 @@ impl TuiTheme {
             TranscriptLineKind::Overlay => Style::default(),
             TranscriptLineKind::Code => self.code_block_style(),
             TranscriptLineKind::UserInput => Style::default()
-                .fg(USER_INPUT_FG)
+                .fg(palette.colors.user_input_fg)
                 .bg(palette.colors.input_block_bg),
             TranscriptLineKind::Thinking => Style::default().fg(palette.colors.thinking_fg),
             TranscriptLineKind::Tool => Style::default().fg(palette.colors.tool_fg),
@@ -160,50 +161,37 @@ impl TuiTheme {
     }
 
     pub(crate) fn code_block_style(self) -> Style {
-        match self {
-            Self::Dark => Style::default()
-                .fg(Color::Rgb(229, 231, 235))
-                .bg(Color::Rgb(40, 44, 52)),
-            Self::Light => Style::default()
-                .fg(Color::Rgb(57, 57, 57))
-                .bg(Color::Rgb(243, 244, 246)),
-        }
+        let palette = self.palette();
+        Style::default()
+            .fg(palette.colors.code_block_fg)
+            .bg(palette.colors.code_block_bg)
     }
 
     pub(crate) fn code_keyword_style(self, base: Style) -> Style {
-        match self {
-            Self::Dark => base
-                .fg(Color::Rgb(129, 161, 193))
-                .add_modifier(Modifier::BOLD),
-            Self::Light => base
-                .fg(Color::Rgb(26, 95, 180))
-                .add_modifier(Modifier::BOLD),
-        }
+        base.fg(self.palette().colors.code_keyword_fg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub(crate) fn code_string_style(self, base: Style) -> Style {
-        match self {
-            Self::Dark => base.fg(Color::Rgb(163, 190, 140)),
-            Self::Light => base.fg(Color::Rgb(34, 139, 34)),
-        }
+        base.fg(self.palette().colors.code_string_fg)
     }
 
     pub(crate) fn code_comment_style(self, base: Style) -> Style {
-        match self {
-            Self::Dark => base
-                .fg(Color::Rgb(125, 130, 140))
-                .add_modifier(Modifier::ITALIC),
-            Self::Light => base
-                .fg(Color::Rgb(120, 124, 130))
-                .add_modifier(Modifier::ITALIC),
-        }
+        base.fg(self.palette().colors.code_comment_fg)
+            .add_modifier(Modifier::ITALIC)
     }
 
     pub(crate) fn code_number_style(self, base: Style) -> Style {
-        match self {
-            Self::Dark => base.fg(Color::Rgb(208, 135, 112)),
-            Self::Light => base.fg(Color::Rgb(175, 82, 222)),
-        }
+        base.fg(self.palette().colors.code_number_fg)
+    }
+
+    pub(crate) fn overlay_logo_style(self, base: Style) -> Style {
+        base.fg(self.palette().colors.overlay_logo_fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub(crate) fn overlay_version_style(self, base: Style) -> Style {
+        base.fg(self.palette().colors.overlay_version_fg)
     }
 
     pub(crate) fn selection_colors(self) -> Option<(Color, Color)> {
@@ -240,9 +228,15 @@ struct ThemeColors {
     transcript_fg: Color,
     transcript_bg: Color,
     input_block_bg: Color,
+    user_input_fg: Color,
+    input_placeholder_fg: Color,
     input_border: Color,
     footer_fg: Color,
     footer_bg: Color,
+    status_primary_left_fg: Color,
+    status_primary_right_fg: Color,
+    status_hint_fg: Color,
+    status_help_right_fg: Color,
     help_border: Option<Color>,
     thinking_fg: Color,
     tool_fg: Color,
@@ -255,6 +249,14 @@ struct ThemeColors {
     key_token_fg: Color,
     skills_header_fg: Color,
     skills_group_fg: Color,
+    code_block_fg: Color,
+    code_block_bg: Color,
+    code_keyword_fg: Color,
+    code_string_fg: Color,
+    code_comment_fg: Color,
+    code_number_fg: Color,
+    overlay_logo_fg: Color,
+    overlay_version_fg: Color,
     selection_bg: Option<Color>,
     selection_fg: Option<Color>,
 }
@@ -263,6 +265,7 @@ struct ThemeColors {
 struct ThemePalette {
     colors: ThemeColors,
     input_prompt: String,
+    output_prompt: String,
 }
 
 impl ThemePalette {
@@ -273,6 +276,7 @@ impl ThemePalette {
             name,
             colors,
             input_prompt,
+            output_prompt,
         } = parsed;
 
         if name.trim().to_ascii_lowercase() != expected_name {
@@ -306,12 +310,62 @@ impl ThemePalette {
             .map_err(|error| format!("invalid transcriptBg: {error}"))?;
         let input_block_bg = parse_color(&colors.input_block_bg)
             .map_err(|error| format!("invalid inputBlockBg: {error}"))?;
+        let user_input_fg = colors
+            .user_input_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid userInputFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(transcript_fg);
+        let input_placeholder_fg = colors
+            .input_placeholder_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid inputPlaceholderFg: {error}"))
+            })
+            .transpose()?;
         let input_border = parse_color(&colors.input_border)
             .map_err(|error| format!("invalid inputBorder: {error}"))?;
         let footer_fg =
             parse_color(&colors.footer_fg).map_err(|error| format!("invalid footerFg: {error}"))?;
         let footer_bg =
             parse_color(&colors.footer_bg).map_err(|error| format!("invalid footerBg: {error}"))?;
+        let status_primary_left_fg = colors
+            .status_primary_left_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid statusPrimaryLeftFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(footer_fg);
+        let status_primary_right_fg = colors
+            .status_primary_right_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid statusPrimaryRightFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(transcript_fg);
+        let status_hint_fg = colors
+            .status_hint_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid statusHintFg: {error}"))
+            })
+            .transpose()?;
+        let status_help_right_fg = colors
+            .status_help_right_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid statusHelpRightFg: {error}"))
+            })
+            .transpose()?;
         let help_border = colors
             .help_border
             .map(|value| {
@@ -320,6 +374,9 @@ impl ThemePalette {
             .transpose()?;
         let thinking_fg = parse_color(&colors.thinking_fg)
             .map_err(|error| format!("invalid thinkingFg: {error}"))?;
+        let input_placeholder_fg = input_placeholder_fg.unwrap_or(thinking_fg);
+        let status_hint_fg = status_hint_fg.unwrap_or(thinking_fg);
+        let status_help_right_fg = status_help_right_fg.unwrap_or(status_primary_left_fg);
         let tool_fg =
             parse_color(&colors.tool_fg).map_err(|error| format!("invalid toolFg: {error}"))?;
         let working_fg = parse_color(&colors.working_fg)
@@ -361,15 +418,91 @@ impl ThemePalette {
             })
             .transpose()?
             .unwrap_or(key_token_fg);
+        let code_block_fg = colors
+            .code_block_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid codeBlockFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(transcript_fg);
+        let code_block_bg = colors
+            .code_block_bg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str()).map_err(|error| format!("invalid codeBlockBg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(input_block_bg);
+        let code_keyword_fg = colors
+            .code_keyword_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid codeKeywordFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(file_path_fg);
+        let code_string_fg = colors
+            .code_string_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid codeStringFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(skills_group_fg);
+        let code_comment_fg = colors
+            .code_comment_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid codeCommentFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(file_path_fg);
+        let code_number_fg = colors
+            .code_number_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid codeNumberFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(skills_header_fg);
+        let overlay_logo_fg = colors
+            .overlay_logo_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid overlayLogoFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(transcript_fg);
+        let overlay_version_fg = colors
+            .overlay_version_fg
+            .as_ref()
+            .map(|value| {
+                parse_color(value.as_str())
+                    .map_err(|error| format!("invalid overlayVersionFg: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(thinking_fg);
 
         Ok(Self {
             colors: ThemeColors {
                 transcript_fg,
                 transcript_bg,
                 input_block_bg,
+                user_input_fg,
+                input_placeholder_fg,
                 input_border,
                 footer_fg,
                 footer_bg,
+                status_primary_left_fg,
+                status_primary_right_fg,
+                status_hint_fg,
+                status_help_right_fg,
                 help_border,
                 thinking_fg,
                 tool_fg,
@@ -382,10 +515,19 @@ impl ThemePalette {
                 key_token_fg,
                 skills_header_fg,
                 skills_group_fg,
+                code_block_fg,
+                code_block_bg,
+                code_keyword_fg,
+                code_string_fg,
+                code_comment_fg,
+                code_number_fg,
+                overlay_logo_fg,
+                overlay_version_fg,
                 selection_bg,
                 selection_fg,
             },
             input_prompt,
+            output_prompt,
         })
     }
 }
@@ -399,6 +541,12 @@ struct ThemeFile {
         alias = "input_prompt"
     )]
     input_prompt: String,
+    #[serde(
+        default = "default_output_prompt",
+        rename = "outputPrompt",
+        alias = "output_prompt"
+    )]
+    output_prompt: String,
     colors: ThemeFileColors,
 }
 
@@ -409,9 +557,15 @@ struct ThemeFileColors {
     transcript_bg: String,
     #[serde(alias = "input_block_bg")]
     input_block_bg: String,
+    user_input_fg: Option<String>,
+    input_placeholder_fg: Option<String>,
     input_border: String,
     footer_fg: String,
     footer_bg: String,
+    status_primary_left_fg: Option<String>,
+    status_primary_right_fg: Option<String>,
+    status_hint_fg: Option<String>,
+    status_help_right_fg: Option<String>,
     help_border: Option<String>,
     thinking_fg: String,
     tool_fg: String,
@@ -424,6 +578,14 @@ struct ThemeFileColors {
     key_token_fg: String,
     skills_header_fg: Option<String>,
     skills_group_fg: Option<String>,
+    code_block_fg: Option<String>,
+    code_block_bg: Option<String>,
+    code_keyword_fg: Option<String>,
+    code_string_fg: Option<String>,
+    code_comment_fg: Option<String>,
+    code_number_fg: Option<String>,
+    overlay_logo_fg: Option<String>,
+    overlay_version_fg: Option<String>,
     #[serde(alias = "selection_bg")]
     selection_bg: Option<String>,
     #[serde(alias = "selection_fg")]
@@ -432,6 +594,10 @@ struct ThemeFileColors {
 
 fn default_input_prompt() -> String {
     DEFAULT_INPUT_PROMPT.to_string()
+}
+
+fn default_output_prompt() -> String {
+    DEFAULT_OUTPUT_PROMPT.to_string()
 }
 
 fn parse_color(raw: &str) -> Result<Color, String> {
@@ -489,12 +655,80 @@ mod tests {
     }
 
     #[test]
+    fn built_in_themes_default_output_prompt_is_supported() {
+        assert_eq!(TuiTheme::Dark.output_prompt(), "⛬  ");
+        assert_eq!(TuiTheme::Light.output_prompt(), "⛬  ");
+    }
+
+    #[test]
     fn built_in_dark_theme_includes_selection_colors() {
         assert_eq!(
             TuiTheme::Dark.selection_colors(),
-            Some((Color::White, Color::Black))
+            Some((Color::Rgb(59, 66, 97), Color::Rgb(192, 202, 245)))
         );
         assert_eq!(TuiTheme::Light.selection_colors(), None);
+    }
+
+    #[test]
+    fn built_in_dark_theme_matches_reference_palette_basics() {
+        assert_eq!(
+            TuiTheme::Dark.transcript_style(),
+            Style::default().fg(Color::White).bg(Color::Rgb(26, 27, 38))
+        );
+        assert_eq!(
+            TuiTheme::Dark.input_border_style(),
+            Style::default().fg(Color::Rgb(59, 66, 97))
+        );
+        assert_eq!(
+            TuiTheme::Dark.footer_style(),
+            Style::default()
+                .fg(Color::Rgb(122, 162, 247))
+                .bg(Color::Rgb(26, 27, 38))
+        );
+        assert_eq!(
+            TuiTheme::Dark.line_style(TranscriptLineKind::Thinking),
+            Style::default().fg(Color::Rgb(86, 95, 137))
+        );
+        assert_eq!(
+            TuiTheme::Dark.line_style(TranscriptLineKind::Tool),
+            Style::default().fg(Color::Rgb(169, 177, 214))
+        );
+        assert_eq!(
+            TuiTheme::Dark.input_style(),
+            Style::default()
+                .fg(Color::Rgb(227, 153, 42))
+                .bg(Color::Rgb(26, 27, 38))
+        );
+        assert_eq!(
+            TuiTheme::Dark.line_style(TranscriptLineKind::UserInput),
+            Style::default()
+                .fg(Color::Rgb(227, 153, 42))
+                .bg(Color::Rgb(26, 27, 38))
+        );
+    }
+
+    #[test]
+    fn built_in_dark_theme_status_styles_match_reference_palette() {
+        assert_eq!(
+            TuiTheme::Dark.status_primary_left_style(),
+            Style::default().fg(Color::Rgb(224, 175, 104))
+        );
+        assert_eq!(
+            TuiTheme::Dark.status_primary_right_style(),
+            Style::default().fg(Color::Rgb(192, 202, 245))
+        );
+        assert_eq!(
+            TuiTheme::Dark.status_hint_style(),
+            Style::default().fg(Color::Rgb(86, 95, 137))
+        );
+        assert_eq!(
+            TuiTheme::Dark.status_help_right_style(),
+            Style::default().fg(Color::Rgb(187, 154, 247))
+        );
+        assert_eq!(
+            TuiTheme::Dark.input_placeholder_style(),
+            Style::default().fg(Color::Rgb(86, 95, 137))
+        );
     }
 
     #[test]
@@ -524,6 +758,35 @@ mod tests {
         "##;
         let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
         assert_eq!(palette.input_prompt, "pi> ");
+    }
+
+    #[test]
+    fn parse_theme_file_uses_configured_output_prompt() {
+        let raw = r##"
+        {
+          "name": "dark",
+          "outputPrompt": "bot> ",
+          "colors": {
+            "transcriptFg": "white",
+            "transcriptBg": "black",
+            "inputBlockBg": "#343541",
+            "inputBorder": "green",
+            "footerFg": "darkGray",
+            "footerBg": "black",
+            "helpBorder": null,
+            "thinkingFg": "darkGray",
+            "toolFg": "gray",
+            "workingFg": "black",
+            "workingBg": "white",
+            "toolDiffAdded": "yellow",
+            "toolDiffRemoved": "red",
+            "filePathFg": "cyan",
+            "keyTokenFg": "lightYellow"
+          }
+        }
+        "##;
+        let palette = ThemePalette::from_json("dark", raw).expect("theme should parse");
+        assert_eq!(palette.output_prompt, "bot> ");
     }
 
     #[test]

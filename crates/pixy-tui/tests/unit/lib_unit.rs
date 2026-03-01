@@ -384,6 +384,34 @@ fn overlay_welcome_lines_are_center_aligned_in_transcript() {
 }
 
 #[test]
+fn overlay_logo_line_uses_reference_foreground_in_dark_theme() {
+    let line = TranscriptLine::new("█ PIXY".to_string(), TranscriptLineKind::Overlay)
+        .to_line(40, TuiTheme::Dark);
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains("█")
+                && span.style.fg == Some(Color::Rgb(192, 202, 245))
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        }),
+        "overlay logo text should use the dark theme transcript tone and bold weight"
+    );
+}
+
+#[test]
+fn overlay_version_line_uses_muted_tone_in_dark_theme() {
+    let line = TranscriptLine::new("v0.1.0".to_string(), TranscriptLineKind::Overlay)
+        .to_line(40, TuiTheme::Dark);
+    assert!(
+        line.spans.iter().any(|span| span.content.contains("v0.1.0")
+            && span.style.fg == Some(Color::Rgb(86, 95, 137))),
+        "overlay version line should use muted dark theme tone"
+    );
+}
+
+#[test]
 fn first_submitted_input_keeps_overlay_welcome_lines_as_overlay() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_welcome_lines(vec!["Welcome line".to_string()]);
@@ -572,6 +600,41 @@ fn backspace_at_input_start_keeps_prompt_visible() {
 }
 
 #[test]
+fn input_line_shows_placeholder_before_first_submission() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_welcome_lines(vec!["Welcome line".to_string()]);
+    persist_welcome_into_transcript(&mut app);
+
+    let line = build_input_line(&app, "> ", TuiTheme::Dark);
+    let rendered = line_text(&line);
+    let expected = crate::constants::INPUT_PLACEHOLDER_HINTS
+        .first()
+        .copied()
+        .expect("placeholder hints should not be empty");
+    assert!(rendered.contains(expected));
+    assert!(
+        line.spans.iter().any(|span| {
+            span.content.contains(expected) && span.style.fg == Some(Color::Rgb(86, 95, 137))
+        }),
+        "placeholder hint should be rendered with muted foreground color"
+    );
+}
+
+#[test]
+fn input_line_hides_placeholder_after_first_submission() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.push_user_input_line(">  hello".to_string());
+
+    let line = build_input_line(&app, "> ", TuiTheme::Dark);
+    let rendered = line_text(&line);
+    assert!(
+        !rendered.contains("Try \"Search the documentation for this library\""),
+        "placeholder should be hidden once conversation starts"
+    );
+    assert_eq!(rendered, " > ");
+}
+
+#[test]
 fn visible_transcript_picks_latest_lines() {
     let lines = vec![
         TranscriptLine::new("l1".to_string(), TranscriptLineKind::Normal),
@@ -715,13 +778,32 @@ fn tool_output_line_resets_working_message_to_generic_state() {
         "pixy",
         &StreamUpdate::ToolLine("• Ran bash -lc 'mkdir -p /tmp/snake_v5'".to_string()),
     );
-    assert_eq!(
-        app.working_message,
-        "• Ran bash -lc 'mkdir -p /tmp/snake_v5'"
-    );
+    assert_eq!(app.working_message, "Invoking tools...");
 
     app.note_working_from_update("pixy", &StreamUpdate::ToolLine("(no output)".to_string()));
-    assert_eq!(app.working_message, "pixy is working...");
+    assert_eq!(app.working_message, "Thinking...");
+}
+
+#[test]
+fn assistant_stream_update_switches_working_message_to_streaming() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.start_working("pixy is working...".to_string());
+
+    app.note_working_from_update("pixy", &StreamUpdate::AssistantTextDelta("h".to_string()));
+    assert_eq!(app.working_message, "Streaming...");
+}
+
+#[test]
+fn working_line_uses_single_space_after_spinner_prefix() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.start_working("pixy is working...".to_string());
+    app.working_tick = 0;
+
+    let line = app.working_line().expect("working line should be present");
+    assert!(
+        line.text.starts_with("⠋ Thinking..."),
+        "spinner prefix should have exactly one space before status text"
+    );
 }
 
 #[test]
@@ -737,8 +819,8 @@ fn working_line_marquee_highlights_spinner_text_with_dark_theme_colors() {
     assert!(
         line0.spans.iter().any(|span| {
             span.content.contains("Thin")
-                && span.style.fg == Some(Color::Rgb(244, 208, 137))
-                && span.style.bg == Some(Color::Black)
+                && span.style.fg == Some(Color::Rgb(224, 175, 104))
+                && span.style.bg == Some(Color::Rgb(26, 27, 38))
         }),
         "tick=0 should highlight first 4 chars with amber-on-black"
     );
@@ -751,8 +833,8 @@ fn working_line_marquee_highlights_spinner_text_with_dark_theme_colors() {
     assert!(
         line1.spans.iter().any(|span| {
             span.content.contains("hink")
-                && span.style.fg == Some(Color::Rgb(244, 208, 137))
-                && span.style.bg == Some(Color::Black)
+                && span.style.fg == Some(Color::Rgb(224, 175, 104))
+                && span.style.bg == Some(Color::Rgb(26, 27, 38))
         }),
         "tick=1 should move highlight window forward by one char"
     );
@@ -917,8 +999,8 @@ fn tool_diff_lines_use_expected_colors() {
         .to_line(40, TuiTheme::Dark);
     let added = TranscriptLine::new("+ new assertion".to_string(), TranscriptLineKind::Tool)
         .to_line(40, TuiTheme::Dark);
-    assert_eq!(removed.spans[0].style.fg, Some(Color::Red));
-    assert_eq!(added.spans[0].style.fg, Some(Color::Green));
+    assert_eq!(removed.spans[0].style.fg, Some(Color::Rgb(247, 118, 142)));
+    assert_eq!(added.spans[0].style.fg, Some(Color::Rgb(158, 206, 106)));
 }
 
 #[test]
@@ -939,15 +1021,15 @@ fn tool_diff_stat_line_colors_plus_and_minus_segments() {
         .iter()
         .find(|span| span.content.contains('-'))
         .expect("minus span");
-    assert_eq!(plus_span.style.fg, Some(Color::Green));
-    assert_eq!(minus_span.style.fg, Some(Color::Red));
+    assert_eq!(plus_span.style.fg, Some(Color::Rgb(158, 206, 106)));
+    assert_eq!(minus_span.style.fg, Some(Color::Rgb(247, 118, 142)));
 }
 
 #[test]
 fn tool_lines_keep_default_background_and_use_light_text() {
     let tool = TranscriptLine::new("tool output".to_string(), TranscriptLineKind::Tool)
         .to_line(40, TuiTheme::Dark);
-    assert_eq!(tool.spans[0].style.fg, Some(Color::Rgb(176, 176, 176)));
+    assert_eq!(tool.spans[0].style.fg, Some(Color::Rgb(169, 177, 214)));
     assert_eq!(tool.spans[0].style.bg, None);
 }
 
@@ -955,8 +1037,8 @@ fn tool_lines_keep_default_background_and_use_light_text() {
 fn user_input_line_uses_orange_foreground_with_default_background() {
     let input = TranscriptLine::new("hello".to_string(), TranscriptLineKind::UserInput)
         .to_line(40, TuiTheme::Dark);
-    assert_eq!(input.spans[0].style.fg, Some(Color::Rgb(226, 154, 42)));
-    assert_eq!(input.spans[0].style.bg, Some(Color::Black));
+    assert_eq!(input.spans[0].style.fg, Some(Color::Rgb(227, 153, 42)));
+    assert_eq!(input.spans[0].style.bg, Some(Color::Rgb(26, 27, 38)));
 }
 
 #[test]
@@ -967,9 +1049,10 @@ fn assistant_output_lines_use_sigil_prefix() {
     )];
     let visible = visible_transcript_lines(&lines, &[], 3, 80, true, true, None, 0, TuiTheme::Dark);
     let rendered = line_text(&visible[0]);
+    let output_prompt = TuiTheme::Dark.output_prompt();
     assert!(
-        rendered.contains("⛬  Hello there"),
-        "assistant output should use the ⛬ prefix"
+        rendered.contains(&format!("{output_prompt}Hello there")),
+        "assistant output should use the configured output prompt prefix"
     );
 }
 
@@ -981,11 +1064,18 @@ fn assistant_multiline_block_prefixes_only_first_non_empty_line() {
     ];
     let visible = visible_transcript_lines(&lines, &[], 4, 80, true, true, None, 0, TuiTheme::Dark);
     let rendered = visible.iter().map(line_text).collect::<Vec<_>>();
+    let output_prompt = TuiTheme::Dark.output_prompt();
 
-    assert!(rendered.iter().any(|line| line.contains("⛬  first line")));
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains(&format!("{output_prompt}first line")))
+    );
     assert!(rendered.iter().any(|line| line.contains("second line")));
     assert!(
-        !rendered.iter().any(|line| line.contains("⛬  second line")),
+        !rendered
+            .iter()
+            .any(|line| line.contains(&format!("{output_prompt}second line"))),
         "only the first line in an assistant block should have the prefix"
     );
 }
@@ -1053,10 +1143,10 @@ fn parse_tui_theme_names_case_insensitive() {
 }
 
 #[test]
-fn dark_theme_selection_osc_sequence_is_white_bg_black_fg() {
+fn dark_theme_selection_osc_sequence_uses_reference_selection_colors() {
     assert_eq!(
         selection_osc_set_sequence(TuiTheme::Dark),
-        Some("\u{1b}]17;#ffffff\u{7}\u{1b}]19;#000000\u{7}".to_string())
+        Some("\u{1b}]17;#3b4261\u{7}\u{1b}]19;#c0caf5\u{7}".to_string())
     );
 }
 
@@ -1075,12 +1165,12 @@ fn dark_theme_selection_osc_sequences_include_rgb_and_st_variants() {
     assert!(
         sequences
             .iter()
-            .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{7}"))
+            .any(|sequence| sequence.contains("rgb:3b/42/61") && sequence.contains("\u{7}"))
     );
     assert!(
         sequences
             .iter()
-            .any(|sequence| sequence.contains("rgb:ff/ff/ff") && sequence.contains("\u{1b}\\"))
+            .any(|sequence| sequence.contains("rgb:c0/ca/f5") && sequence.contains("\u{1b}\\"))
     );
 }
 
@@ -1152,37 +1242,37 @@ fn highlights_file_path_and_key_tokens() {
     assert!(
         line.spans.iter().any(|span| {
             span.content.contains("crates/pixy-tui/src/lib.rs:902")
-                && span.style.fg == Some(Color::Rgb(125, 130, 140))
+                && span.style.fg == Some(Color::Rgb(122, 162, 247))
         }),
         "file path token should be highlighted"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("PageUp") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("PageUp") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "PageUp token should be highlighted"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("PageDown") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("PageDown") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "PageDown token should be highlighted"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("ctrl+c") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("ctrl+c") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "ctrl+c token should be highlighted"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("shift+tab") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("shift+tab") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "shift+tab token should be highlighted"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("alt+enter") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("alt+enter") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "alt+enter token should be highlighted"
     );
@@ -1324,7 +1414,11 @@ fn multiline_assistant_markdown_tables_are_rendered_in_transcript() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(texts.iter().any(|line| line == "⛬  before"));
+    assert!(
+        texts
+            .iter()
+            .any(|line| line == &format!("{}before", TuiTheme::Dark.output_prompt()))
+    );
     assert!(texts.iter().any(|line| line == "┌──────┬──────┐"));
     assert!(texts.iter().any(|line| line == "│ A    │ BBB  │"));
     assert!(texts.iter().any(|line| line == "after"));
@@ -1357,7 +1451,8 @@ fn streaming_delta_with_chinese_markdown_table_is_rendered_as_table() {
     assert!(
         texts
             .iter()
-            .any(|line| line == "⛬  给你一个 markdown 表格：")
+            .any(|line| line
+                == &format!("{}给你一个 markdown 表格：", TuiTheme::Dark.output_prompt()))
     );
     assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
     assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
@@ -1429,7 +1524,11 @@ fn assistant_line_with_multiline_markdown_table_is_rendered_as_table() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(texts.iter().any(|line| line == "⛬  这里是表格："));
+    assert!(
+        texts
+            .iter()
+            .any(|line| line == &format!("{}这里是表格：", TuiTheme::Dark.output_prompt()))
+    );
     assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
     assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
     assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
@@ -1652,13 +1751,13 @@ fn slash_compound_shortcuts_use_key_token_color_instead_of_path_color() {
 
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains(token) && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains(token) && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "slash compound shortcuts should use key token color"
     );
     assert!(
         !line.spans.iter().any(|span| {
-            span.content.contains(token) && span.style.fg == Some(Color::Rgb(125, 130, 140))
+            span.content.contains(token) && span.style.fg == Some(Color::Rgb(122, 162, 247))
         }),
         "slash compound shortcuts should not be treated as file paths"
     );
@@ -1674,13 +1773,13 @@ fn named_single_key_shortcuts_are_highlighted() {
 
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("escape") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("escape") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "escape should be highlighted as a key token"
     );
     assert!(
         line.spans.iter().any(|span| {
-            span.content.contains("enter") && span.style.fg == Some(Color::Rgb(148, 150, 153))
+            span.content.contains("enter") && span.style.fg == Some(Color::Rgb(125, 207, 255))
         }),
         "enter should be highlighted as a key token"
     );
@@ -1694,7 +1793,7 @@ fn slash_command_hint_token_is_highlighted() {
     assert!(
         line.spans
             .iter()
-            .any(|span| span.content == "/" && span.style.fg == Some(Color::Rgb(148, 150, 153))),
+            .any(|span| span.content == "/" && span.style.fg == Some(Color::Rgb(125, 207, 255))),
         "slash command hint should use key token color"
     );
 }
@@ -1707,12 +1806,12 @@ fn section_headers_and_user_group_use_reference_colors() {
         skills_header
             .spans
             .iter()
-            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(224, 175, 104))),
         "skills header left bracket should use reference accent color"
     );
     assert!(
         skills_header.spans.iter().any(|span| {
-            span.content.contains("Skills") && span.style.fg == Some(Color::Rgb(240, 198, 116))
+            span.content.contains("Skills") && span.style.fg == Some(Color::Rgb(224, 175, 104))
         }),
         "skills header text should use reference accent color"
     );
@@ -1720,7 +1819,7 @@ fn section_headers_and_user_group_use_reference_colors() {
         skills_header
             .spans
             .iter()
-            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(224, 175, 104))),
         "skills header right bracket should use reference accent color"
     );
 
@@ -1730,12 +1829,12 @@ fn section_headers_and_user_group_use_reference_colors() {
         context_header
             .spans
             .iter()
-            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+            .any(|span| span.content == "[" && span.style.fg == Some(Color::Rgb(224, 175, 104))),
         "context header left bracket should use reference accent color"
     );
     assert!(
         context_header.spans.iter().any(|span| {
-            span.content.contains("Context") && span.style.fg == Some(Color::Rgb(240, 198, 116))
+            span.content.contains("Context") && span.style.fg == Some(Color::Rgb(224, 175, 104))
         }),
         "context header text should use reference accent color"
     );
@@ -1743,7 +1842,7 @@ fn section_headers_and_user_group_use_reference_colors() {
         context_header
             .spans
             .iter()
-            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(240, 198, 116))),
+            .any(|span| span.content == "]" && span.style.fg == Some(Color::Rgb(224, 175, 104))),
         "context header right bracket should use reference accent color"
     );
 
@@ -1751,7 +1850,7 @@ fn section_headers_and_user_group_use_reference_colors() {
         .to_line(40, TuiTheme::Dark);
     assert!(
         user_group.spans.iter().any(|span| {
-            span.content.contains("user") && span.style.fg == Some(Color::Rgb(138, 192, 184))
+            span.content.contains("user") && span.style.fg == Some(Color::Rgb(115, 218, 202))
         }),
         "skills user group should use reference accent color"
     );

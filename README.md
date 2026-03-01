@@ -108,6 +108,7 @@ pixy --no-tui
 
 ## Minimal `pixy.toml`
 
+
 Use this as the smallest chat setup:
 
 ```toml

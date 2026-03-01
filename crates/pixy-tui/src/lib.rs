@@ -1,24 +1,22 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_util::StreamExt;
 use pixy_agent_core::AgentAbortController;
 use pixy_ai::{Message, StopReason, UserContentBlock};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
+use ratatui::style::Color;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -27,30 +25,36 @@ use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub mod backend;
+mod constants;
 pub mod keybindings;
 pub mod options;
 mod resume;
+mod runtime;
+mod terminal;
 pub mod theme;
 mod transcript;
 
 pub use backend::{BackendFuture, ResumeCandidate, StreamUpdate, TuiBackend};
+use constants::{
+    FORCE_EXIT_SIGNAL, FORCE_EXIT_STATUS, INPUT_AREA_FIXED_HEIGHT, INPUT_RENDER_LEFT_PADDING,
+    PASTED_TEXT_PREVIEW_LIMIT, RESUME_LIST_LIMIT, STATUS_HINT_LEFT, STATUS_HINT_RIGHT,
+    primary_input_placeholder_hint,
+};
 pub use keybindings::{KeyBinding, TuiKeyBindings, parse_key_id};
 pub use options::TuiOptions;
+use runtime::TuiRuntime;
+use terminal::apply_selection_osc_colors;
+#[cfg(test)]
+use terminal::{
+    TerminalCapabilities, TerminalMultiplexer, selection_osc_reset_sequence,
+    selection_osc_reset_sequences, selection_osc_set_sequence, selection_osc_set_sequences,
+};
 pub use theme::TuiTheme;
 use transcript::{
     TranscriptLine, TranscriptLineKind, is_thinking_line, is_tool_run_line,
     normalize_tool_line_for_display, parse_tool_name, render_messages, split_tool_output_lines,
     visible_transcript_lines,
 };
-
-const FORCE_EXIT_SIGNAL: &str = "__FORCE_EXIT__";
-const FORCE_EXIT_STATUS: &str = "force exiting...";
-const PASTED_TEXT_PREVIEW_LIMIT: usize = 100;
-const RESUME_LIST_LIMIT: usize = 10;
-const INPUT_RENDER_LEFT_PADDING: &str = " ";
-const INPUT_AREA_FIXED_HEIGHT: u16 = 3;
-const STATUS_HINT_LEFT: &str = "shift+tab to cycle modes (auto/spec), ctrl+L for autonomy";
-const STATUS_HINT_RIGHT: &str = "ctrl+N to cycle models";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingTextAttachment {
@@ -323,6 +327,18 @@ impl TuiApp {
         !self.input.trim().is_empty() || self.has_non_text_input_blocks()
     }
 
+    fn has_conversation_content(&self) -> bool {
+        self.transcript
+            .iter()
+            .any(|line| line.kind != TranscriptLineKind::Overlay && !line.text.trim().is_empty())
+    }
+
+    fn should_show_input_placeholder(&self) -> bool {
+        self.input.is_empty()
+            && !self.has_non_text_input_blocks()
+            && !self.has_conversation_content()
+    }
+
     fn take_input_payload(&mut self) -> (String, String, Option<Vec<UserContentBlock>>) {
         self.cursor_pos = 0;
         self.reset_input_history_navigation();
@@ -567,9 +583,9 @@ impl TuiApp {
         self.show_thinking
     }
 
-    fn start_working(&mut self, message: String) {
+    fn start_working(&mut self, _message: String) {
         self.is_working = true;
-        self.working_message = message;
+        self.working_message = "Thinking...".to_string();
         self.working_tick = 0;
         self.working_started_at = Some(Instant::now());
     }
@@ -729,20 +745,18 @@ impl TuiApp {
         true
     }
 
-    fn note_working_from_update(&mut self, app_name: &str, update: &StreamUpdate) {
+    fn note_working_from_update(&mut self, _app_name: &str, update: &StreamUpdate) {
         match update {
             StreamUpdate::AssistantTextDelta(_) | StreamUpdate::AssistantLine(_) => {
-                self.working_message = format!("{app_name} is reasoning...");
+                self.working_message = "Streaming...".to_string();
             }
             StreamUpdate::ToolLine(line) => {
                 if is_tool_run_line(line) {
-                    self.working_message = line.clone();
-                } else if let Some(tool_name) = parse_tool_name(line) {
-                    self.working_message = format!("• Ran {tool_name}");
+                    self.working_message = "Invoking tools...".to_string();
+                } else if parse_tool_name(line).is_some() {
+                    self.working_message = "Invoking tools...".to_string();
                 } else {
-                    // Tool output lines are emitted after the tool returns.
-                    // Switch back to generic "working" while waiting for next assistant token.
-                    self.working_message = format!("{app_name} is working...");
+                    self.working_message = "Thinking...".to_string();
                 }
             }
         }
@@ -767,8 +781,12 @@ impl TuiApp {
         } else {
             self.interrupt_hint_label.to_ascii_uppercase()
         };
-        let prefix = format!("{spinner}  ");
-        let message = "Thinking...";
+        let prefix = format!("{spinner} ");
+        let message = if self.working_message.trim().is_empty() {
+            "Thinking..."
+        } else {
+            self.working_message.as_str()
+        };
         let suffix = format!("  (Press {stop_key} to stop)");
         let text = format!("{prefix}{message}{suffix}");
 
@@ -854,316 +872,7 @@ impl TuiApp {
 }
 
 pub async fn run_tui<B: TuiBackend>(backend: &mut B, options: TuiOptions) -> Result<(), String> {
-    enable_raw_mode().map_err(|error| format!("enable raw mode failed: {error}"))?;
-    let mouse_capture_enabled = if options.enable_mouse_capture {
-        execute!(io::stdout(), EnableMouseCapture)
-            .map_err(|error| format!("enable mouse capture failed: {error}"))?;
-        true
-    } else {
-        false
-    };
-
-    let keyboard_enhancement_enabled =
-        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-            execute!(
-                io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-            .is_ok()
-        } else {
-            false
-        };
-
-    let bracketed_paste_enabled = execute!(io::stdout(), EnableBracketedPaste).is_ok();
-
-    let mut _restore = TerminalRestore {
-        keyboard_enhancement_enabled,
-        mouse_capture_enabled,
-        bracketed_paste_enabled,
-        selection_colors_applied: false,
-        alternate_screen_enabled: false,
-    };
-
-    let status = startup_status_label(backend);
-    let mut app = TuiApp::new(status, options.show_tool_results, options.initial_help);
-    app.set_interrupt_hint_label(primary_keybinding_label_lower(
-        &options.keybindings.interrupt,
-    ));
-    app.set_dequeue_hint_label(keybinding_label(&options.keybindings.dequeue));
-    app.set_input_history_store(
-        options
-            .input_history_path
-            .as_ref()
-            .map(|path| InputHistoryStore::new(path.clone(), options.input_history_limit)),
-    );
-    app.set_status_bar_meta(
-        String::new(),
-        options.status_left.clone(),
-        options.status_right.clone(),
-    );
-    app.set_welcome_lines(build_welcome_banner(&options));
-    persist_welcome_into_transcript(&mut app);
-
-    let mut fullscreen_init_error: Option<String> = None;
-    let mut terminal = match Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        default_terminal_options(),
-    ) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            fullscreen_init_error = Some(error.to_string());
-            Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|fallback_error| {
-                format!(
-                    "create terminal failed: {error}; fallback terminal failed: {fallback_error}"
-                )
-            })?
-        }
-    };
-    terminal
-        .clear()
-        .map_err(|error| format!("clear terminal failed: {error}"))?;
-    _restore.selection_colors_applied = apply_selection_osc_colors(options.theme);
-
-    if let Some(error) = fullscreen_init_error {
-        app.status = format!("fullscreen viewport unavailable: {error}");
-    }
-
-    let mut events = EventStream::new();
-    let mut needs_redraw = true;
-    loop {
-        if needs_redraw {
-            draw_ui_frame(&mut terminal, &mut app, &options)
-                .map_err(|error| format!("draw UI failed: {error}"))?;
-            needs_redraw = false;
-        }
-
-        let maybe_event = events.next().await;
-        let Some(event_result) = maybe_event else {
-            return Ok(());
-        };
-        let event = event_result.map_err(|error| format!("read terminal event failed: {error}"))?;
-
-        if let Event::Mouse(mouse) = event {
-            needs_redraw = handle_mouse_history_event(&mut app, mouse);
-            continue;
-        }
-
-        if let Event::Paste(pasted) = event {
-            handle_paste_event(&mut app, pasted);
-            needs_redraw = true;
-            continue;
-        }
-
-        if !matches!(event, Event::Key(_)) {
-            // Keep resize/focus redraw responsive without repainting on every mouse drag.
-            needs_redraw = true;
-            continue;
-        }
-
-        let Event::Key(key) = event else {
-            continue;
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
-        }
-        needs_redraw = true;
-
-        if matches_keybinding(&options.keybindings.quit, key) {
-            return Ok(());
-        }
-        if handle_resume_picker_key_event(key, backend, &mut app) {
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.interrupt, key) {
-            app.clear_input();
-            app.show_help = false;
-            app.status = "interrupted".to_string();
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.clear, key) {
-            if app.has_input_payload() || !app.pending_text_attachments.is_empty() {
-                app.clear_input();
-                app.last_clear_key_at_ms = now_millis();
-                app.status = "input cleared".to_string();
-                continue;
-            }
-
-            let now = now_millis();
-            if now.saturating_sub(app.last_clear_key_at_ms) <= 500 {
-                return Ok(());
-            }
-            app.last_clear_key_at_ms = now;
-            app.status = "press clear again to exit".to_string();
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.show_help, key) {
-            app.show_help = !app.show_help;
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.show_session, key) {
-            app.status = query_session_status_label(backend);
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.cycle_model_forward, key) {
-            app.status = match backend.cycle_model_forward() {
-                Ok(Some(status)) => {
-                    app.maybe_update_status_right_from_backend_status(&status);
-                    status
-                }
-                Ok(None) => "".to_string(),
-                Err(error) => format!("cycle model failed: {error}"),
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.cycle_model_backward, key) {
-            app.status = match backend.cycle_model_backward() {
-                Ok(Some(status)) => {
-                    app.maybe_update_status_right_from_backend_status(&status);
-                    status
-                }
-                Ok(None) => "".to_string(),
-                Err(error) => format!("cycle model failed: {error}"),
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.select_model, key) {
-            app.status = match backend.select_model() {
-                Ok(Some(status)) => {
-                    app.maybe_update_status_right_from_backend_status(&status);
-                    status
-                }
-                Ok(None) => "".to_string(),
-                Err(error) => format!("select model failed: {error}"),
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.cycle_thinking_level, key) {
-            let enabled = app.toggle_thinking();
-            app.status = if enabled {
-                "thinking visible".to_string()
-            } else {
-                "thinking hidden".to_string()
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.expand_tools, key) {
-            let enabled = app.toggle_tool_results();
-            app.status = if enabled {
-                "tool output visible".to_string()
-            } else {
-                "tool output hidden".to_string()
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.toggle_thinking, key) {
-            let enabled = app.toggle_thinking();
-            app.status = if enabled {
-                "thinking visible".to_string()
-            } else {
-                "thinking hidden".to_string()
-            };
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.continue_run, key) {
-            if !app.has_input_payload() {
-                if let Err(error) = handle_continue_streaming(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-                if let Err(error) = process_queued_follow_ups(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-            } else {
-                let (display_input, submitted, blocks) = app.take_input_payload();
-                if submitted.is_empty() && blocks.is_none() {
-                    continue;
-                }
-                if let Err(error) = run_submitted_input(
-                    backend,
-                    &mut terminal,
-                    &mut app,
-                    &options,
-                    display_input,
-                    submitted,
-                    blocks,
-                    &mut events,
-                )
-                .await
-                {
-                    if is_force_exit_signal(&error) {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-            }
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.dequeue, key) {
-            if let Some(count) = app.dequeue_follow_ups_to_editor() {
-                let label = if count == 1 { "message" } else { "messages" };
-                app.status = format!("editing {count} queued {label}");
-                continue;
-            }
-        }
-        if matches_keybinding(&options.keybindings.newline, key) {
-            app.insert_char('\n');
-            continue;
-        }
-        if matches_keybinding(&options.keybindings.submit, key) {
-            let (display_input, submitted, blocks) = app.take_input_payload();
-            if submitted.is_empty() && blocks.is_none() {
-                continue;
-            }
-            if let Err(error) = run_submitted_input(
-                backend,
-                &mut terminal,
-                &mut app,
-                &options,
-                display_input,
-                submitted,
-                blocks,
-                &mut events,
-            )
-            .await
-            {
-                if is_force_exit_signal(&error) {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            continue;
-        }
-        if handle_input_history_key_event(&mut app, key) {
-            continue;
-        }
-        if handle_transcript_scroll_key(&mut app, key) {
-            continue;
-        }
-        if handle_editor_key_event(&mut app, key) {
-            continue;
-        }
-    }
+    TuiRuntime::new(backend, options)?.run().await
 }
 
 fn handle_editor_key_event(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -2081,16 +1790,22 @@ fn persist_welcome_into_transcript(app: &mut TuiApp) {
     }
 
     for line in &app.welcome_lines {
-        app.transcript
-            .push(TranscriptLine::new(line.clone(), TranscriptLineKind::Overlay));
+        app.transcript.push(TranscriptLine::new(
+            line.clone(),
+            TranscriptLineKind::Overlay,
+        ));
     }
-    app.transcript
-        .push(TranscriptLine::new(String::new(), TranscriptLineKind::Overlay));
+    app.transcript.push(TranscriptLine::new(
+        String::new(),
+        TranscriptLineKind::Overlay,
+    ));
     app.scroll_transcript_to_latest();
 }
 
 fn has_overlay_transcript_lines(lines: &[TranscriptLine]) -> bool {
-    lines.iter().any(|line| line.kind == TranscriptLineKind::Overlay)
+    lines
+        .iter()
+        .any(|line| line.kind == TranscriptLineKind::Overlay)
 }
 
 fn ensure_bottom_status_separator(
@@ -2228,8 +1943,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
     frame.render_widget(status_top, status_top_area);
 
     let input_scroll = input_scroll_offset(app, input_area, input_prompt);
-    let input_text = format!("{INPUT_RENDER_LEFT_PADDING}{input_prompt}{}", app.input);
-    let input = Paragraph::new(input_text)
+    let input = Paragraph::new(build_input_line(app, input_prompt, options.theme))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2375,6 +2089,23 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             .wrap(Wrap { trim: false });
         frame.render_widget(picker_popup, popup);
     }
+}
+
+fn build_input_line(app: &TuiApp, input_prompt: &str, theme: TuiTheme) -> Line<'static> {
+    if app.should_show_input_placeholder() {
+        return Line::from(vec![
+            Span::raw(INPUT_RENDER_LEFT_PADDING),
+            Span::raw(input_prompt.to_string()),
+            Span::styled(
+                primary_input_placeholder_hint().to_string(),
+                theme.input_placeholder_style(),
+            ),
+        ]);
+    }
+    Line::from(format!(
+        "{INPUT_RENDER_LEFT_PADDING}{input_prompt}{}",
+        app.input
+    ))
 }
 
 fn input_cursor_position(app: &TuiApp, input_area: Rect, input_prompt: &str) -> (u16, u16) {
@@ -2544,7 +2275,7 @@ fn render_status_bar_lines(app: &TuiApp, width: usize, theme: TuiTheme) -> Text<
     };
     lines.push(compose_left_right_status_line_with_styles(
         bottom_left.as_str(),
-        "IDE ◌",
+        "Pixy ◌",
         width,
         theme.status_hint_style(),
         theme.status_help_right_style(),
@@ -2683,255 +2414,6 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-fn apply_selection_osc_colors(theme: TuiTheme) -> bool {
-    let capabilities = detect_terminal_capabilities();
-    let Some(sequences) = selection_osc_set_sequences(theme, capabilities) else {
-        return false;
-    };
-    if sequences.is_empty() {
-        return false;
-    }
-    let mut stdout = io::stdout();
-    for sequence in sequences {
-        if stdout.write_all(sequence.as_bytes()).is_err() {
-            return false;
-        }
-    }
-    let _ = stdout.flush();
-    true
-}
-
-fn reset_selection_osc_colors() {
-    let capabilities = detect_terminal_capabilities();
-    let mut stdout = io::stdout();
-    for sequence in selection_osc_reset_sequences(capabilities) {
-        let _ = stdout.write_all(sequence.as_bytes());
-    }
-    let _ = stdout.flush();
-}
-
-#[cfg(test)]
-fn selection_osc_set_sequence(theme: TuiTheme) -> Option<String> {
-    selection_osc_set_sequences(theme, TerminalCapabilities::default())?
-        .into_iter()
-        .next()
-}
-
-fn selection_osc_set_sequences(
-    theme: TuiTheme,
-    capabilities: TerminalCapabilities,
-) -> Option<Vec<String>> {
-    let (bg, fg) = theme.selection_colors()?;
-    let bg_hex = color_to_osc_hex(bg)?;
-    let fg_hex = color_to_osc_hex(fg)?;
-    let bg_rgb = color_to_osc_rgb(bg)?;
-    let fg_rgb = color_to_osc_rgb(fg)?;
-
-    let mut sequences = Vec::new();
-    push_osc_pair(&mut sequences, "17", bg_hex.as_str(), "19", fg_hex.as_str());
-    push_osc_pair(&mut sequences, "17", bg_rgb.as_str(), "19", fg_rgb.as_str());
-
-    if capabilities.iterm2 {
-        push_osc_pair(
-            &mut sequences,
-            "1337",
-            format!("SetColors=selbg={}", bg_hex.trim_start_matches('#')).as_str(),
-            "1337",
-            format!("SetColors=selfg={}", fg_hex.trim_start_matches('#')).as_str(),
-        );
-    }
-
-    if capabilities.kitty {
-        push_osc_single(
-            &mut sequences,
-            "21",
-            format!("selection_background={bg_hex};selection_foreground={fg_hex}").as_str(),
-        );
-    }
-
-    append_multiplexer_variants(&mut sequences, capabilities.multiplexer);
-
-    Some(sequences)
-}
-
-#[cfg(test)]
-fn selection_osc_reset_sequence() -> &'static str {
-    "\u{1b}]117;\u{7}\u{1b}]119;\u{7}"
-}
-
-fn selection_osc_reset_sequences(capabilities: TerminalCapabilities) -> Vec<String> {
-    let mut sequences = Vec::new();
-    push_osc_pair(&mut sequences, "117", "", "119", "");
-
-    if capabilities.iterm2 {
-        push_osc_pair(
-            &mut sequences,
-            "1337",
-            "SetColors=selbg=default",
-            "1337",
-            "SetColors=selfg=default",
-        );
-    }
-
-    if capabilities.kitty {
-        push_osc_single(
-            &mut sequences,
-            "21",
-            "selection_background;selection_foreground",
-        );
-    }
-
-    append_multiplexer_variants(&mut sequences, capabilities.multiplexer);
-    sequences
-}
-
-fn color_to_osc_hex(color: Color) -> Option<String> {
-    let (red, green, blue) = color_to_rgb_bytes(color)?;
-    Some(format!("#{red:02x}{green:02x}{blue:02x}"))
-}
-
-fn color_to_osc_rgb(color: Color) -> Option<String> {
-    let (red, green, blue) = color_to_rgb_bytes(color)?;
-    Some(format!("rgb:{red:02x}/{green:02x}/{blue:02x}"))
-}
-
-fn color_to_rgb_bytes(color: Color) -> Option<(u8, u8, u8)> {
-    match color {
-        Color::Black => Some((0x00, 0x00, 0x00)),
-        Color::Red => Some((0xff, 0x00, 0x00)),
-        Color::Green => Some((0x00, 0xff, 0x00)),
-        Color::Yellow => Some((0xff, 0xff, 0x00)),
-        Color::Blue => Some((0x00, 0x00, 0xff)),
-        Color::Magenta => Some((0xff, 0x00, 0xff)),
-        Color::Cyan => Some((0x00, 0xff, 0xff)),
-        Color::Gray => Some((0xc0, 0xc0, 0xc0)),
-        Color::DarkGray => Some((0x80, 0x80, 0x80)),
-        Color::LightRed => Some((0xff, 0x55, 0x55)),
-        Color::LightGreen => Some((0x55, 0xff, 0x55)),
-        Color::LightYellow => Some((0xff, 0xff, 0x55)),
-        Color::LightBlue => Some((0x55, 0x55, 0xff)),
-        Color::LightMagenta => Some((0xff, 0x55, 0xff)),
-        Color::LightCyan => Some((0x55, 0xff, 0xff)),
-        Color::White => Some((0xff, 0xff, 0xff)),
-        Color::Rgb(red, green, blue) => Some((red, green, blue)),
-        Color::Reset | Color::Indexed(_) => None,
-    }
-}
-
-fn detect_terminal_capabilities() -> TerminalCapabilities {
-    let term_program = env::var("TERM_PROGRAM")
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-    let term = env::var("TERM")
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    TerminalCapabilities {
-        multiplexer: if env::var_os("TMUX").is_some() {
-            Some(TerminalMultiplexer::Tmux)
-        } else if env::var_os("STY").is_some() {
-            Some(TerminalMultiplexer::Screen)
-        } else {
-            None
-        },
-        iterm2: term_program.contains("iterm"),
-        kitty: env::var_os("KITTY_WINDOW_ID").is_some() || term.contains("kitty"),
-    }
-}
-
-fn wrap_osc_for_multiplexer(sequence: &str, multiplexer: TerminalMultiplexer) -> String {
-    match multiplexer {
-        TerminalMultiplexer::Tmux => {
-            let mut escaped = String::with_capacity(sequence.len() * 2);
-            for ch in sequence.chars() {
-                if ch == '\u{1b}' {
-                    escaped.push('\u{1b}');
-                }
-                escaped.push(ch);
-            }
-            format!("\u{1b}Ptmux;{escaped}\u{1b}\\")
-        }
-        TerminalMultiplexer::Screen => format!("\u{1b}P{sequence}\u{1b}\\"),
-    }
-}
-
-fn push_osc_single(sequences: &mut Vec<String>, code: &str, value: &str) {
-    for terminator in ["\u{7}", "\u{1b}\\"] {
-        sequences.push(format!("\u{1b}]{code};{value}{terminator}"));
-    }
-}
-
-fn push_osc_pair(
-    sequences: &mut Vec<String>,
-    first_code: &str,
-    first_value: &str,
-    second_code: &str,
-    second_value: &str,
-) {
-    for terminator in ["\u{7}", "\u{1b}\\"] {
-        sequences.push(format!(
-            "\u{1b}]{first_code};{first_value}{terminator}\u{1b}]{second_code};{second_value}{terminator}"
-        ));
-    }
-}
-
-fn append_multiplexer_variants(
-    sequences: &mut Vec<String>,
-    multiplexer: Option<TerminalMultiplexer>,
-) {
-    let Some(multiplexer) = multiplexer else {
-        return;
-    };
-    sequences.extend(
-        sequences
-            .clone()
-            .into_iter()
-            .map(|sequence| wrap_osc_for_multiplexer(sequence.as_str(), multiplexer)),
-    );
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalMultiplexer {
-    Tmux,
-    Screen,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TerminalCapabilities {
-    multiplexer: Option<TerminalMultiplexer>,
-    iterm2: bool,
-    kitty: bool,
-}
-
-struct TerminalRestore {
-    keyboard_enhancement_enabled: bool,
-    mouse_capture_enabled: bool,
-    bracketed_paste_enabled: bool,
-    selection_colors_applied: bool,
-    alternate_screen_enabled: bool,
-}
-
-impl Drop for TerminalRestore {
-    fn drop(&mut self) {
-        if self.keyboard_enhancement_enabled {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        let _ = disable_raw_mode();
-        if self.selection_colors_applied {
-            reset_selection_osc_colors();
-        }
-        if self.bracketed_paste_enabled {
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
-        }
-        if self.mouse_capture_enabled {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
-        }
-        if self.alternate_screen_enabled {
-            let _ = execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        }
-    }
 }
 
 #[cfg(test)]
