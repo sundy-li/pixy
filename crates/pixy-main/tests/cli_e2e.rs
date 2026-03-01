@@ -59,7 +59,7 @@ fn e2e_cli_prompt_streams_text_from_mock_openai() {
         "expected session metadata in stdout, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("model: openai-completions/openai/gpt-4o-mini"),
+        stdout.contains("model: openai-completions/mock/gpt-4o-mini"),
         "expected model metadata in stdout, got:\n{stdout}"
     );
     assert!(
@@ -282,32 +282,30 @@ fn spawn_server_loop(
     scripted_responses: Arc<Mutex<VecDeque<String>>>,
     requests: Arc<Mutex<Vec<String>>>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
-        loop {
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
+    thread::spawn(move || loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
 
-            match listener.accept() {
-                Ok((mut stream, _addr)) => {
-                    if let Ok(body) = read_http_request_body(&mut stream) {
-                        if let Ok(mut captured) = requests.lock() {
-                            captured.push(body);
-                        }
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                if let Ok(body) = read_http_request_body(&mut stream) {
+                    if let Ok(mut captured) = requests.lock() {
+                        captured.push(body);
                     }
+                }
 
-                    let response_body = scripted_responses
-                        .lock()
-                        .ok()
-                        .and_then(|mut responses| responses.pop_front())
-                        .unwrap_or_else(|| TEXT_RESPONSE_BODY.to_string());
-                    let _ = write_http_response(&mut stream, &response_body);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
+                let response_body = scripted_responses
+                    .lock()
+                    .ok()
+                    .and_then(|mut responses| responses.pop_front())
+                    .unwrap_or_else(|| TEXT_RESPONSE_BODY.to_string());
+                let _ = write_http_response(&mut stream, &response_body);
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
         }
     })
 }

@@ -601,9 +601,7 @@ description: A valid skill for testing.
         let prompt = format_skills_for_prompt(&skills);
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>visible-skill</name>"));
-        assert!(
-            prompt.contains("After reading a matching skill, execute it with available tools.")
-        );
+        assert!(prompt.contains("After reading a matching skill, execute it with available tools."));
         assert!(!prompt.contains("hidden-skill"));
     }
 
@@ -654,12 +652,10 @@ name: missing-description
 
         let result = load_skills_from_dir(dir.path(), SkillSource::Path);
         assert!(result.skills.is_empty());
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|item| item.message.contains("description is required"))
-        );
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("description is required")));
     }
 
     #[test]
@@ -689,19 +685,17 @@ description: second
         .expect("write second");
 
         let mut options =
-            LoadSkillsOptions::new(dir.path().to_path_buf(), dir.path().join(".pixy/agent"));
+            LoadSkillsOptions::new(dir.path().to_path_buf(), dir.path().join(".pixy/agents"));
         options.include_defaults = false;
         options.skill_paths = vec!["alpha".to_string(), "beta".to_string()];
 
         let result = load_skills(options);
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].description, "first");
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|item| item.kind == SkillDiagnosticKind::Collision)
-        );
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|item| item.kind == SkillDiagnosticKind::Collision));
     }
 
     #[test]
@@ -736,7 +730,7 @@ description: should not be discovered.
         )
         .expect("write outside skill");
 
-        let options = LoadSkillsOptions::new(nested, dir.path().join(".pixy/agent"));
+        let options = LoadSkillsOptions::new(nested, dir.path().join(".pixy/agents"));
         let result = load_skills(options);
 
         let names = result
@@ -775,7 +769,7 @@ description: beta description
         .expect("write beta");
 
         let mut options =
-            LoadSkillsOptions::new(dir.path().to_path_buf(), dir.path().join(".pixy/agent"));
+            LoadSkillsOptions::new(dir.path().to_path_buf(), dir.path().join(".pixy/agents"));
         options.include_defaults = false;
         options.skill_paths = vec!["alpha".to_string(), "beta".to_string()];
 

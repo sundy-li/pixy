@@ -119,6 +119,7 @@ pub struct TuiKeyBindings {
     pub cycle_thinking_level: Vec<KeyBinding>,
     pub cycle_model_forward: Vec<KeyBinding>,
     pub cycle_model_backward: Vec<KeyBinding>,
+    pub cycle_permission_mode: Vec<KeyBinding>,
     pub select_model: Vec<KeyBinding>,
     pub expand_tools: Vec<KeyBinding>,
     pub toggle_thinking: Vec<KeyBinding>,
@@ -181,8 +182,12 @@ impl Default for TuiKeyBindings {
                 code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             }],
-            select_model: vec![KeyBinding {
+            cycle_permission_mode: vec![KeyBinding {
                 code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+            }],
+            select_model: vec![KeyBinding {
+                code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::CONTROL,
             }],
             expand_tools: vec![KeyBinding {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use pixy_agent_core::{AgentTool, ParentChildRunEvent, ParentChildRunEventSink, StreamFn};
@@ -173,23 +173,23 @@ impl TaskDispatcher {
             });
             PiAiError::new(PiAiErrorCode::ToolExecutionFailed, error_message)
         })?;
-        if let Some((stop_reason, error_message)) = last_assistant_stop_reason(&produced)
-            && matches!(stop_reason, StopReason::Error | StopReason::Aborted)
-        {
-            let failure = error_message.unwrap_or_else(|| {
-                format!(
-                    "subagent '{}' ended with stop_reason={stop_reason:?}",
-                    subagent_name
-                )
-            });
-            self.emit_lifecycle_event(ParentChildRunEvent::ChildRunError {
-                parent_session_id: parent_session_id.clone(),
-                child_session_file: child_session_file_text.clone(),
-                task_id: task_id.clone(),
-                subagent: subagent_name.clone(),
-                error: failure.clone(),
-            });
-            return Err(PiAiError::new(PiAiErrorCode::ToolExecutionFailed, failure));
+        if let Some((stop_reason, error_message)) = last_assistant_stop_reason(&produced) {
+            if matches!(stop_reason, StopReason::Error | StopReason::Aborted) {
+                let failure = error_message.unwrap_or_else(|| {
+                    format!(
+                        "subagent '{}' ended with stop_reason={stop_reason:?}",
+                        subagent_name
+                    )
+                });
+                self.emit_lifecycle_event(ParentChildRunEvent::ChildRunError {
+                    parent_session_id: parent_session_id.clone(),
+                    child_session_file: child_session_file_text.clone(),
+                    task_id: task_id.clone(),
+                    subagent: subagent_name.clone(),
+                    error: failure.clone(),
+                });
+                return Err(PiAiError::new(PiAiErrorCode::ToolExecutionFailed, failure));
+            }
         }
         let summary = last_assistant_text(&produced)
             .unwrap_or_else(|| "Subagent completed without assistant text output.".to_string());
@@ -245,10 +245,10 @@ impl TaskDispatcher {
     ) -> Result<PathBuf, PiAiError> {
         {
             let store = self.config.session_store.lock().await;
-            if let Some(path) = store.resolve(task_id)
-                && path.exists()
-            {
-                return Ok(path);
+            if let Some(path) = store.resolve(task_id) {
+                if path.exists() {
+                    return Ok(path);
+                }
             }
         }
 
@@ -306,7 +306,11 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
             .trim()
             .to_string();
 
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     })
 }
 
@@ -336,9 +340,9 @@ fn generate_task_id() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pixy_agent_core::ParentChildRunEvent;
     use pixy_ai::{

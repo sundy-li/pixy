@@ -2,10 +2,10 @@ use std::fs;
 
 use pixy_ai::{Message, StopReason, UserContent};
 use pixy_coding_agent::{
-    BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
-    COMPACTION_SUMMARY_SUFFIX, CURRENT_SESSION_VERSION, SessionManager,
+    SessionManager, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX, CURRENT_SESSION_VERSION,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn user_message(text: &str, ts: i64) -> Message {

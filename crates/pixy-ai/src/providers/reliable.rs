@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 #[cfg(not(test))]
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
-use crate::AssistantMessageEventStream;
 use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
-use crate::transport_retry::{DEFAULT_TRANSPORT_RETRY_COUNT, transport_retry_count};
+use crate::transport_retry::{transport_retry_count, DEFAULT_TRANSPORT_RETRY_COUNT};
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, Context, Model, SimpleStreamOptions, StopReason,
     StreamOptions,
 };
+use crate::AssistantMessageEventStream;
 
 pub struct ReliableProvider {
     inner: Arc<dyn ApiProvider>,
@@ -366,11 +366,9 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AssistantMessageEvent::Done { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AssistantMessageEvent::Done { .. })));
         assert!(events.iter().all(|event| match event {
             AssistantMessageEvent::Start { partial } => !partial
                 .content

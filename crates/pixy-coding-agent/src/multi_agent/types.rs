@@ -43,10 +43,10 @@ impl TaskToolInput {
         if self.prompt.trim().is_empty() {
             return Err("task prompt cannot be empty".to_string());
         }
-        if let Some(task_id) = &self.task_id
-            && task_id.trim().is_empty()
-        {
-            return Err("task task_id cannot be empty when provided".to_string());
+        if let Some(task_id) = &self.task_id {
+            if task_id.trim().is_empty() {
+                return Err("task task_id cannot be empty when provided".to_string());
+            }
         }
         Ok(())
     }

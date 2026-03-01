@@ -5,7 +5,7 @@ use crate::types::{Context, Model, SimpleStreamOptions, StreamOptions};
 use crate::{ApiProviderRef, AssistantMessageEventStream};
 
 use super::google_generative_ai::{
-    GoogleAuthMode, run_google_with_mode, run_simple_google_with_mode,
+    run_google_with_mode, run_simple_google_with_mode, GoogleAuthMode,
 };
 
 const GOOGLE_VERTEX_FALLBACK_ENVS: &[&str] = &[

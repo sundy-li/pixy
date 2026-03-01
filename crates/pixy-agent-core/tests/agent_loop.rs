@@ -5,16 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pixy_agent_core::{
-    AgentAbortController, AgentContext, AgentEvent, AgentLoopConfig, AgentLoopError, AgentMessage,
-    AgentRetryConfig, AgentTool, AgentToolResult, agent_loop, agent_loop_continue,
-    try_agent_loop_continue,
+    agent_loop, agent_loop_continue, try_agent_loop_continue, AgentAbortController, AgentContext,
+    AgentEvent, AgentLoopConfig, AgentLoopError, AgentMessage, AgentRetryConfig, AgentTool,
+    AgentToolResult,
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
     Context, Cost, DoneReason, Message, Model, PiAiError, PiAiErrorCode, StopReason,
     ToolResultContentBlock, Usage, UserContent,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::time::sleep;
 
 fn sample_usage() -> Usage {

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub mod channels;
 pub mod config;
@@ -480,7 +480,7 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<(), String> {
-    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|error| format!("register SIGTERM handler failed: {error}"))?;
     tokio::select! {
@@ -632,11 +632,9 @@ mod tests {
     fn build_runtime_log_config_uses_defaults_when_unset() {
         let resolved =
             build_runtime_log_config(&PixyTomlLog::default(), &HashMap::new(), "gateway.log");
-        assert!(
-            resolved
-                .file_path
-                .ends_with(Path::new(".pixy/logs/gateway.log"))
-        );
+        assert!(resolved
+            .file_path
+            .ends_with(Path::new(".pixy/logs/gateway.log")));
         assert_eq!(resolved.level, "info");
         assert_eq!(resolved.rotate_size_bytes, 100 * 1024 * 1024);
         assert!(!resolved.stdout);

@@ -2,8 +2,9 @@ use std::fs;
 
 use pixy_ai::{PiAiErrorCode, ToolResultContentBlock};
 use pixy_coding_agent::{
-    create_bash_tool, create_coding_tools, create_edit_tool, create_list_directory_tool,
-    create_read_tool, create_write_tool,
+    apply_permission_mode_to_tools, create_bash_tool, create_coding_tools, create_edit_tool,
+    create_list_directory_tool, create_read_tool, create_write_tool, new_shared_permission_mode,
+    PermissionMode,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -203,4 +204,78 @@ fn create_coding_tools_returns_expected_order() {
         names,
         vec!["list_directory", "read", "bash", "edit", "write"]
     );
+}
+
+#[tokio::test]
+async fn permission_guard_blocks_outside_workspace_edit_in_auto_off() {
+    let workspace = tempdir().expect("workspace");
+    let outside = tempdir().expect("outside");
+    let outside_file = outside.path().join("outside.txt");
+
+    let mut tools = create_coding_tools(workspace.path());
+    let mode = new_shared_permission_mode(PermissionMode::AutoOff);
+    apply_permission_mode_to_tools(&mut tools, workspace.path(), mode.clone());
+    let write_tool = tools
+        .iter()
+        .find(|tool| tool.name == "write")
+        .expect("write tool should exist")
+        .clone();
+
+    let blocked = write_tool
+        .execute
+        .execute(
+            "call-write-outside".to_string(),
+            json!({
+                "path": outside_file.display().to_string(),
+                "content": "hello"
+            }),
+        )
+        .await
+        .expect_err("outside workspace write should require approval in auto-off");
+    assert_eq!(blocked.code, PiAiErrorCode::ToolExecutionFailed);
+    assert!(blocked.message.contains("Approval required"));
+    assert!(blocked.message.contains("Auto (off)"));
+
+    *mode.lock().expect("mode lock") = PermissionMode::AutoFull;
+    write_tool
+        .execute
+        .execute(
+            "call-write-outside-full".to_string(),
+            json!({
+                "path": outside_file.display().to_string(),
+                "content": "hello"
+            }),
+        )
+        .await
+        .expect("outside workspace write should be allowed in auto-full");
+    let persisted = fs::read_to_string(&outside_file).expect("outside file should be written");
+    assert_eq!(persisted, "hello");
+}
+
+#[tokio::test]
+async fn permission_guard_blocks_internet_bash_in_auto_off() {
+    let workspace = tempdir().expect("workspace");
+
+    let mut tools = create_coding_tools(workspace.path());
+    let mode = new_shared_permission_mode(PermissionMode::AutoOff);
+    apply_permission_mode_to_tools(&mut tools, workspace.path(), mode);
+    let bash_tool = tools
+        .iter()
+        .find(|tool| tool.name == "bash")
+        .expect("bash tool should exist")
+        .clone();
+
+    let blocked = bash_tool
+        .execute
+        .execute(
+            "call-bash-network".to_string(),
+            json!({
+                "command": "curl https://example.com"
+            }),
+        )
+        .await
+        .expect_err("internet command should require approval in auto-off");
+    assert_eq!(blocked.code, PiAiErrorCode::ToolExecutionFailed);
+    assert!(blocked.message.contains("Approval required"));
+    assert!(blocked.message.contains("Auto (off)"));
 }

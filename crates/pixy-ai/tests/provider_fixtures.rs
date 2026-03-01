@@ -2,17 +2,17 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use pixy_ai::{
-    AssistantContentBlock, AssistantMessageEvent, Context, Cost, Message, Model, StreamOptions,
-    Tool, UserContent, stream,
+    stream, AssistantContentBlock, AssistantMessageEvent, Context, Cost, Message, Model,
+    StreamOptions, Tool, UserContent,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Debug, Deserialize)]
 struct Fixture {

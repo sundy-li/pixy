@@ -6,17 +6,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{Datelike, Local};
 use pixy_ai::{AssistantContentBlock, Message, Model, StopReason};
 use pixy_coding_agent::{
-    AgentSession, RuntimeLoadOptions, RuntimeOverrides, SessionCreateOptions, SessionManager,
-    create_session,
+    create_session, AgentSession, RuntimeLoadOptions, RuntimeOverrides, SessionCreateOptions,
+    SessionManager,
 };
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::DEFAULT_PROMPT_INTRO;
-use crate::channels::feishu::{FeishuChannel, FeishuWebhookBinding, build_feishu_webhook_router};
+use crate::channels::feishu::{build_feishu_webhook_router, FeishuChannel, FeishuWebhookBinding};
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::{Channel, DispatchFuture, SessionDispatcher};
 use crate::config::{GatewayChannelConfig, GatewayConfig};
+use crate::DEFAULT_PROMPT_INTRO;
 
 const NEW_SESSION_COMMAND_REPLY: &str = "Started a new session. Send your next message.";
 
@@ -167,7 +167,7 @@ pub async fn serve_gateway(config: GatewayConfig) -> Result<(), String> {
 
 fn default_session_root() -> PathBuf {
     crate::config::current_pixy_home_dir()
-        .join("agent")
+        .join("agents")
         .join("sessions")
 }
 

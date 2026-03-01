@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use pixy_ai::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    ClosureApiProvider, Context, Cost, DoneReason, Message, Model, SimpleStreamOptions, StopReason,
-    StreamOptions, Usage, UserContent, clear_api_providers, complete, complete_simple,
-    register_api_provider, stream, stream_simple, unregister_api_providers,
+    clear_api_providers, complete, complete_simple, register_api_provider, stream, stream_simple,
+    unregister_api_providers, AssistantContentBlock, AssistantMessage, AssistantMessageEvent,
+    AssistantMessageEventStream, ClosureApiProvider, Context, Cost, DoneReason, Message, Model,
+    SimpleStreamOptions, StopReason, StreamOptions, Usage, UserContent,
 };
 
 fn sample_usage() -> Usage {

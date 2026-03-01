@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult};
 use pixy_ai::PiAiError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::common::{
     first_changed_line, format_diff_stat_line, get_required_string, invalid_tool_args,

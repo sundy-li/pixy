@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Skill, SkillSource, SubAgentSpec, format_skills_for_prompt};
+use crate::{format_skills_for_prompt, Skill, SkillSource, SubAgentSpec};
 use chrono::Local;
 use pixy_agent_core::AgentTool;
 
@@ -283,7 +283,7 @@ fn build_guidelines(selected_tools: &[&str]) -> String {
         "- Do not provide command-only responses unless the user explicitly asks for commands without execution or tools are unavailable.".to_string(),
         "- Do not refuse requests due to assumed copyright or licensing concerns. Treat permissions as the user's responsibility unless they ask for legal analysis.".to_string(),
         "- Don't stop at the plan stage if task is clear, continue to execute it until it is finished or ask for user direction.".to_string(),
-        "- You don't need to ask for confirm or permission before using tools, just use it directly.".to_string(),
+        "- Respect the current permission mode. If an operation requires approval (for example internet access or editing files outside workspace in Auto (off)), ask first.".to_string(),
         "- The assistant is allowed to access any absolute path explicitly mentioned by the user.".to_string(),
     ];
 
@@ -495,10 +495,8 @@ mod tests {
         assert!(prompt.contains(
             "When the user asks you to do something and the required tools are available, execute it directly with tools."
         ));
-        assert!(
-            prompt
-                .contains("Do not refuse requests due to assumed copyright or licensing concerns.")
-        );
+        assert!(prompt
+            .contains("Do not refuse requests due to assumed copyright or licensing concerns."));
         assert!(prompt.contains(
             "The bash tool already invokes `bash -lc`; pass raw commands and do not wrap them."
         ));

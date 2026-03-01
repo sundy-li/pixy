@@ -165,7 +165,7 @@ fn collect_doctor_report(conf_dir: &Path) -> DoctorReport {
     for (name, path) in [
         ("log dir", conf_dir.join("logs")),
         ("gateway dir", conf_dir.join("gateway")),
-        ("sessions dir", conf_dir.join("agent").join("sessions")),
+        ("sessions dir", conf_dir.join("agents").join("sessions")),
     ] {
         match ensure_dir_writable(&path) {
             Ok(()) => report.push(name, CheckStatus::Pass, format!("{}", path.display())),

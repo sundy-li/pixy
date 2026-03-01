@@ -4,7 +4,7 @@ use pixy_ai::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, EventStream, Message,
     PiAiError, PiAiErrorCode, StopReason, ToolResultContentBlock,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::types::{

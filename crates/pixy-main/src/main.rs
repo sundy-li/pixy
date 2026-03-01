@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use pixy_coding_agent::cli::ChatArgs;
-use pixy_gateway::{GatewayCommand, GatewayStartOptions, run_gateway_command};
+use pixy_gateway::{run_gateway_command, GatewayCommand, GatewayStartOptions};
 
 mod config_cmd;
 mod doctor;

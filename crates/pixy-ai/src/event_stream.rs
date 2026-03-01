@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 use crate::types::{AssistantMessage, AssistantMessageEvent, DoneReason, ErrorReason};
 

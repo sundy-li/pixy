@@ -5,15 +5,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pixy_agent_core::{AgentTool, AgentToolExecutor, AgentToolResult};
 use pixy_ai::PiAiError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::bash_command::normalize_nested_bash_lc;
 
 use super::common::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_timeout, get_optional_f64, get_required_string,
-    invalid_tool_args, text_result, tool_execution_failed, truncate_tail, truncated_by_str,
+    format_timeout, get_optional_f64, get_required_string, invalid_tool_args, text_result,
+    tool_execution_failed, truncate_tail, truncated_by_str, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
 };
 
 pub fn create_bash_tool(cwd: impl AsRef<Path>) -> AgentTool {

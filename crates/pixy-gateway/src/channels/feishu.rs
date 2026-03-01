@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 
 use crate::channels::{Channel, ChannelFuture, SessionDispatcher};
@@ -323,16 +323,16 @@ async fn handle_feishu_webhook(
             Json(serde_json::json!({ "challenge": value })),
         ),
         Ok(FeishuWebhookParseResult::Inbound { message }) => {
-            if let Some(message) = message
-                && binding.sender.send(message).is_err()
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "code": 500,
-                        "msg": format!("channel '{}' receiver dropped", binding.channel_name),
-                    })),
-                );
+            if let Some(message) = message {
+                if binding.sender.send(message).is_err() {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "code": 500,
+                            "msg": format!("channel '{}' receiver dropped", binding.channel_name),
+                        })),
+                    );
+                }
             }
             (
                 StatusCode::OK,
@@ -498,10 +498,10 @@ impl FeishuClient {
     async fn tenant_access_token(&self) -> Result<String, String> {
         {
             let cache = self.token_cache.lock().await;
-            if let Some(cache) = cache.as_ref()
-                && cache.expires_at > Instant::now()
-            {
-                return Ok(cache.value.clone());
+            if let Some(cache) = cache.as_ref() {
+                if cache.expires_at > Instant::now() {
+                    return Ok(cache.value.clone());
+                }
             }
         }
 

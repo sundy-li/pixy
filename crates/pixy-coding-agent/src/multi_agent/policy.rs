@@ -27,10 +27,10 @@ pub struct DispatchPolicyConfig {
 
 impl DispatchPolicyConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(fallback_subagent) = &self.fallback_subagent
-            && fallback_subagent.trim().is_empty()
-        {
-            return Err("policy fallback_subagent cannot be empty when provided".to_string());
+        if let Some(fallback_subagent) = &self.fallback_subagent {
+            if fallback_subagent.trim().is_empty() {
+                return Err("policy fallback_subagent cannot be empty when provided".to_string());
+            }
         }
 
         for rule in &self.rules {
@@ -71,16 +71,18 @@ impl DispatchPolicyConfig {
         let mut resolved_subagent = requested_subagent.clone();
         let mut routing_hint_applied = false;
 
-        if resolver.resolve(&requested_subagent).is_none()
-            && let Some(fallback_subagent) = self
+        if resolver.resolve(&requested_subagent).is_none() {
+            if let Some(fallback_subagent) = self
                 .fallback_subagent
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            && resolver.resolve(fallback_subagent).is_some()
-        {
-            resolved_subagent = fallback_subagent.to_string();
-            routing_hint_applied = true;
+            {
+                if resolver.resolve(fallback_subagent).is_some() {
+                    resolved_subagent = fallback_subagent.to_string();
+                    routing_hint_applied = true;
+                }
+            }
         }
 
         let mut blocked = false;

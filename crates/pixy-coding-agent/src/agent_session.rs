@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone};
 use pixy_agent_core::{
-    AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentRetryConfig,
-    AgentTool, IdentityMessageConverter, ParentChildRunEvent, StreamFn, agent_loop,
-    agent_loop_continue,
+    agent_loop, agent_loop_continue, AgentAbortSignal, AgentContext, AgentEvent, AgentLoopConfig,
+    AgentMessage, AgentRetryConfig, AgentTool, IdentityMessageConverter, ParentChildRunEvent,
+    StreamFn,
 };
 use pixy_ai::{
     AssistantContentBlock, AssistantMessageEvent, Context as LlmContext, Message, Model,
@@ -14,18 +15,24 @@ use pixy_ai::{
 };
 use serde_json::Value;
 
+use crate::permission::{
+    apply_permission_mode_to_tools, current_permission_mode_state, cycle_permission_mode_state,
+    new_shared_permission_mode,
+};
 use crate::system_prompt::append_multi_agent_prompt_section;
 use crate::{
-    BRANCH_SUMMARY_PREFIX, BeforeToolDefinitionHookContext, BeforeUserMessageHookContext,
-    COMPACTION_SUMMARY_PREFIX, ChildSessionStore, DefaultSubAgentRegistry, DispatchPolicyConfig,
-    MergedPluginConfig, MultiAgentPluginRuntime, ResolvedRuntime, RuntimeLoadOptions,
-    SessionContext, SessionManager, TaskDispatcher, TaskDispatcherConfig,
     agent_session_services::{
         AutoCompactionService, SessionResumeService, StreamingToolLineRenderer,
     },
     bash_command::normalize_nested_bash_lc,
-    build_system_prompt, create_coding_tools_with_extra,
+    build_system_prompt, create_coding_tools_with_extra, create_memory_tool,
     create_multi_agent_plugin_runtime_from_specs, create_task_tool, load_and_merge_plugins,
+    memory::{MemoryConfig as PersistMemoryConfig, MemoryFlushContext, MemoryManager},
+    BeforeToolDefinitionHookContext, BeforeUserMessageHookContext, ChildSessionStore,
+    DefaultSubAgentRegistry, DispatchPolicyConfig, MergedPluginConfig, MultiAgentPluginRuntime,
+    PermissionMode, ResolvedRuntime, RuntimeLoadOptions, SessionContext, SessionManager,
+    SharedPermissionMode, TaskDispatcher, TaskDispatcherConfig, BRANCH_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_PREFIX,
 };
 
 const AUTO_COMPACTION_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Summarize conversation history for another coding assistant.";
@@ -75,13 +82,22 @@ pub struct AgentSession {
     session_manager: SessionManager,
     config: AgentSessionConfig,
     plugin_runtime: Arc<MultiAgentPluginRuntime>,
+    memory_runtime: Option<SessionMemoryRuntime>,
     auto_compaction: AutoCompactionConfig,
     model_catalog: Vec<Model>,
     current_model_index: usize,
     retry_config: AgentRetryConfig,
+    permission_mode: SharedPermissionMode,
     resume_service: SessionResumeService,
     compaction_service: AutoCompactionService,
     stream_renderer: StreamingToolLineRenderer,
+}
+
+#[derive(Clone)]
+struct SessionMemoryRuntime {
+    manager: Arc<Mutex<MemoryManager>>,
+    auto_flush: bool,
+    flush_threshold_tokens: Option<u64>,
 }
 
 impl AgentSession {
@@ -91,10 +107,12 @@ impl AgentSession {
             session_manager,
             config,
             plugin_runtime: Arc::new(MultiAgentPluginRuntime::default()),
+            memory_runtime: None,
             auto_compaction: AutoCompactionConfig::default(),
             model_catalog: vec![current_model],
             current_model_index: 0,
             retry_config: AgentRetryConfig::default(),
+            permission_mode: new_shared_permission_mode(PermissionMode::default()),
             resume_service: SessionResumeService::new(),
             compaction_service: AutoCompactionService::new(),
             stream_renderer: StreamingToolLineRenderer::new(),
@@ -111,6 +129,10 @@ impl AgentSession {
 
     pub fn set_multi_agent_plugin_runtime(&mut self, plugin_runtime: Arc<MultiAgentPluginRuntime>) {
         self.plugin_runtime = plugin_runtime;
+    }
+
+    fn set_memory_runtime(&mut self, memory_runtime: Option<SessionMemoryRuntime>) {
+        self.memory_runtime = memory_runtime;
     }
 
     pub fn resume(&mut self, target: Option<&str>) -> Result<PathBuf, String> {
@@ -208,6 +230,18 @@ impl AgentSession {
 
     pub fn set_retry_config(&mut self, retry_config: AgentRetryConfig) {
         self.retry_config = retry_config;
+    }
+
+    pub fn current_permission_mode(&self) -> PermissionMode {
+        current_permission_mode_state(&self.permission_mode)
+    }
+
+    pub fn cycle_permission_mode(&mut self) -> PermissionMode {
+        cycle_permission_mode_state(&self.permission_mode)
+    }
+
+    fn set_permission_mode_state(&mut self, permission_mode: SharedPermissionMode) {
+        self.permission_mode = permission_mode;
     }
 
     pub fn set_model_catalog(&mut self, models: Vec<Model>) {
@@ -531,8 +565,11 @@ impl AgentSession {
         first_kept_entry_id: Option<&str>,
         tokens_before: u64,
     ) -> Result<String, String> {
-        self.session_manager
-            .append_compaction(summary, first_kept_entry_id, tokens_before)
+        let compaction_id =
+            self.session_manager
+                .append_compaction(summary, first_kept_entry_id, tokens_before)?;
+        self.flush_memory_for_compaction(summary, first_kept_entry_id, tokens_before);
+        Ok(compaction_id)
     }
 
     pub fn compact_keep_recent(
@@ -548,9 +585,63 @@ impl AgentSession {
             return Ok(None);
         };
 
-        self.session_manager
-            .append_compaction(summary, Some(&first_kept_entry_id), tokens_before)
-            .map(Some)
+        let compaction_id = self.session_manager.append_compaction(
+            summary,
+            Some(&first_kept_entry_id),
+            tokens_before,
+        )?;
+        self.flush_memory_for_compaction(summary, Some(&first_kept_entry_id), tokens_before);
+        Ok(Some(compaction_id))
+    }
+
+    fn flush_memory_for_compaction(
+        &self,
+        summary: &str,
+        first_kept_entry_id: Option<&str>,
+        tokens_before: u64,
+    ) {
+        let Some(memory_runtime) = &self.memory_runtime else {
+            return;
+        };
+        if !memory_runtime.auto_flush {
+            return;
+        }
+        if let Some(threshold) = memory_runtime.flush_threshold_tokens {
+            if tokens_before < threshold {
+                return;
+            }
+        }
+
+        let mut notes = vec!["Session compaction persisted.".to_string()];
+        if let Some(first_kept_entry_id) = first_kept_entry_id {
+            notes.push(format!("first_kept_entry_id: {first_kept_entry_id}"));
+        }
+        let context = MemoryFlushContext {
+            session_id: Some(self.session_manager.header().id.clone()),
+            agent_id: Some("pixy-coding-agent".to_string()),
+            token_count: usize::try_from(tokens_before).unwrap_or(usize::MAX),
+            compaction_count: self.session_manager.current_path_compaction_count(),
+            summary: Some(summary.to_string()),
+            notes,
+            decisions: Vec::new(),
+            todos: Vec::new(),
+            metadata: None,
+        };
+
+        let manager = match memory_runtime.manager.lock() {
+            Ok(manager) => manager,
+            Err(_) => {
+                eprintln!("warning: memory manager lock poisoned, skip memory flush");
+                return;
+            }
+        };
+        if let Err(error) = manager.flush(&context) {
+            eprintln!("warning: memory flush during compaction failed: {error}");
+            return;
+        }
+        if let Err(error) = manager.cleanup() {
+            eprintln!("warning: memory cleanup after compaction failed: {error}");
+        }
     }
 
     fn loop_config(&self) -> AgentLoopConfig {
@@ -822,6 +913,50 @@ pub fn create_session(
     Ok(CreatedSession { session, runtime })
 }
 
+fn create_session_memory_runtime(runtime: &ResolvedRuntime) -> Option<SessionMemoryRuntime> {
+    if !runtime.memory.enabled {
+        return None;
+    }
+
+    let mut config = PersistMemoryConfig::new(runtime.memory.dir.clone());
+    config.retention_days = runtime.memory.retention_days;
+    config.auto_flush = runtime.memory.auto_flush;
+    config.flush_threshold_tokens = runtime.memory.flush_threshold_tokens;
+    config.file_pattern = runtime.memory.file_pattern.clone();
+    config.search_max_results = runtime.memory.search.max_results.max(1);
+    config.search_min_score = runtime.memory.search.min_score.clamp(0.0, 1.0);
+
+    match MemoryManager::new(config) {
+        Ok(manager) => Some(SessionMemoryRuntime {
+            manager: Arc::new(Mutex::new(manager)),
+            auto_flush: runtime.memory.auto_flush,
+            flush_threshold_tokens: runtime.memory.flush_threshold_tokens,
+        }),
+        Err(error) => {
+            eprintln!("warning: failed to initialize memory runtime, memory disabled: {error}");
+            None
+        }
+    }
+}
+
+fn resolve_runtime_api_key_for_model(
+    model_provider: &str,
+    provider_api_keys: &HashMap<String, String>,
+    default_provider: &str,
+    runtime_api_key: Option<&String>,
+) -> Option<String> {
+    provider_api_keys
+        .get(model_provider)
+        .cloned()
+        .or_else(|| {
+            if model_provider == default_provider {
+                runtime_api_key.cloned()
+            } else {
+                None
+            }
+        })
+}
+
 pub fn create_session_from_runtime(
     cwd: &Path,
     session_manager: SessionManager,
@@ -836,17 +971,36 @@ pub fn create_session_from_runtime(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cwd.to_path_buf());
 
+    let session_memory_runtime = create_session_memory_runtime(runtime);
+    let mut extra_tools = Vec::new();
+    if !no_tools && runtime.memory.search.enabled {
+        if let Some(memory_runtime) = &session_memory_runtime {
+            extra_tools.push(create_memory_tool(
+                memory_runtime.manager.clone(),
+                runtime.memory.search.max_results,
+                runtime.memory.search.min_score,
+            ));
+        }
+    }
+
     let mut child_tools = if no_tools {
         vec![]
     } else {
-        create_coding_tools_with_extra(cwd, vec![])
+        create_coding_tools_with_extra(cwd, extra_tools)
     };
     let runtime_api_key = runtime.api_key.clone();
+    let runtime_provider_api_keys = runtime.provider_api_keys.clone();
+    let runtime_default_provider = runtime.model.provider.clone();
     let stream_fn = Arc::new(
         move |model: Model, context: pixy_ai::Context, options: Option<SimpleStreamOptions>| {
             let mut resolved_options = options.unwrap_or_default();
             if resolved_options.stream.api_key.is_none() {
-                resolved_options.stream.api_key = runtime_api_key.clone();
+                resolved_options.stream.api_key = resolve_runtime_api_key_for_model(
+                    &model.provider,
+                    &runtime_provider_api_keys,
+                    &runtime_default_provider,
+                    runtime_api_key.as_ref(),
+                );
             }
             pixy_ai::stream_simple(model, context, Some(resolved_options))
         },
@@ -874,6 +1028,8 @@ pub fn create_session_from_runtime(
         }
     };
     apply_before_tool_definition_hooks(plugin_runtime.as_ref(), &mut child_tools);
+    let permission_mode = new_shared_permission_mode(PermissionMode::default());
+    apply_permission_mode_to_tools(&mut child_tools, cwd, permission_mode.clone());
 
     let mut tools = child_tools.clone();
     let mut prompt_subagents = vec![];
@@ -902,10 +1058,10 @@ pub fn create_session_from_runtime(
             }
         }
 
-        if init_error.is_none()
-            && let Some(error) = plugin_merge_error.clone()
-        {
-            init_error = Some(error);
+        if init_error.is_none() {
+            if let Some(error) = plugin_merge_error.clone() {
+                init_error = Some(error);
+            }
         }
 
         if init_error.is_none() {
@@ -976,6 +1132,8 @@ pub fn create_session_from_runtime(
     };
     let mut session = AgentSession::new(session_manager, config);
     session.set_multi_agent_plugin_runtime(plugin_runtime);
+    session.set_memory_runtime(session_memory_runtime);
+    session.set_permission_mode_state(permission_mode);
     if !runtime.model_catalog.is_empty() {
         session.set_model_catalog(runtime.model_catalog.clone());
     }
@@ -1757,14 +1915,19 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Local;
     use pixy_ai::{Cost, Message, Model, UserContent};
     use serde_json::json;
+    use std::collections::HashMap;
 
     use super::{
-        ResolvedRuntime, build_session_resume_candidate, create_session_from_runtime,
-        format_bash_tool_start_line, normalize_session_candidate_title,
+        build_session_resume_candidate, create_session_from_runtime, format_bash_tool_start_line,
+        normalize_session_candidate_title, resolve_runtime_api_key_for_model, ResolvedRuntime,
     };
-    use crate::{ResolvedMultiAgentConfig, SessionManager, SubAgentMode, SubAgentSpec};
+    use crate::{
+        ResolvedMemoryConfig, ResolvedMemorySearchConfig, ResolvedMultiAgentConfig, SessionManager,
+        SubAgentMode, SubAgentSpec,
+    };
 
     fn sample_model() -> Model {
         Model {
@@ -1785,6 +1948,22 @@ mod tests {
             },
             context_window: 128_000,
             max_tokens: 8_192,
+        }
+    }
+
+    fn default_memory_config() -> ResolvedMemoryConfig {
+        ResolvedMemoryConfig {
+            enabled: false,
+            dir: std::env::temp_dir().join("pixy-memory-disabled"),
+            retention_days: Some(30),
+            auto_flush: true,
+            flush_threshold_tokens: None,
+            file_pattern: "%Y-%m-%d.md".to_string(),
+            search: ResolvedMemorySearchConfig {
+                enabled: true,
+                max_results: 10,
+                min_score: 0.1,
+            },
         }
     }
 
@@ -1834,12 +2013,14 @@ mod tests {
             model: sample_model(),
             model_catalog: vec![sample_model()],
             api_key: None,
+            provider_api_keys: HashMap::new(),
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: false,
                 agents: vec![],
                 plugin_paths: vec![],
                 hooks: vec![],
             },
+            memory: default_memory_config(),
             skills: vec![],
             skill_diagnostics: vec![],
             theme: None,
@@ -1852,18 +2033,17 @@ mod tests {
             None,
             false,
         );
-        assert!(
-            !session_disabled
-                .config
-                .tools
-                .iter()
-                .any(|tool| tool.name == "task")
-        );
+        assert!(!session_disabled
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool.name == "task"));
 
         let runtime_enabled = ResolvedRuntime {
             model: sample_model(),
             model_catalog: vec![sample_model()],
             api_key: None,
+            provider_api_keys: HashMap::new(),
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: true,
                 agents: vec![SubAgentSpec {
@@ -1874,6 +2054,7 @@ mod tests {
                 plugin_paths: vec![],
                 hooks: vec![],
             },
+            memory: default_memory_config(),
             skills: vec![],
             skill_diagnostics: vec![],
             theme: None,
@@ -1886,13 +2067,11 @@ mod tests {
             None,
             false,
         );
-        assert!(
-            session_enabled
-                .config
-                .tools
-                .iter()
-                .any(|tool| tool.name == "task")
-        );
+        assert!(session_enabled
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool.name == "task"));
     }
 
     #[test]
@@ -1906,6 +2085,7 @@ mod tests {
             model: sample_model(),
             model_catalog: vec![sample_model()],
             api_key: None,
+            provider_api_keys: HashMap::new(),
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: true,
                 agents: vec![
@@ -1923,6 +2103,7 @@ mod tests {
                 plugin_paths: vec![],
                 hooks: vec![],
             },
+            memory: default_memory_config(),
             skills: vec![],
             skill_diagnostics: vec![],
             theme: None,
@@ -1966,12 +2147,14 @@ mode = "subagent"
             model: sample_model(),
             model_catalog: vec![sample_model()],
             api_key: None,
+            provider_api_keys: HashMap::new(),
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: true,
                 agents: vec![],
                 plugin_paths: vec![plugin_path],
                 hooks: vec![],
             },
+            memory: default_memory_config(),
             skills: vec![],
             skill_diagnostics: vec![],
             theme: None,
@@ -2024,12 +2207,14 @@ value = "\n[plugin hook active]"
             model: sample_model(),
             model_catalog: vec![sample_model()],
             api_key: None,
+            provider_api_keys: HashMap::new(),
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: true,
                 agents: vec![],
                 plugin_paths: vec![plugin_path],
                 hooks: vec![],
             },
+            memory: default_memory_config(),
             skills: vec![],
             skill_diagnostics: vec![],
             theme: None,
@@ -2051,5 +2236,137 @@ value = "\n[plugin hook active]"
             .find(|tool| tool.name == "task")
             .expect("task tool");
         assert!(task_tool.description.contains("[plugin hook active]"));
+    }
+
+    #[test]
+    fn create_session_from_runtime_adds_memory_tool_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            provider_api_keys: HashMap::new(),
+            multi_agent: ResolvedMultiAgentConfig::default(),
+            memory: ResolvedMemoryConfig {
+                enabled: true,
+                dir: dir.path().join("memory"),
+                retention_days: Some(30),
+                auto_flush: true,
+                flush_threshold_tokens: None,
+                file_pattern: "%Y-%m-%d.md".to_string(),
+                search: ResolvedMemorySearchConfig {
+                    enabled: true,
+                    max_results: 8,
+                    min_score: 0.1,
+                },
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+
+        assert!(
+            session
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool.name == "memory"),
+            "memory tool should be injected when memory + search are enabled"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_api_key_for_model_prefers_provider_specific_key() {
+        let mut provider_api_keys = HashMap::new();
+        provider_api_keys.insert("anthropic-ds".to_string(), "ds-key".to_string());
+
+        let default_key = "anthropic-default".to_string();
+        let resolved = resolve_runtime_api_key_for_model(
+            "anthropic-ds",
+            &provider_api_keys,
+            "anthropic",
+            Some(&default_key),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("ds-key"));
+    }
+
+    #[test]
+    fn resolve_runtime_api_key_for_model_falls_back_to_default_provider_key() {
+        let provider_api_keys = HashMap::new();
+        let default_key = "openai-key".to_string();
+        let resolved = resolve_runtime_api_key_for_model(
+            "openai",
+            &provider_api_keys,
+            "openai",
+            Some(&default_key),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("openai-key"));
+    }
+
+    #[test]
+    fn compact_triggers_memory_flush_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path();
+        let cwd_text = cwd.to_str().expect("utf-8 cwd");
+        let memory_dir = dir.path().join("memory");
+
+        let runtime = ResolvedRuntime {
+            model: sample_model(),
+            model_catalog: vec![sample_model()],
+            api_key: None,
+            provider_api_keys: HashMap::new(),
+            multi_agent: ResolvedMultiAgentConfig::default(),
+            memory: ResolvedMemoryConfig {
+                enabled: true,
+                dir: memory_dir.clone(),
+                retention_days: Some(30),
+                auto_flush: true,
+                flush_threshold_tokens: Some(1000),
+                file_pattern: "%Y-%m-%d.md".to_string(),
+                search: ResolvedMemorySearchConfig {
+                    enabled: true,
+                    max_results: 8,
+                    min_score: 0.1,
+                },
+            },
+            skills: vec![],
+            skill_diagnostics: vec![],
+            theme: None,
+            transport_retry_count: 5,
+        };
+
+        let mut session = create_session_from_runtime(
+            cwd,
+            SessionManager::create(cwd_text, &session_dir).expect("create session"),
+            &runtime,
+            None,
+            false,
+        );
+        session
+            .compact("compaction recap for memory flush", None, 2048)
+            .expect("compaction should succeed");
+
+        let filename = Local::now().date_naive().format("%Y-%m-%d.md").to_string();
+        let file_path = memory_dir.join(filename);
+        let content = std::fs::read_to_string(&file_path).expect("memory flush file should exist");
+        assert!(content.contains("Memory Flush"));
+        assert!(content.contains("compaction recap for memory flush"));
+        assert!(content.contains("Compaction Count"));
     }
 }

@@ -96,6 +96,20 @@ command = "git status --short | head -n 20"
 field = "output.summary"
 append = true
 
+[memory]
+enabled = false
+# Relative paths resolve from pixy.toml directory.
+dir = "memory"
+retention_days = 30
+auto_flush = true
+flush_threshold_tokens = 4000
+file_pattern = "%Y-%m-%d.md"
+
+[memory.search]
+enabled = true
+max_results = 10
+min_score = 0.1
+
 [gateway]
 enabled = true
 bind = "0.0.0.0:8080"

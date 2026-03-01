@@ -3,9 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::AssistantMessageEventStream;
 use crate::error::PiAiError;
 use crate::types::{Api, Context, Model, SimpleStreamOptions, StreamOptions};
+use crate::AssistantMessageEventStream;
 
 pub type ApiProviderFuture = Pin<Box<dyn Future<Output = Result<(), PiAiError>> + Send>>;
 

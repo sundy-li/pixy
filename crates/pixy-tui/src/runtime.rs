@@ -8,13 +8,12 @@ use crossterm::execute;
 use crossterm::terminal::enable_raw_mode;
 use futures_util::StreamExt;
 use pixy_ai::UserContentBlock;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 use super::terminal::TerminalRestore;
 use super::{
-    InputHistoryStore, TuiApp, TuiBackend, TuiOptions, apply_selection_osc_colors,
-    build_welcome_banner, default_terminal_options, draw_ui_frame,
+    apply_selection_osc_colors, build_welcome_banner, default_terminal_options, draw_ui_frame,
     handle_continue_streaming as handle_continue_streaming_impl, handle_editor_key_event,
     handle_input_history_key_event, handle_mouse_history_event, handle_paste_event,
     handle_resume_picker_key_event as handle_resume_picker_key_event_impl,
@@ -22,7 +21,8 @@ use super::{
     now_millis, persist_welcome_into_transcript,
     primary_keybinding_label_lower as primary_keybinding_label_lower_impl,
     process_queued_follow_ups as process_queued_follow_ups_impl, query_session_status_label,
-    run_submitted_input as run_submitted_input_impl, startup_status_label,
+    run_submitted_input as run_submitted_input_impl, startup_status_label, InputHistoryStore,
+    TuiApp, TuiBackend, TuiOptions,
 };
 
 pub(crate) struct TuiRuntime<'a, B: TuiBackend> {
@@ -37,6 +37,14 @@ pub(crate) struct TuiRuntime<'a, B: TuiBackend> {
 enum RuntimeControl {
     Continue,
     Exit,
+}
+
+fn normalize_backend_model_status(status: String) -> String {
+    if status.starts_with("model: ") {
+        "ready".to_string()
+    } else {
+        status
+    }
 }
 
 impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
@@ -214,12 +222,28 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
             self.app.status = query_session_status_label(self.backend);
             return Ok(RuntimeControl::Continue);
         }
+        if matches_keybinding(&self.options.keybindings.cycle_permission_mode, key) {
+            self.app.status = match self.backend.cycle_permission_mode() {
+                Ok(Some(status)) => {
+                    self.app
+                        .maybe_update_status_left_from_backend_status(&status);
+                    if status.starts_with("permission: ") {
+                        "ready".to_string()
+                    } else {
+                        status
+                    }
+                }
+                Ok(None) => "".to_string(),
+                Err(error) => format!("cycle permission mode failed: {error}"),
+            };
+            return Ok(RuntimeControl::Continue);
+        }
         if matches_keybinding(&self.options.keybindings.cycle_model_forward, key) {
             self.app.status = match self.backend.cycle_model_forward() {
                 Ok(Some(status)) => {
                     self.app
                         .maybe_update_status_right_from_backend_status(&status);
-                    status
+                    normalize_backend_model_status(status)
                 }
                 Ok(None) => "".to_string(),
                 Err(error) => format!("cycle model failed: {error}"),
@@ -231,7 +255,7 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
                 Ok(Some(status)) => {
                     self.app
                         .maybe_update_status_right_from_backend_status(&status);
-                    status
+                    normalize_backend_model_status(status)
                 }
                 Ok(None) => "".to_string(),
                 Err(error) => format!("cycle model failed: {error}"),
@@ -243,7 +267,7 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
                 Ok(Some(status)) => {
                     self.app
                         .maybe_update_status_right_from_backend_status(&status);
-                    status
+                    normalize_backend_model_status(status)
                 }
                 Ok(None) => "".to_string(),
                 Err(error) => format!("select model failed: {error}"),
@@ -391,5 +415,22 @@ impl<'a, B: TuiBackend> TuiRuntime<'a, B> {
             &mut self.events,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_backend_model_status;
+
+    #[test]
+    fn normalize_backend_model_status_hides_ephemeral_model_line() {
+        assert_eq!(
+            normalize_backend_model_status("model: anthropic/claude-3-5-sonnet-latest".to_string()),
+            "ready"
+        );
+        assert_eq!(
+            normalize_backend_model_status("cycle model failed: boom".to_string()),
+            "cycle model failed: boom"
+        );
     }
 }

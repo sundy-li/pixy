@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use pixy_ai::Message;
 
 use crate::{
-    AgentSession, ResolvedRuntime, RuntimeLoadOptions, RuntimeOverrides, SessionManager,
-    agent_session::{SessionResumeCandidate, build_session_resume_candidate},
-    create_session_from_runtime,
+    agent_session::{build_session_resume_candidate, SessionResumeCandidate},
+    create_session_from_runtime, AgentSession, ResolvedRuntime, RuntimeLoadOptions,
+    RuntimeOverrides, SessionManager,
 };
 
 #[derive(Debug, Clone)]
@@ -367,7 +367,7 @@ impl ReplCommandParser {
 
         match trimmed {
             "/exit" | "/quit" => Some(ReplCommand::Exit),
-            "/help" => Some(ReplCommand::Help),
+            "/help" | "?" => Some(ReplCommand::Help),
             "/session" => Some(ReplCommand::Session),
             "/continue" => Some(ReplCommand::Continue),
             _ => Some(ReplCommand::Prompt {

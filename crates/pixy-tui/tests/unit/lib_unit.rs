@@ -171,6 +171,13 @@ fn default_keybindings_match_expected_keys() {
     assert_eq!(
         bindings.select_model,
         vec![KeyBinding {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::CONTROL
+        }]
+    );
+    assert_eq!(
+        bindings.cycle_permission_mode,
+        vec![KeyBinding {
             code: KeyCode::Char('l'),
             modifiers: KeyModifiers::CONTROL
         }]
@@ -327,11 +334,10 @@ fn welcome_banner_is_persisted_into_transcript() {
     app.set_welcome_lines(vec!["Welcome line".to_string()]);
 
     persist_welcome_into_transcript(&mut app);
-    assert!(
-        app.transcript
-            .iter()
-            .any(|line| line.text.contains("Welcome line"))
-    );
+    assert!(app
+        .transcript
+        .iter()
+        .any(|line| line.text.contains("Welcome line")));
 }
 
 #[test]
@@ -752,21 +758,69 @@ fn status_bar_keeps_top_line_stable_while_working() {
     let mut app = TuiApp::new("pi is working...".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (High) - allow all commands".to_string(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
         "Databend GPT-5.3 Codex [custom]".to_string(),
     );
     app.start_working("pi is working...".to_string());
-    app.status_left = "Auto (High) - allow all commands".to_string();
+    app.status_left =
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string();
 
     let status = render_status_bar_lines(&app, 120, TuiTheme::Dark);
     let middle = line_text(&status.lines[0]);
     let hints = line_text(&status.lines[1]);
     let bottom = line_text(&status.lines[2]);
 
-    assert!(middle.contains("Auto (High) - allow all commands"));
+    assert!(middle.contains("Auto (off) - workspace edits/commands"));
     assert!(middle.contains("Databend GPT-5.3 Codex [custom]"));
-    assert!(hints.contains("shift+tab to cycle modes"));
+    assert!(hints.contains("shift+tab to toggle thinking"));
     assert!(bottom.contains("[⏱"));
+}
+
+#[test]
+fn backend_model_status_updates_status_right_with_provider_and_model() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        "Databend GPT-5.3 Codex".to_string(),
+    );
+
+    app.maybe_update_status_right_from_backend_status("model: openai/gpt-5.3-codex");
+
+    assert_eq!(app.status_right, "openai:gpt-5.3-codex");
+}
+
+#[test]
+fn backend_model_status_replaces_previous_label_with_provider_and_model() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        "openai:gpt-5.3-codex".to_string(),
+    );
+
+    app.maybe_update_status_right_from_backend_status("model: anthropic/claude-opus-4-6");
+
+    assert_eq!(app.status_right, "anthropic:claude-opus-4-6");
+}
+
+#[test]
+fn backend_permission_status_updates_status_left_label() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.set_status_bar_meta(
+        String::new(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
+        "openai:gpt-5.3-codex".to_string(),
+    );
+
+    app.maybe_update_status_left_from_backend_status(
+        "permission: Auto (full) - internet and outside-workspace edits are allowed without approval",
+    );
+
+    assert_eq!(
+        app.status_left,
+        "Auto (full) - internet and outside-workspace edits are allowed without approval"
+    );
 }
 
 #[test]
@@ -984,11 +1038,9 @@ fn multiline_tool_update_is_split_and_compacted() {
         TuiTheme::Dark,
     );
     let texts = visible.iter().map(line_text).collect::<Vec<_>>();
-    assert!(
-        texts
-            .iter()
-            .any(|line| line.contains("• Ran read /tmp/example.txt"))
-    );
+    assert!(texts
+        .iter()
+        .any(|line| line.contains("• Ran read /tmp/example.txt")));
     assert!(texts.iter().any(|line| line.contains("… +3 lines")));
     assert!(texts.iter().any(|line| line.contains("line 6")));
 }
@@ -1066,11 +1118,9 @@ fn assistant_multiline_block_prefixes_only_first_non_empty_line() {
     let rendered = visible.iter().map(line_text).collect::<Vec<_>>();
     let output_prompt = TuiTheme::Dark.output_prompt();
 
-    assert!(
-        rendered
-            .iter()
-            .any(|line| line.contains(&format!("{output_prompt}first line")))
-    );
+    assert!(rendered
+        .iter()
+        .any(|line| line.contains(&format!("{output_prompt}first line"))));
     assert!(rendered.iter().any(|line| line.contains("second line")));
     assert!(
         !rendered
@@ -1126,11 +1176,10 @@ fn first_submitted_input_keeps_welcome_banner_in_transcript() {
     persist_welcome_into_transcript(&mut app);
     app.push_user_input_line("hello".to_string());
 
-    assert!(
-        app.transcript
-            .iter()
-            .any(|line| line.text.contains("Welcome line"))
-    );
+    assert!(app
+        .transcript
+        .iter()
+        .any(|line| line.text.contains("Welcome line")));
     assert!(app.transcript.iter().any(|line| line.text == "hello"));
 }
 
@@ -1162,16 +1211,12 @@ fn selection_osc_reset_sequence_resets_both_colors() {
 fn dark_theme_selection_osc_sequences_include_rgb_and_st_variants() {
     let sequences = selection_osc_set_sequences(TuiTheme::Dark, TerminalCapabilities::default())
         .expect("dark theme should provide selection sequences");
-    assert!(
-        sequences
-            .iter()
-            .any(|sequence| sequence.contains("rgb:3b/42/61") && sequence.contains("\u{7}"))
-    );
-    assert!(
-        sequences
-            .iter()
-            .any(|sequence| sequence.contains("rgb:c0/ca/f5") && sequence.contains("\u{1b}\\"))
-    );
+    assert!(sequences
+        .iter()
+        .any(|sequence| sequence.contains("rgb:3b/42/61") && sequence.contains("\u{7}")));
+    assert!(sequences
+        .iter()
+        .any(|sequence| sequence.contains("rgb:c0/ca/f5") && sequence.contains("\u{1b}\\")));
 }
 
 #[test]
@@ -1184,11 +1229,9 @@ fn selection_osc_sequences_are_wrapped_for_tmux() {
         },
     )
     .expect("dark theme should provide selection sequences");
-    assert!(
-        sequences
-            .iter()
-            .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
-    );
+    assert!(sequences
+        .iter()
+        .any(|sequence| sequence.starts_with("\u{1b}Ptmux;")));
 }
 
 #[test]
@@ -1197,11 +1240,9 @@ fn selection_osc_reset_sequences_are_wrapped_for_tmux() {
         multiplexer: Some(TerminalMultiplexer::Tmux),
         ..TerminalCapabilities::default()
     });
-    assert!(
-        sequences
-            .iter()
-            .any(|sequence| sequence.starts_with("\u{1b}Ptmux;"))
-    );
+    assert!(sequences
+        .iter()
+        .any(|sequence| sequence.starts_with("\u{1b}Ptmux;")));
 }
 
 #[test]
@@ -1414,11 +1455,9 @@ fn multiline_assistant_markdown_tables_are_rendered_in_transcript() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(
-        texts
-            .iter()
-            .any(|line| line == &format!("{}before", TuiTheme::Dark.output_prompt()))
-    );
+    assert!(texts
+        .iter()
+        .any(|line| line == &format!("{}before", TuiTheme::Dark.output_prompt())));
     assert!(texts.iter().any(|line| line == "┌──────┬──────┐"));
     assert!(texts.iter().any(|line| line == "│ A    │ BBB  │"));
     assert!(texts.iter().any(|line| line == "after"));
@@ -1524,11 +1563,9 @@ fn assistant_line_with_multiline_markdown_table_is_rendered_as_table() {
         .map(|line| line.trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert!(
-        texts
-            .iter()
-            .any(|line| line == &format!("{}这里是表格：", TuiTheme::Dark.output_prompt()))
-    );
+    assert!(texts
+        .iter()
+        .any(|line| line == &format!("{}这里是表格：", TuiTheme::Dark.output_prompt())));
     assert!(texts.iter().any(|line| line == "┌─────┬─────┬─────┐"));
     assert!(texts.iter().any(|line| line == "│ 列1 │ 列2 │ 列3 │"));
     assert!(texts.iter().any(|line| line == "│ A3  │ B3  │ C3  │"));
@@ -2480,7 +2517,7 @@ fn status_bar_shows_working_without_steering_rows() {
     let mut app = TuiApp::new("pixy is working...".to_string(), true, false);
     app.set_status_bar_meta(
         String::new(),
-        "Auto (High) - allow all commands".to_string(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
         "Databend GPT-5.3 Codex [custom]".to_string(),
     );
     app.start_working("pixy is working...".to_string());
@@ -2490,7 +2527,7 @@ fn status_bar_shows_working_without_steering_rows() {
     let status = render_status_bar_lines(&app, 40, TuiTheme::Dark);
     assert_eq!(status.lines.len(), 3);
     assert!(!line_text(&status.lines[0]).contains("Steering:"));
-    assert!(line_text(&status.lines[0]).contains("Auto (High)"));
+    assert!(line_text(&status.lines[0]).contains("Auto (off)"));
     assert!(line_text(&status.lines[1]).contains("shift+tab"));
     assert!(line_text(&status.lines[2]).contains("? for help"));
 }
@@ -2500,7 +2537,7 @@ fn status_bar_hides_ready_suffix_when_status_top_present() {
     let mut app = TuiApp::new("ready".to_string(), true, false);
     app.set_status_bar_meta(
         "/data/work/pixy (main)".to_string(),
-        "Auto (High) - allow all commands".to_string(),
+        "Auto (off) - workspace edits/commands, internet & outside edits need approval".to_string(),
         "databend/gpt-5.3-codex".to_string(),
     );
 

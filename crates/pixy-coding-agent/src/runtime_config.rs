@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pixy_ai::{Cost, DEFAULT_TRANSPORT_RETRY_COUNT, Model};
+use pixy_ai::{Cost, Model, DEFAULT_TRANSPORT_RETRY_COUNT};
 use serde::Deserialize;
 
 use crate::{
-    DeclarativeHookSpec, LoadSkillsOptions, Skill, SkillDiagnostic, SubAgentMode, SubAgentSpec,
-    load_skills,
+    load_skills, DeclarativeHookSpec, LoadSkillsOptions, Skill, SkillDiagnostic, SubAgentMode,
+    SubAgentSpec,
 };
 
 const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
@@ -101,7 +101,7 @@ impl RuntimeLoadOptions {
             let agent_dir = self
                 .agent_dir
                 .clone()
-                .unwrap_or_else(|| conf_dir.join("agent"));
+                .unwrap_or_else(|| conf_dir.join("agents"));
             let mut load_options = LoadSkillsOptions::new(cwd.to_path_buf(), agent_dir);
             load_options.include_defaults = self.include_default_skills;
             load_options.skill_paths = local.settings.skills.clone();
@@ -116,12 +116,14 @@ impl RuntimeLoadOptions {
             model: runtime.model,
             model_catalog: runtime.model_catalog,
             api_key: runtime.api_key,
+            provider_api_keys: runtime.provider_api_keys,
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: local.multi_agent.enabled,
                 agents: local.multi_agent.agents.clone(),
                 plugin_paths: local.multi_agent.plugin_paths.clone(),
                 hooks: local.multi_agent.hooks.clone(),
             },
+            memory: local.memory.clone(),
             skills,
             skill_diagnostics,
             theme: local.settings.theme.take(),
@@ -147,7 +149,7 @@ impl RuntimeLoadOptions {
             let agent_dir = self
                 .agent_dir
                 .clone()
-                .unwrap_or_else(|| conf_dir.join("agent"));
+                .unwrap_or_else(|| conf_dir.join("agents"));
             let mut load_options = LoadSkillsOptions::new(cwd.to_path_buf(), agent_dir);
             load_options.include_defaults = self.include_default_skills;
             load_options.skill_paths = local.settings.skills.clone();
@@ -162,12 +164,14 @@ impl RuntimeLoadOptions {
             model: runtime.model,
             model_catalog: runtime.model_catalog,
             api_key: runtime.api_key,
+            provider_api_keys: runtime.provider_api_keys,
             multi_agent: ResolvedMultiAgentConfig {
                 enabled: local.multi_agent.enabled,
                 agents: local.multi_agent.agents.clone(),
                 plugin_paths: local.multi_agent.plugin_paths.clone(),
                 hooks: local.multi_agent.hooks.clone(),
             },
+            memory: local.memory.clone(),
             skills,
             skill_diagnostics,
             theme: local.settings.theme.take(),
@@ -184,7 +188,9 @@ pub struct ResolvedRuntime {
     pub model: Model,
     pub model_catalog: Vec<Model>,
     pub api_key: Option<String>,
+    pub provider_api_keys: HashMap<String, String>,
     pub multi_agent: ResolvedMultiAgentConfig,
+    pub memory: ResolvedMemoryConfig,
     pub skills: Vec<Skill>,
     pub skill_diagnostics: Vec<SkillDiagnostic>,
     pub theme: Option<String>,
@@ -197,6 +203,48 @@ pub struct ResolvedMultiAgentConfig {
     pub agents: Vec<SubAgentSpec>,
     pub plugin_paths: Vec<PathBuf>,
     pub hooks: Vec<DeclarativeHookSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMemorySearchConfig {
+    pub enabled: bool,
+    pub max_results: usize,
+    pub min_score: f32,
+}
+
+impl Default for ResolvedMemorySearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_results: 10,
+            min_score: 0.1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMemoryConfig {
+    pub enabled: bool,
+    pub dir: PathBuf,
+    pub retention_days: Option<u32>,
+    pub auto_flush: bool,
+    pub flush_threshold_tokens: Option<u64>,
+    pub file_pattern: String,
+    pub search: ResolvedMemorySearchConfig,
+}
+
+impl Default for ResolvedMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: PathBuf::from("./memory"),
+            retention_days: Some(30),
+            auto_flush: true,
+            flush_threshold_tokens: None,
+            file_pattern: "%Y-%m-%d.md".to_string(),
+            search: ResolvedMemorySearchConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +286,7 @@ struct AgentLocalConfig {
     settings: AgentSettingsFile,
     models: ModelsFile,
     multi_agent: MultiAgentLocalConfig,
+    memory: ResolvedMemoryConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +294,7 @@ struct ResolvedRuntimeConfig {
     model: Model,
     model_catalog: Vec<Model>,
     api_key: Option<String>,
+    provider_api_keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +373,8 @@ struct PixyTomlFile {
     llm: PixyTomlLlm,
     #[serde(default)]
     multi_agent: PixyTomlMultiAgent,
+    #[serde(default)]
+    memory: PixyTomlMemory,
     theme: Option<String>,
     #[serde(default)]
     transport_retry_count: Option<usize>,
@@ -367,6 +419,58 @@ struct PixyTomlMultiAgentPlugin {
     path: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PixyTomlMemorySearch {
+    #[serde(default = "default_memory_search_enabled")]
+    enabled: bool,
+    #[serde(default = "default_memory_search_max_results")]
+    max_results: usize,
+    #[serde(default = "default_memory_search_min_score")]
+    min_score: f32,
+}
+
+impl Default for PixyTomlMemorySearch {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_search_enabled(),
+            max_results: default_memory_search_max_results(),
+            min_score: default_memory_search_min_score(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PixyTomlMemory {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    retention_days: Option<u32>,
+    #[serde(default = "default_memory_auto_flush")]
+    auto_flush: bool,
+    #[serde(default)]
+    flush_threshold_tokens: Option<u64>,
+    #[serde(default = "default_memory_file_pattern")]
+    file_pattern: String,
+    #[serde(default)]
+    search: PixyTomlMemorySearch,
+}
+
+impl Default for PixyTomlMemory {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            retention_days: Some(30),
+            auto_flush: default_memory_auto_flush(),
+            flush_threshold_tokens: None,
+            file_pattern: default_memory_file_pattern(),
+            search: PixyTomlMemorySearch::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PixyTomlProvider {
     name: String,
@@ -396,6 +500,26 @@ struct PixyTomlProvider {
 
 fn default_provider_weight() -> u8 {
     1
+}
+
+fn default_memory_auto_flush() -> bool {
+    true
+}
+
+fn default_memory_file_pattern() -> String {
+    "%Y-%m-%d.md".to_string()
+}
+
+fn default_memory_search_enabled() -> bool {
+    true
+}
+
+fn default_memory_search_max_results() -> usize {
+    10
+}
+
+fn default_memory_search_min_score() -> f32 {
+    0.1
 }
 
 fn load_agent_local_config_from_toml_with_base_dir(
@@ -497,6 +621,42 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile, base_dir: &Path) -> A
 
     let hook_specs = config.multi_agent.hooks;
 
+    let memory_dir = config
+        .memory
+        .dir
+        .as_deref()
+        .and_then(|value| resolve_config_value(value, &env_map))
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| base_dir.join("memory"));
+    let file_pattern = {
+        let trimmed = config.memory.file_pattern.trim();
+        if trimmed.is_empty() {
+            default_memory_file_pattern()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let memory = ResolvedMemoryConfig {
+        enabled: config.memory.enabled,
+        dir: memory_dir,
+        retention_days: config.memory.retention_days,
+        auto_flush: config.memory.auto_flush,
+        flush_threshold_tokens: config.memory.flush_threshold_tokens,
+        file_pattern,
+        search: ResolvedMemorySearchConfig {
+            enabled: config.memory.search.enabled,
+            max_results: config.memory.search.max_results.max(1),
+            min_score: config.memory.search.min_score.clamp(0.0, 1.0),
+        },
+    };
+
     AgentLocalConfig {
         settings: AgentSettingsFile {
             default_provider: config.llm.default_provider,
@@ -512,6 +672,7 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile, base_dir: &Path) -> A
             plugin_paths,
             hooks: hook_specs,
         },
+        memory,
     }
 }
 
@@ -553,6 +714,7 @@ impl<'a> RuntimeConfigResolver<'a> {
                 model,
                 model_catalog,
                 api_key: self.overrides.fixed_api_key.clone(),
+                provider_api_keys: HashMap::new(),
             });
         }
 
@@ -595,11 +757,13 @@ impl<'a> RuntimeConfigResolver<'a> {
                 ));
             }
         }
+        let provider_label = provider.clone();
         let provider_name = resolve_provider_name(&provider, provider_config);
         let model_id = first_non_empty([
             cli_model_parts.1.clone(),
             provider_config_default_model(provider_config),
             default_model_for_provider(&provider_name),
+            default_model_for_provider(&provider_label),
         ])
         .ok_or_else(|| format!("Unable to resolve model for provider '{provider}'"))?;
 
@@ -615,6 +779,7 @@ impl<'a> RuntimeConfigResolver<'a> {
             selected_model_cfg.and_then(|model| model.api.clone()),
             provider_config.and_then(|provider| provider.api.clone()),
             infer_api_for_provider(&provider_name),
+            infer_api_for_provider(&provider_label),
         ])
         .ok_or_else(|| format!("Unable to resolve API for provider '{provider}'"))?;
 
@@ -651,7 +816,9 @@ impl<'a> RuntimeConfigResolver<'a> {
         let api_key = provider_config
             .and_then(|provider_cfg| provider_cfg.api_key.as_ref())
             .and_then(|value| resolve_config_value(value, &self.local.settings.env))
+            .or_else(|| infer_api_key_from_settings(&provider_label, &self.local.settings.env))
             .or_else(|| infer_api_key_from_settings(&provider_name, &self.local.settings.env))
+            .or_else(|| std::env::var(primary_env_key_for_provider(&provider_label)).ok())
             .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok());
 
         let reasoning = selected_model_cfg
@@ -671,7 +838,7 @@ impl<'a> RuntimeConfigResolver<'a> {
             id: model_id.clone(),
             name: model_id,
             api,
-            provider: provider_name.clone(),
+            provider: provider_label.clone(),
             base_url,
             reasoning,
             reasoning_effort,
@@ -687,25 +854,9 @@ impl<'a> RuntimeConfigResolver<'a> {
             max_tokens,
         };
 
-        let mut model_catalog = provider_config
-            .map(|provider_cfg| {
-                provider_cfg
-                    .models
-                    .iter()
-                    .map(|entry| {
-                        model_from_config(
-                            entry,
-                            &provider_name,
-                            &model.api,
-                            &model.base_url,
-                            model.context_window,
-                            model.max_tokens,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut model_catalog = build_chat_model_catalog(self.local, self.overrides);
         dedupe_models(&mut model_catalog);
+        let provider_api_keys = build_chat_provider_api_keys(self.local);
 
         if let Some(position) = model_catalog
             .iter()
@@ -719,6 +870,7 @@ impl<'a> RuntimeConfigResolver<'a> {
             model,
             model_catalog,
             api_key,
+            provider_api_keys,
         })
     }
 }
@@ -797,6 +949,7 @@ fn model_from_config(
     default_base_url: &str,
     default_context_window: u32,
     default_max_tokens: u32,
+    env_map: &HashMap<String, String>,
 ) -> Model {
     let api = config
         .api
@@ -804,7 +957,8 @@ fn model_from_config(
         .unwrap_or_else(|| default_api.to_string());
     let base_url = config
         .base_url
-        .clone()
+        .as_deref()
+        .and_then(|value| resolve_config_value(value, env_map))
         .or_else(|| default_base_url_for_api(&api))
         .unwrap_or_else(|| default_base_url.to_string());
     let reasoning = config
@@ -837,6 +991,140 @@ fn model_from_config(
         context_window: config.context_window.unwrap_or(default_context_window),
         max_tokens: config.max_tokens.unwrap_or(default_max_tokens),
     }
+}
+
+fn model_from_defaults(
+    model_id: &str,
+    provider: &str,
+    api: &str,
+    base_url: &str,
+    context_window: u32,
+    max_tokens: u32,
+) -> Model {
+    let reasoning = default_reasoning_enabled_for_api(api);
+    let reasoning_effort = if reasoning {
+        Some(pixy_ai::ThinkingLevel::Medium)
+    } else {
+        None
+    };
+
+    Model {
+        id: model_id.to_string(),
+        name: model_id.to_string(),
+        api: api.to_string(),
+        provider: provider.to_string(),
+        base_url: base_url.to_string(),
+        reasoning,
+        reasoning_effort,
+        input: vec!["text".to_string()],
+        cost: Cost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 0.0,
+        },
+        context_window,
+        max_tokens,
+    }
+}
+
+fn build_chat_model_catalog(local: &AgentLocalConfig, overrides: &RuntimeOverrides) -> Vec<Model> {
+    let default_context_window = overrides.context_window.unwrap_or(200_000);
+    let default_max_tokens = overrides.max_tokens.unwrap_or(8_192);
+
+    let mut providers = local.models.providers.iter().collect::<Vec<_>>();
+    providers.sort_by(|left, right| left.0.cmp(right.0));
+
+    let mut catalog = Vec::new();
+    for (provider_key, provider_config) in providers {
+        if !is_chat_provider(provider_config) {
+            continue;
+        }
+
+        let provider_label = provider_key.to_string();
+        let provider_name = resolve_provider_name(provider_key, Some(provider_config));
+        let Some(api) = first_non_empty([
+            provider_config.api.clone(),
+            infer_api_for_provider(&provider_name),
+            infer_api_for_provider(&provider_label),
+        ]) else {
+            continue;
+        };
+        let Some(base_url) = provider_config
+            .base_url
+            .as_ref()
+            .and_then(|value| resolve_config_value(value, &local.settings.env))
+            .or_else(|| default_base_url_for_api(&api))
+        else {
+            continue;
+        };
+
+        if provider_config.models.is_empty() {
+            let Some(model_id) = first_non_empty([
+                provider_config.default_model.clone(),
+                default_model_for_provider(&provider_name),
+                default_model_for_provider(&provider_label),
+            ]) else {
+                continue;
+            };
+            catalog.push(model_from_defaults(
+                &model_id,
+                &provider_label,
+                &api,
+                &base_url,
+                default_context_window,
+                default_max_tokens,
+            ));
+            continue;
+        }
+
+        for model_cfg in &provider_config.models {
+            catalog.push(model_from_config(
+                model_cfg,
+                &provider_label,
+                &api,
+                &base_url,
+                default_context_window,
+                default_max_tokens,
+                &local.settings.env,
+            ));
+        }
+    }
+
+    catalog
+}
+
+fn build_chat_provider_api_keys(local: &AgentLocalConfig) -> HashMap<String, String> {
+    let mut providers = local.models.providers.iter().collect::<Vec<_>>();
+    providers.sort_by(|left, right| left.0.cmp(right.0));
+
+    let mut api_keys = HashMap::new();
+    for (provider_key, provider_config) in providers {
+        if !is_chat_provider(provider_config) {
+            continue;
+        }
+
+        let provider_label = provider_key.to_string();
+        let provider_name = resolve_provider_name(provider_key, Some(provider_config));
+        let Some(api_key) = provider_config
+            .api_key
+            .as_ref()
+            .and_then(|value| resolve_config_value(value, &local.settings.env))
+            .or_else(|| infer_api_key_from_settings(&provider_label, &local.settings.env))
+            .or_else(|| infer_api_key_from_settings(&provider_name, &local.settings.env))
+            .or_else(|| std::env::var(primary_env_key_for_provider(&provider_label)).ok())
+            .or_else(|| std::env::var(primary_env_key_for_provider(&provider_name)).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        api_keys.insert(provider_label, api_key);
+    }
+
+    api_keys
 }
 
 fn dedupe_models(models: &mut Vec<Model>) {
@@ -1068,6 +1356,84 @@ weight = 1
     }
 
     #[test]
+    fn resolve_runtime_from_toml_parses_memory_settings() {
+        let dir = tempdir().expect("tempdir");
+        let content = r#"
+[memory]
+enabled = true
+dir = "memory-store"
+retention_days = 45
+auto_flush = true
+flush_threshold_tokens = 2048
+file_pattern = "%Y-%m-%d.md"
+
+[memory.search]
+enabled = true
+max_results = 7
+min_score = 0.25
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(dir.path(), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(resolved.memory.enabled);
+        assert_eq!(resolved.memory.dir, dir.path().join("memory-store"));
+        assert_eq!(resolved.memory.retention_days, Some(45));
+        assert_eq!(resolved.memory.flush_threshold_tokens, Some(2048));
+        assert_eq!(resolved.memory.search.max_results, 7);
+        assert_eq!(resolved.memory.search.min_score, 0.25);
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_uses_memory_defaults_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(dir.path(), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(!resolved.memory.enabled);
+        assert_eq!(resolved.memory.dir, dir.path().join("memory"));
+        assert_eq!(resolved.memory.retention_days, Some(30));
+        assert!(resolved.memory.auto_flush);
+        assert_eq!(resolved.memory.file_pattern, "%Y-%m-%d.md");
+        assert!(resolved.memory.search.enabled);
+        assert_eq!(resolved.memory.search.max_results, 10);
+    }
+
+    #[test]
     fn resolve_runtime_from_toml_parses_multi_agent_agents() {
         let content = r#"
 [multi_agent]
@@ -1280,6 +1646,149 @@ weight = 10
     }
 
     #[test]
+    fn resolve_runtime_model_catalog_includes_models_from_multiple_chat_providers() {
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "openai-key"
+model = "gpt-5.3-codex"
+weight = 80
+
+[[llm.providers]]
+name = "anthropic"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "anthropic-key"
+model = "claude-3-5-sonnet-latest"
+weight = 20
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.model.provider, "openai");
+        assert_eq!(resolved.model.id, "gpt-5.3-codex");
+        assert_eq!(resolved.model_catalog[0].provider, "openai");
+        assert_eq!(resolved.model_catalog[0].id, "gpt-5.3-codex");
+        assert!(
+            resolved.model_catalog.iter().any(
+                |model| model.provider == "anthropic" && model.id == "claude-3-5-sonnet-latest"
+            ),
+            "model catalog should include anthropic model for Ctrl+N model cycling"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_model_catalog_keeps_distinct_provider_names_for_same_vendor() {
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "openai-key"
+model = "gpt-5.3-codex"
+weight = 70
+
+[[llm.providers]]
+name = "anthropic"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "anthropic-key"
+model = "claude-4-6-sonnet-latest"
+weight = 20
+
+[[llm.providers]]
+name = "anthropic-ds"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "https://api.deepseek.com/anthropic"
+api_key = "ds-key"
+model = "claude-4-6-sonnet-latest"
+weight = 10
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert!(
+            resolved
+                .model_catalog
+                .iter()
+                .any(|model| model.provider == "anthropic-ds"
+                    && model.id == "claude-4-6-sonnet-latest"),
+            "catalog should preserve anthropic-ds as an independent provider entry"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_model_catalog_resolves_placeholder_base_url_for_cycled_models() {
+        let content = r#"
+[env]
+DS_API = "https://api.deepseek.com/anthropic"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "openai-key"
+model = "gpt-5.3-codex"
+weight = 70
+
+[[llm.providers]]
+name = "anthropic-ds"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "$DS_API"
+api_key = "ds-key"
+model = "claude-4-6-sonnet-latest"
+weight = 30
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        let cycled = resolved
+            .model_catalog
+            .iter()
+            .find(|model| model.provider == "anthropic-ds")
+            .expect("catalog should include anthropic-ds");
+
+        assert_eq!(cycled.base_url, "https://api.deepseek.com/anthropic");
+    }
+
+    #[test]
     fn resolve_runtime_from_toml_loads_config_and_explicit_skills() {
         let dir = tempdir().expect("tempdir");
         let cwd = dir.path().join("workspace");
@@ -1331,7 +1840,7 @@ weight = 1
 
         let options = RuntimeLoadOptions {
             conf_dir: Some(dir.path().join(".pixy")),
-            agent_dir: Some(dir.path().join("agent")),
+            agent_dir: Some(dir.path().join("agents")),
             load_skills: true,
             include_default_skills: false,
             skill_paths: vec![explicit_skill_dir.display().to_string()],
@@ -1449,6 +1958,57 @@ weight = 1
             .expect("runtime should resolve");
 
         assert_eq!(resolved.api_key.as_deref(), Some("from-process-only"));
+    }
+
+    #[test]
+    fn resolve_runtime_provider_api_keys_prefer_provider_specific_over_vendor_default() {
+        let content = r#"
+[env]
+OPENAI_API_KEY = "openai-key"
+ANTHROPIC_API_KEY = "anthropic-default"
+DS_KEY = "anthropic-ds-key"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"
+model = "gpt-5.3-codex"
+weight = 70
+
+[[llm.providers]]
+name = "anthropic-ds"
+kind = "chat"
+provider = "anthropic"
+api = "anthropic-messages"
+base_url = "https://api.deepseek.com/anthropic"
+api_key = "$DS_KEY"
+model = "claude-4-6-sonnet-latest"
+weight = 30
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(
+            resolved.provider_api_keys.get("openai").map(String::as_str),
+            Some("openai-key")
+        );
+        assert_eq!(
+            resolved
+                .provider_api_keys
+                .get("anthropic-ds")
+                .map(String::as_str),
+            Some("anthropic-ds-key")
+        );
     }
 
     #[test]

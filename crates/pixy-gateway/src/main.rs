@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use pixy_gateway::{GatewayCommand, GatewayStartOptions, run_gateway_command};
+use pixy_gateway::{run_gateway_command, GatewayCommand, GatewayStartOptions};
 
 #[derive(Parser, Debug)]
 #[command(name = "pixy-gateway", version, about = "pixy gateway runtime")]

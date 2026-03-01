@@ -7,7 +7,7 @@ pub(crate) const INPUT_PLACEHOLDER_HINTS: &[&str] =
     &["Try \"Search the documentation for this library\""];
 pub(crate) const INPUT_AREA_FIXED_HEIGHT: u16 = 3;
 pub(crate) const STATUS_HINT_LEFT: &str =
-    "shift+tab to cycle modes (auto/spec), ctrl+L for autonomy";
+    "shift+tab to toggle thinking, ctrl+L to switch permission";
 pub(crate) const STATUS_HINT_RIGHT: &str = "ctrl+N to cycle models";
 
 pub(crate) fn primary_input_placeholder_hint() -> &'static str {

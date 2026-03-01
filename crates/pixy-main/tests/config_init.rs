@@ -17,8 +17,8 @@ fn config_init_creates_pixy_home_tree_and_pixy_toml_from_sample() {
     assert!(pixy_toml.is_file(), "expected {}", pixy_toml.display());
 
     for dir in [
-        conf_dir.path().join("agent"),
-        conf_dir.path().join("agent").join("sessions"),
+        conf_dir.path().join("agents"),
+        conf_dir.path().join("agents").join("sessions"),
         conf_dir.path().join("logs"),
         conf_dir.path().join("workspace"),
         conf_dir.path().join("gateway"),

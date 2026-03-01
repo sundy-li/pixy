@@ -3,7 +3,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tracing::info;
 
 use super::common::{empty_assistant_message, join_url, shared_http_client};

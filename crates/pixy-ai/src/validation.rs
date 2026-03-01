@@ -1,6 +1,6 @@
 use jsonschema::JSONSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::Tool;

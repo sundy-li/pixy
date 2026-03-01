@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use pixy_agent_core::AgentAbortSignal;
 use pixy_tui::{BackendFuture, ResumeCandidate, StreamUpdate, TuiBackend};
 
-use crate::{AgentSession, AgentSessionStreamUpdate, cli_app::CliSession};
+use crate::{cli_app::CliSession, AgentSession, AgentSessionStreamUpdate};
 
 impl TuiBackend for AgentSession {
     fn prompt<'a>(&'a mut self, input: &'a str) -> BackendFuture<'a> {
@@ -76,6 +76,11 @@ impl TuiBackend for AgentSession {
         AgentSession::select_model(self).map(|maybe_model| {
             maybe_model.map(|model| format!("model: {}/{}", model.provider, model.id))
         })
+    }
+
+    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
+        let mode = AgentSession::cycle_permission_mode(self);
+        Ok(Some(format!("permission: {}", mode.status_line())))
     }
 
     fn recent_resumable_sessions(
@@ -198,6 +203,12 @@ impl TuiBackend for CliSession {
         AgentSession::select_model(session).map(|maybe_model| {
             maybe_model.map(|model| format!("model: {}/{}", model.provider, model.id))
         })
+    }
+
+    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
+        let session = self.ensure_session()?;
+        let mode = AgentSession::cycle_permission_mode(session);
+        Ok(Some(format!("permission: {}", mode.status_line())))
     }
 
     fn recent_resumable_sessions(

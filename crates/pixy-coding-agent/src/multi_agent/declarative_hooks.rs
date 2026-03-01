@@ -4,9 +4,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AfterTaskResultHookContext, BeforeTaskDispatchHookContext, BeforeToolDefinitionHookContext,
-    BeforeUserMessageHookContext, MultiAgentHook, MultiAgentPluginRuntime,
-    create_multi_agent_plugin_runtime,
+    create_multi_agent_plugin_runtime, AfterTaskResultHookContext, BeforeTaskDispatchHookContext,
+    BeforeToolDefinitionHookContext, BeforeUserMessageHookContext, MultiAgentHook,
+    MultiAgentPluginRuntime,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,9 +205,10 @@ fn hook_matches(hook: &DeclarativeHookSpec, input: HookMatchInput<'_>) -> bool {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && input.tool_name.map(str::trim) != Some(expected_tool)
     {
-        return false;
+        if input.tool_name.map(str::trim) != Some(expected_tool) {
+            return false;
+        }
     }
 
     if let Some(expected_subagent) = hook
@@ -215,9 +216,10 @@ fn hook_matches(hook: &DeclarativeHookSpec, input: HookMatchInput<'_>) -> bool {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && input.subagent.map(str::trim) != Some(expected_subagent)
     {
-        return false;
+        if input.subagent.map(str::trim) != Some(expected_subagent) {
+            return false;
+        }
     }
 
     if let Some(contains_text) = hook

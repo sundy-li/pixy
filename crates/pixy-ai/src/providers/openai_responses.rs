@@ -1,17 +1,17 @@
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read};
 use tracing::info;
 
 use super::common::{empty_assistant_message, join_url, shared_http_client};
-use crate::AssistantMessageEventStream;
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Message,
     Model, SimpleStreamOptions, StopReason, StreamOptions, Tool, Usage, UserContent,
     UserContentBlock,
 };
+use crate::AssistantMessageEventStream;
 
 pub async fn run_openai_responses(
     model: Model,

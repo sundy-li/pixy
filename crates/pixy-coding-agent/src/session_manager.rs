@@ -611,6 +611,13 @@ impl SessionManager {
         Some(context_entries[first_kept_idx].id().to_string())
     }
 
+    pub fn current_path_compaction_count(&self) -> usize {
+        self.current_path_entries()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .count()
+    }
+
     pub fn build_session_context(&self) -> SessionContext {
         let path_entries = self.current_path_entries();
 

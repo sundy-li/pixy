@@ -54,6 +54,9 @@ pub trait TuiBackend {
     fn select_model(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn cycle_permission_mode(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     fn recent_resumable_sessions(
         &mut self,
         _limit: usize,

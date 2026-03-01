@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use pixy_tui::backend::StreamUpdate;
-use pixy_tui::keybindings::{TuiKeyBindings, parse_key_id};
+use pixy_tui::keybindings::{parse_key_id, TuiKeyBindings};
 use pixy_tui::options::TuiOptions;
 use pixy_tui::theme::TuiTheme;
 use serde_json::Value;

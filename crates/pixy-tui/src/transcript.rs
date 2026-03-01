@@ -3,8 +3,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::TuiTheme;
 use crate::keybindings::parse_key_id;
+use crate::TuiTheme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptLineKind {

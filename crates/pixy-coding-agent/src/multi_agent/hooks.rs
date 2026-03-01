@@ -36,7 +36,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        MultiAgentPluginRuntime, TaskToolInput, TaskToolOutput, create_multi_agent_plugin_runtime,
+        create_multi_agent_plugin_runtime, MultiAgentPluginRuntime, TaskToolInput, TaskToolOutput,
     };
 
     #[derive(Clone)]

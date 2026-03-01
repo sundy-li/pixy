@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use pixy_agent_core::ParentChildRunEvent;
 use pixy_ai::{
@@ -7,10 +7,10 @@ use pixy_ai::{
     Context, Cost, DoneReason, Message, Model, StopReason, Usage,
 };
 use pixy_coding_agent::{
-    AgentSession, AgentSessionConfig, ChildSessionStore, DefaultSubAgentRegistry,
+    create_task_tool, AgentSession, AgentSessionConfig, ChildSessionStore, DefaultSubAgentRegistry,
     DispatchPolicyConfig, DispatchPolicyRule, MultiAgentPluginRuntime, PolicyRuleEffect,
     SessionManager, SubAgentMode, SubAgentResolver, SubAgentSpec, TaskDispatcher,
-    TaskDispatcherConfig, create_task_tool,
+    TaskDispatcherConfig,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -727,11 +727,9 @@ async fn single_agent_mode_keeps_existing_flow_without_task_tool() {
     );
 
     let produced = session.prompt("hello").await.expect("prompt succeeds");
-    assert!(
-        !produced
-            .iter()
-            .any(|message| matches!(message, Message::ToolResult { .. }))
-    );
+    assert!(!produced
+        .iter()
+        .any(|message| matches!(message, Message::ToolResult { .. })));
     assert!(produced.iter().any(|message| {
         matches!(
             message,

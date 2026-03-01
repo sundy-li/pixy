@@ -1,6 +1,6 @@
 {
   "name": "dark",
-  "inputPrompt": "> ",
+  "inputPrompt": ":) ",
   "outputPrompt": "⛬  ",
   "colors": {
     "transcriptFg": "white",

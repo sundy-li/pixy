@@ -1,9 +1,9 @@
 use std::env;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use reqwest::RequestBuilder;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use super::common::{empty_assistant_message, join_url, shared_http_client};
 use crate::api_registry::{ApiProvider, ApiProviderFuture};
@@ -770,7 +770,11 @@ fn parse_sse_data_events(body: &str) -> Vec<String> {
                 .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if data.is_empty() { None } else { Some(data) }
+            if data.is_empty() {
+                None
+            } else {
+                Some(data)
+            }
         })
         .collect()
 }

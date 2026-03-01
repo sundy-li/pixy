@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::{RESUME_LIST_LIMIT, TuiApp, TuiBackend};
+use crate::{TuiApp, TuiBackend, RESUME_LIST_LIMIT};
 
 pub(super) fn handle_slash_resume_command<B: TuiBackend>(
     command: &str,

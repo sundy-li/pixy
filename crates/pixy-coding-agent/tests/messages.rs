@@ -1,8 +1,8 @@
 use pixy_ai::{Message, UserContent, UserContentBlock};
 use pixy_coding_agent::{
-    BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BashExecutionMessage, BranchSummaryMessage,
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CodingMessage, CompactionSummaryMessage,
-    CustomMessage, convert_to_llm,
+    convert_to_llm, BashExecutionMessage, BranchSummaryMessage, CodingMessage,
+    CompactionSummaryMessage, CustomMessage, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
 };
 
 fn user_message(text: &str, ts: i64) -> Message {

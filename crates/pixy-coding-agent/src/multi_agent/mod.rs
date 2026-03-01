@@ -11,8 +11,8 @@ mod task_tool;
 mod types;
 
 pub use declarative_hooks::{
-    DeclarativeHookAction, DeclarativeHookSpec, DeclarativeHookStage,
-    create_multi_agent_plugin_runtime_from_specs,
+    create_multi_agent_plugin_runtime_from_specs, DeclarativeHookAction, DeclarativeHookSpec,
+    DeclarativeHookStage,
 };
 pub use dispatcher::{TaskDispatchResult, TaskDispatcher, TaskDispatcherConfig};
 pub use hooks::{
@@ -20,11 +20,11 @@ pub use hooks::{
     BeforeUserMessageHookContext, MultiAgentHook,
 };
 pub use plugin_loader::{
-    LoadedPluginManifest, MergedPluginConfig, PluginSubAgentSpec, load_and_merge_plugins,
-    load_and_merge_plugins_from_paths, load_plugin_manifests,
+    load_and_merge_plugins, load_and_merge_plugins_from_paths, load_plugin_manifests,
+    LoadedPluginManifest, MergedPluginConfig, PluginSubAgentSpec,
 };
 pub use plugin_manifest::MultiAgentPluginManifest;
-pub use plugin_runtime::{MultiAgentPluginRuntime, create_multi_agent_plugin_runtime};
+pub use plugin_runtime::{create_multi_agent_plugin_runtime, MultiAgentPluginRuntime};
 pub use policy::{
     DispatchPolicyConfig, DispatchPolicyDecision, DispatchPolicyRule, PolicyRuleEffect,
 };

@@ -38,14 +38,15 @@ impl ChildSessionStore {
         if let Some(previous) = self
             .by_task_id
             .insert(task_id.to_string(), session_file.clone())
-            && previous != session_file
         {
-            tracing::warn!(
-                task_id,
-                old_session_file = %previous.display(),
-                new_session_file = %session_file.display(),
-                "task_id remapped to a different child session file"
-            );
+            if previous != session_file {
+                tracing::warn!(
+                    task_id,
+                    old_session_file = %previous.display(),
+                    new_session_file = %session_file.display(),
+                    "task_id remapped to a different child session file"
+                );
+            }
         }
         Ok(())
     }

@@ -1,4 +1,4 @@
-use pixy_ai::{PiAiErrorCode, Tool, ToolCall, validate_tool_call};
+use pixy_ai::{validate_tool_call, PiAiErrorCode, Tool, ToolCall};
 use serde_json::json;
 
 fn sample_tool() -> Tool {

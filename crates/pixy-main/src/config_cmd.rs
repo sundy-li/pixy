@@ -29,8 +29,8 @@ pub fn run_config_init(conf_dir: Option<PathBuf>) -> Result<(), String> {
 fn init_directories(pixy_home_dir: &Path) -> Vec<PathBuf> {
     vec![
         pixy_home_dir.to_path_buf(),
-        pixy_home_dir.join("agent"),
-        pixy_home_dir.join("agent").join("sessions"),
+        pixy_home_dir.join("agents"),
+        pixy_home_dir.join("agents").join("sessions"),
         pixy_home_dir.join("logs"),
         pixy_home_dir.join("workspace"),
         pixy_home_dir.join("workspace").join("tmp"),
@@ -46,8 +46,8 @@ mod tests {
     fn init_directories_include_expected_runtime_paths() {
         let root = PathBuf::from("/tmp/pixy-home");
         let dirs = init_directories(&root);
-        assert!(dirs.contains(&root.join("agent")));
-        assert!(dirs.contains(&root.join("agent").join("sessions")));
+        assert!(dirs.contains(&root.join("agents")));
+        assert!(dirs.contains(&root.join("agents").join("sessions")));
         assert!(dirs.contains(&root.join("logs")));
         assert!(dirs.contains(&root.join("workspace")));
         assert!(dirs.contains(&root.join("gateway")));

@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -36,24 +36,24 @@ mod transcript;
 
 pub use backend::{BackendFuture, ResumeCandidate, StreamUpdate, TuiBackend};
 use constants::{
-    FORCE_EXIT_SIGNAL, FORCE_EXIT_STATUS, INPUT_AREA_FIXED_HEIGHT, INPUT_RENDER_LEFT_PADDING,
-    PASTED_TEXT_PREVIEW_LIMIT, RESUME_LIST_LIMIT, STATUS_HINT_LEFT, STATUS_HINT_RIGHT,
-    primary_input_placeholder_hint,
+    primary_input_placeholder_hint, FORCE_EXIT_SIGNAL, FORCE_EXIT_STATUS, INPUT_AREA_FIXED_HEIGHT,
+    INPUT_RENDER_LEFT_PADDING, PASTED_TEXT_PREVIEW_LIMIT, RESUME_LIST_LIMIT, STATUS_HINT_LEFT,
+    STATUS_HINT_RIGHT,
 };
-pub use keybindings::{KeyBinding, TuiKeyBindings, parse_key_id};
+pub use keybindings::{parse_key_id, KeyBinding, TuiKeyBindings};
 pub use options::TuiOptions;
 use runtime::TuiRuntime;
 use terminal::apply_selection_osc_colors;
 #[cfg(test)]
 use terminal::{
-    TerminalCapabilities, TerminalMultiplexer, selection_osc_reset_sequence,
-    selection_osc_reset_sequences, selection_osc_set_sequence, selection_osc_set_sequences,
+    selection_osc_reset_sequence, selection_osc_reset_sequences, selection_osc_set_sequence,
+    selection_osc_set_sequences, TerminalCapabilities, TerminalMultiplexer,
 };
 pub use theme::TuiTheme;
 use transcript::{
-    TranscriptLine, TranscriptLineKind, is_thinking_line, is_tool_run_line,
-    normalize_tool_line_for_display, parse_tool_name, render_messages, split_tool_output_lines,
-    visible_transcript_lines,
+    is_thinking_line, is_tool_run_line, normalize_tool_line_for_display, parse_tool_name,
+    render_messages, split_tool_output_lines, visible_transcript_lines, TranscriptLine,
+    TranscriptLineKind,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,16 +290,30 @@ impl TuiApp {
         let Some(model_path) = status.strip_prefix("model: ").map(str::trim) else {
             return;
         };
-        let model_id = model_path.rsplit('/').next().unwrap_or(model_path).trim();
-        if model_id.is_empty() {
+        let (provider_name, model_name) = model_path
+            .split_once('/')
+            .map(|(provider, model)| (provider.trim(), model.trim()))
+            .unwrap_or((model_path.trim(), ""));
+        if provider_name.is_empty() && model_name.is_empty() {
             return;
         }
-        let suffix = self
-            .status_right
-            .split_once(" • ")
-            .map(|(_, value)| value.to_string())
-            .unwrap_or_else(|| "medium".to_string());
-        self.status_right = format!("{model_id} • {suffix}");
+        self.status_right = if provider_name.is_empty() {
+            model_name.to_string()
+        } else if model_name.is_empty() {
+            provider_name.to_string()
+        } else {
+            format!("{provider_name}:{model_name}")
+        };
+    }
+
+    fn maybe_update_status_left_from_backend_status(&mut self, status: &str) {
+        let Some(permission_label) = status.strip_prefix("permission: ").map(str::trim) else {
+            return;
+        };
+        if permission_label.is_empty() {
+            return;
+        }
+        self.status_left = permission_label.to_string();
     }
 
     fn input_char_count(&self) -> usize {
@@ -1059,11 +1073,11 @@ fn build_welcome_banner(options: &TuiOptions) -> Vec<String> {
     }
     lines.extend([
         String::new(),
-        "You are standing in an open terminal. An AI awaits your commands.".to_string(),
+        "Let's build crazy things together".to_string(),
         String::new(),
-        format!("{submit_label} to send • \\ + ENTER for a new line • @ to mention files"),
+        format!("{submit_label} to send, Shift + ENTER for a new line, @ to mention files, / for commands"),
         String::new(),
-        format!("Current folder: {}", options.status_top),
+        format!("Current workspace: {}", options.status_top),
     ]);
 
     let startup_lines = options
@@ -1335,7 +1349,7 @@ async fn handle_slash_command<B: TuiBackend>(
     app: &mut TuiApp,
 ) -> Result<bool, String> {
     match command {
-        "/help" => {
+        "/help" | "?" => {
             app.show_help = !app.show_help;
             Ok(true)
         }
@@ -1424,7 +1438,6 @@ async fn run_prompt_streaming<B: TuiBackend>(
 ) -> Result<(), String> {
     app.start_working(format!("{} is working...", options.app_name));
     app.status = format!("{} is working...", options.app_name);
-    app.status_left = "Auto (High) - allow all commands".to_string();
     let _ = draw_ui_frame(terminal, app, options);
 
     let abort_controller = AgentAbortController::new();
@@ -1523,7 +1536,6 @@ async fn handle_continue_streaming<B: TuiBackend>(
 ) -> Result<(), String> {
     app.start_working(format!("{} is working...", options.app_name));
     app.status = format!("{} is working...", options.app_name);
-    app.status_left = "Auto (High) - allow all commands".to_string();
     let _ = draw_ui_frame(terminal, app, options);
 
     let abort_controller = AgentAbortController::new();
@@ -2004,6 +2016,10 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
             Line::from(format!(
                 "  {:<14} cycle model backward",
                 keybinding_label(&options.keybindings.cycle_model_backward)
+            )),
+            Line::from(format!(
+                "  {:<14} cycle permission mode",
+                keybinding_label(&options.keybindings.cycle_permission_mode)
             )),
             Line::from(format!(
                 "  {:<14} select model",

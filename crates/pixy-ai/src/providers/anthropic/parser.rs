@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
-use crate::AssistantMessageEventStream;
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, DoneReason, StopReason, Usage,
 };
+use crate::AssistantMessageEventStream;
 
 #[derive(Clone, Debug)]
 enum BlockState {
@@ -407,7 +407,12 @@ fn parse_sse_data_events(body: &str) -> Vec<String> {
                 .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if data.is_empty() { None } else { Some(data) }
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                None
+            } else {
+                Some(data.to_string())
+            }
         })
         .collect()
 }
@@ -694,6 +699,25 @@ mod tests {
             error.message,
             "Unhandled Anthropic event type: unexpected_type"
         );
+    }
+
+    #[test]
+    fn parse_sse_data_events_ignores_done_sentinel() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = parse_sse_data_events(body);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}"
+        );
+        assert_eq!(events[1], "{\"type\":\"message_stop\"}");
     }
 
     #[test]

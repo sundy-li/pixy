@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use pixy_ai::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
@@ -7,8 +7,8 @@ use pixy_ai::{
     Usage,
 };
 use pixy_coding_agent::{
-    AgentSession, AgentSessionConfig, AgentSessionStreamUpdate, AutoCompactionConfig,
-    COMPACTION_SUMMARY_PREFIX, SessionManager, create_coding_tools,
+    create_coding_tools, AgentSession, AgentSessionConfig, AgentSessionStreamUpdate,
+    AutoCompactionConfig, SessionManager, COMPACTION_SUMMARY_PREFIX,
 };
 use serde_json::json;
 use tempfile::tempdir;

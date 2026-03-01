@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use pixy_ai::{
-    AssistantContentBlock, Context, Cost, Message, Model, StopReason, StreamOptions, Tool,
-    UserContent, stream,
+    stream, AssistantContentBlock, Context, Cost, Message, Model, StopReason, StreamOptions, Tool,
+    UserContent,
 };
 use serde_json::json;
 

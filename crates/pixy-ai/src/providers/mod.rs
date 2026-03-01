@@ -1,7 +1,7 @@
 use std::sync::{Arc, Once};
 
-use crate::ApiProviderRef;
 use crate::api_registry::{clear_api_providers, register_api_provider};
+use crate::ApiProviderRef;
 
 mod anthropic;
 mod bedrock_converse_stream;
