@@ -525,6 +525,90 @@ fn anthropic_fixture_matches_expected_contract() {
 }
 
 #[test]
+fn anthropic_stream_tool_use_accepts_arguments_alias_field() {
+    let chunks = vec![
+        json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 21,
+                    "output_tokens": 0,
+                }
+            }
+        }),
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_write_1",
+                "name": "write",
+                "arguments": {
+                    "path": "/tmp/v2/index.html",
+                    "content": "<!doctype html>"
+                }
+            }
+        }),
+        json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "tool_use"
+            },
+            "usage": {
+                "input_tokens": 21,
+                "output_tokens": 4
+            }
+        }),
+        json!({
+            "type": "message_stop"
+        }),
+    ];
+
+    let base_url = spawn_sse_server(sse_body(&chunks, false));
+    let model = sample_model("anthropic-messages", base_url);
+    let context = sample_context();
+    let event_stream = stream(
+        model,
+        context,
+        Some(StreamOptions {
+            api_key: Some("test-key".to_string()),
+            temperature: None,
+            max_tokens: None,
+            headers: None,
+            transport_retry_count: None,
+        }),
+    )
+    .expect("stream should start");
+
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+    let message = runtime
+        .block_on(event_stream.result())
+        .expect("stream should produce final message");
+
+    let tool_arguments = message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            AssistantContentBlock::ToolCall { arguments, .. } => Some(arguments.clone()),
+            _ => None,
+        })
+        .expect("tool call block should exist");
+
+    assert_eq!(message.stop_reason, pixy_ai::StopReason::ToolUse);
+    assert_eq!(
+        tool_arguments,
+        json!({
+            "path": "/tmp/v2/index.html",
+            "content": "<!doctype html>"
+        })
+    );
+}
+
+#[test]
 fn openai_responses_stream_events_are_parsed_to_text_and_tool_call() {
     let chunks = vec![
         json!({
@@ -661,6 +745,95 @@ fn openai_responses_stream_events_are_parsed_to_text_and_tool_call() {
 }
 
 #[test]
+fn openai_responses_function_call_accepts_object_arguments() {
+    let chunks = vec![
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "write",
+                "arguments": {
+                    "path": "/tmp/v2/index.html",
+                    "content": "<!doctype html>"
+                },
+            },
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "write",
+                "arguments": {
+                    "path": "/tmp/v2/index.html",
+                    "content": "<!doctype html>"
+                },
+            },
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 3,
+                    "total_tokens": 14,
+                },
+            },
+        }),
+    ];
+
+    let base_url = spawn_sse_server(sse_body(&chunks, false));
+    let model = sample_model("openai-responses", base_url);
+    let context = sample_context();
+    let event_stream = stream(
+        model,
+        context,
+        Some(StreamOptions {
+            api_key: Some("test-key".to_string()),
+            temperature: None,
+            max_tokens: None,
+            headers: None,
+            transport_retry_count: None,
+        }),
+    )
+    .expect("stream should start");
+
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+    let message = runtime
+        .block_on(event_stream.result())
+        .expect("stream should produce final message");
+
+    let tool_call = message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            AssistantContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            _ => None,
+        })
+        .expect("tool call block should exist");
+
+    assert_eq!(message.stop_reason, pixy_ai::StopReason::ToolUse);
+    assert_eq!(tool_call.0, "call_1|fc_1");
+    assert_eq!(tool_call.1, "write");
+    assert_eq!(
+        tool_call.2,
+        json!({
+            "path": "/tmp/v2/index.html",
+            "content": "<!doctype html>"
+        })
+    );
+}
+
+#[test]
 fn openai_responses_tool_arguments_resolve_when_arg_events_only_have_item_id() {
     let chunks = vec![
         json!({
@@ -737,6 +910,77 @@ fn openai_responses_tool_arguments_resolve_when_arg_events_only_have_item_id() {
         .expect("tool call block should exist");
 
     assert_eq!(tool_call, json!({"path":"/tmp/snake_v3/index.html"}));
+}
+
+#[test]
+fn openai_completions_tool_call_accepts_object_arguments() {
+    let chunks = vec![json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_write_1",
+                    "function": {
+                        "name": "write",
+                        "arguments": {
+                            "path": "/tmp/v2/index.html",
+                            "content": "<!doctype html>"
+                        }
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 4
+        }
+    })];
+    let base_url = spawn_sse_server(sse_body(&chunks, true));
+    let model = sample_model("openai-completions", base_url);
+    let context = sample_context();
+    let event_stream = stream(
+        model,
+        context,
+        Some(StreamOptions {
+            api_key: Some("test-key".to_string()),
+            temperature: None,
+            max_tokens: None,
+            headers: None,
+            transport_retry_count: None,
+        }),
+    )
+    .expect("stream should start");
+
+    let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+    let message = runtime
+        .block_on(event_stream.result())
+        .expect("stream should produce final message");
+
+    let tool_call = message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            AssistantContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            _ => None,
+        })
+        .expect("tool call block should exist");
+
+    assert_eq!(message.stop_reason, pixy_ai::StopReason::ToolUse);
+    assert_eq!(tool_call.0, "call_write_1");
+    assert_eq!(tool_call.1, "write");
+    assert_eq!(
+        tool_call.2,
+        json!({
+            "path": "/tmp/v2/index.html",
+            "content": "<!doctype html>"
+        })
+    );
 }
 
 #[test]

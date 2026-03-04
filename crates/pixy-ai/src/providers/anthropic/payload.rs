@@ -17,7 +17,7 @@ pub(super) fn build_anthropic_payload(
         "messages": convert_messages(context),
         "max_tokens": options
             .and_then(|options| options.max_tokens)
-            .unwrap_or((model.max_tokens / 3).max(256)),
+            .unwrap_or(model.max_tokens),
     });
 
     if let Some(system_prompt) = &context.system_prompt {

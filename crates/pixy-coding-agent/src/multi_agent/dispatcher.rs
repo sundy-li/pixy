@@ -20,6 +20,7 @@ pub struct TaskDispatcherConfig {
     pub parent_session_id: String,
     pub parent_session_dir: PathBuf,
     pub model: Model,
+    pub model_catalog: Vec<Model>,
     pub system_prompt: String,
     pub stream_fn: StreamFn,
     /// Tool set exposed to child sessions.
@@ -41,6 +42,8 @@ pub struct TaskDispatchResult {
     pub summary: String,
     pub resolved_subagent: String,
     pub routing_hint_applied: bool,
+    pub duration_ms: u64,
+    pub trace_lines: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -100,6 +103,18 @@ impl TaskDispatcher {
             })?;
         let subagent_name = subagent.name.clone();
         let parent_session_id = self.config.parent_session_id.clone();
+        let child_model =
+            resolve_child_model(&self.config.model, &self.config.model_catalog, &subagent)
+                .map_err(|error| {
+                    PiAiError::new(
+                        PiAiErrorCode::ToolArgumentsInvalid,
+                        format!(
+                            "subagent '{}' model configuration is invalid: {error}",
+                            subagent_name
+                        ),
+                    )
+                })?;
+        let child_tools = resolve_child_tools(&self.config.child_tools, &subagent);
 
         let task_id = input
             .task_id
@@ -150,14 +165,11 @@ impl TaskDispatcher {
         let mut child_session = AgentSession::new(
             child_manager,
             AgentSessionConfig {
-                model: self.config.model.clone(),
-                system_prompt: build_child_system_prompt(
-                    &self.config.system_prompt,
-                    &subagent.name,
-                ),
+                model: child_model,
+                system_prompt: build_child_system_prompt(&self.config.system_prompt, &subagent),
                 stream_fn: self.config.stream_fn.clone(),
                 // Child sessions in V1 intentionally do not get task tool to avoid recursive fan-out.
-                tools: self.config.child_tools.clone(),
+                tools: child_tools,
             },
         );
         child_session.set_multi_agent_plugin_runtime(self.config.plugin_runtime.clone());
@@ -173,6 +185,7 @@ impl TaskDispatcher {
             });
             PiAiError::new(PiAiErrorCode::ToolExecutionFailed, error_message)
         })?;
+        let trace_lines = collect_subagent_trace_lines(&produced);
         if let Some((stop_reason, error_message)) = last_assistant_stop_reason(&produced) {
             if matches!(stop_reason, StopReason::Error | StopReason::Aborted) {
                 let failure = error_message.unwrap_or_else(|| {
@@ -216,12 +229,14 @@ impl TaskDispatcher {
             PiAiError::new(PiAiErrorCode::ToolExecutionFailed, error)
         })?;
 
+        let duration_ms = u64::try_from(run_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+
         self.emit_lifecycle_event(ParentChildRunEvent::ChildRunEnd {
             parent_session_id,
             child_session_file: child_session_file_text,
             task_id: task_id.clone(),
             subagent: subagent_name,
-            duration_ms: u64::try_from(run_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration_ms,
             summary: after_ctx.output.summary.clone(),
         });
 
@@ -230,6 +245,8 @@ impl TaskDispatcher {
             output: after_ctx.output,
             resolved_subagent: after_ctx.resolved_subagent,
             routing_hint_applied: after_ctx.routing_hint_applied,
+            duration_ms,
+            trace_lines,
         })
     }
 
@@ -283,10 +300,105 @@ impl TaskDispatcher {
     }
 }
 
-fn build_child_system_prompt(parent_system_prompt: &str, subagent_name: &str) -> String {
-    format!(
-        "{parent_system_prompt}\n\n<subagent_context>\nYou are running as subagent '{subagent_name}'. Focus on the delegated task and report concise actionable results.\n</subagent_context>"
-    )
+fn resolve_child_model(
+    default_model: &Model,
+    model_catalog: &[Model],
+    subagent: &crate::SubAgentSpec,
+) -> Result<Model, String> {
+    let Some(raw_target) = subagent
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(default_model.clone());
+    };
+
+    if let Some((provider, model_id)) = split_provider_model(raw_target) {
+        if default_model.provider == provider && default_model.id == model_id {
+            return Ok(default_model.clone());
+        }
+        if let Some(found) = model_catalog
+            .iter()
+            .find(|model| model.provider == provider && model.id == model_id)
+        {
+            return Ok(found.clone());
+        }
+        return Err(format!(
+            "model '{}' not found in runtime model catalog",
+            raw_target
+        ));
+    }
+
+    if default_model.provider == raw_target {
+        return Ok(default_model.clone());
+    }
+    if let Some(found) = model_catalog
+        .iter()
+        .find(|model| model.provider == raw_target)
+    {
+        return Ok(found.clone());
+    }
+
+    if default_model.id == raw_target {
+        return Ok(default_model.clone());
+    }
+    if let Some(found) = model_catalog.iter().find(|model| model.id == raw_target) {
+        return Ok(found.clone());
+    }
+
+    Err(format!(
+        "model '{}' not found in runtime model catalog",
+        raw_target
+    ))
+}
+
+fn split_provider_model(raw: &str) -> Option<(String, String)> {
+    let (provider, model) = raw.split_once('/')?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), model.to_string()))
+}
+
+fn resolve_child_tools(base_tools: &[AgentTool], subagent: &crate::SubAgentSpec) -> Vec<AgentTool> {
+    let allow = subagent
+        .normalized_allowed_tools()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deny = subagent
+        .normalized_blocked_tools()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let use_allow = !allow.is_empty();
+
+    base_tools
+        .iter()
+        .filter(|tool| !use_allow || allow.contains(&tool.name))
+        .filter(|tool| !deny.contains(&tool.name))
+        .cloned()
+        .collect()
+}
+
+fn build_child_system_prompt(parent_system_prompt: &str, subagent: &crate::SubAgentSpec) -> String {
+    let mut prompt = format!(
+        "{parent_system_prompt}\n\n<subagent_context>\nYou are running as subagent '{}'. Focus on the delegated task and report concise actionable results.\nSubagent description: {}\n</subagent_context>",
+        subagent.name,
+        subagent.description.trim()
+    );
+    if let Some(extra_prompt) = subagent
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("\n\n<subagent_profile>\n");
+        prompt.push_str(extra_prompt);
+        prompt.push_str("\n</subagent_profile>");
+    }
+    prompt
 }
 
 fn last_assistant_text(messages: &[Message]) -> Option<String> {
@@ -328,6 +440,38 @@ fn last_assistant_stop_reason(messages: &[Message]) -> Option<(StopReason, Optio
     })
 }
 
+fn collect_subagent_trace_lines(messages: &[Message]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for message in messages {
+        let Message::ToolResult {
+            tool_name, content, ..
+        } = message
+        else {
+            continue;
+        };
+        lines.push(format!("• Ran {tool_name}"));
+        if *tool_name == "read" {
+            continue;
+        }
+        for block in content {
+            match block {
+                pixy_ai::ToolResultContentBlock::Text { text, .. } => {
+                    lines.extend(
+                        text.lines()
+                            .map(str::trim_end)
+                            .filter(|line| !line.is_empty())
+                            .map(str::to_string),
+                    );
+                }
+                pixy_ai::ToolResultContentBlock::Image { .. } => {
+                    lines.push("(image tool result omitted)".to_string());
+                }
+            }
+        }
+    }
+    lines
+}
+
 fn generate_task_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -344,10 +488,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
-    use pixy_agent_core::ParentChildRunEvent;
+    use pixy_agent_core::{AgentTool, AgentToolResult, ParentChildRunEvent, ToolFuture};
     use pixy_ai::{
         AssistantContentBlock, AssistantMessage, AssistantMessageEvent,
-        AssistantMessageEventStream, Cost, DoneReason, Model, StopReason, Usage,
+        AssistantMessageEventStream, Cost, DoneReason, Model, PiAiError, PiAiErrorCode, StopReason,
+        ToolResultContentBlock, Usage,
     };
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -429,10 +574,32 @@ mod tests {
                 name: "general".to_string(),
                 description: "General helper".to_string(),
                 mode: SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             })
             .expect("register general")
             .build();
         Arc::new(built)
+    }
+
+    fn no_op_tool(name: &str) -> AgentTool {
+        AgentTool {
+            name: name.to_string(),
+            label: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({}),
+            execute: Arc::new(
+                |_tool_call_id: String, _args: serde_json::Value| -> ToolFuture {
+                    Box::pin(async {
+                        Err(PiAiError::new(PiAiErrorCode::ToolExecutionFailed, "unused"))
+                            as Result<AgentToolResult, PiAiError>
+                    })
+                },
+            ),
+        }
     }
 
     #[tokio::test]
@@ -446,6 +613,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: dir.path().to_path_buf(),
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 calls_clone.fetch_add(1, Ordering::SeqCst);
@@ -485,6 +653,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: dir.path().to_path_buf(),
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 Ok(done_stream("child done".to_string()))
@@ -520,6 +689,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: dir.path().to_path_buf(),
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 let turn = calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
@@ -567,6 +737,40 @@ mod tests {
     }
 
     #[test]
+    fn collect_subagent_trace_lines_keeps_tool_flow_and_hides_read_body() {
+        let messages = vec![
+            Message::ToolResult {
+                tool_call_id: "call-read".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "secret body".to_string(),
+                    text_signature: None,
+                }],
+                details: None,
+                is_error: false,
+                timestamp: 1,
+            },
+            Message::ToolResult {
+                tool_call_id: "call-write".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "updated file".to_string(),
+                    text_signature: None,
+                }],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+            },
+        ];
+
+        let lines = super::collect_subagent_trace_lines(&messages);
+        assert_eq!(lines[0], "• Ran read");
+        assert!(!lines.iter().any(|line| line.contains("secret body")));
+        assert!(lines.iter().any(|line| line == "• Ran write"));
+        assert!(lines.iter().any(|line| line == "updated file"));
+    }
+
+    #[test]
     fn generate_task_id_produces_unique_ids_in_process() {
         let mut ids = HashSet::new();
         for _ in 0..1024 {
@@ -588,6 +792,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: blocked_session_root,
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 Ok(done_stream("child done".to_string()))
@@ -624,5 +829,151 @@ mod tests {
                     && child_session_file == UNRESOLVED_CHILD_SESSION_FILE
             )
         }));
+    }
+
+    #[test]
+    fn resolve_child_model_uses_subagent_model_override() {
+        let default_model = sample_model();
+        let alternate_model = Model {
+            id: "gemini-3-pro-preview".to_string(),
+            name: "Gemini".to_string(),
+            api: "google-generative-ai".to_string(),
+            provider: "google".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            reasoning: false,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 1_048_576,
+            max_tokens: 8_192,
+        };
+        let subagent = SubAgentSpec {
+            name: "code".to_string(),
+            description: "Code worker".to_string(),
+            mode: SubAgentMode::SubAgent,
+            prompt: None,
+            model: Some("google/gemini-3-pro-preview".to_string()),
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
+        };
+
+        let resolved = resolve_child_model(
+            &default_model,
+            &[default_model.clone(), alternate_model.clone()],
+            &subagent,
+        )
+        .expect("model override should resolve");
+        assert_eq!(resolved.provider, "google");
+        assert_eq!(resolved.id, "gemini-3-pro-preview");
+    }
+
+    #[test]
+    fn resolve_child_model_rejects_unknown_override() {
+        let subagent = SubAgentSpec {
+            name: "code".to_string(),
+            description: "Code worker".to_string(),
+            mode: SubAgentMode::SubAgent,
+            prompt: None,
+            model: Some("missing-provider/missing-model".to_string()),
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
+        };
+
+        let error = resolve_child_model(&sample_model(), &[sample_model()], &subagent)
+            .expect_err("unknown model should fail");
+        assert!(error.contains("not found"));
+    }
+
+    #[test]
+    fn resolve_child_model_uses_provider_override() {
+        let default_model = sample_model();
+        let alternate_model = Model {
+            id: "claude-4-6-sonnet-latest".to_string(),
+            name: "Claude".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning: false,
+            reasoning_effort: None,
+            input: vec!["text".to_string()],
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+        };
+        let subagent = SubAgentSpec {
+            name: "review".to_string(),
+            description: "Review worker".to_string(),
+            mode: SubAgentMode::SubAgent,
+            prompt: None,
+            model: Some("anthropic".to_string()),
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
+        };
+
+        let resolved = resolve_child_model(
+            &default_model,
+            &[default_model.clone(), alternate_model.clone()],
+            &subagent,
+        )
+        .expect("provider override should resolve");
+        assert_eq!(resolved.provider, "anthropic");
+        assert_eq!(resolved.id, "claude-4-6-sonnet-latest");
+    }
+
+    #[test]
+    fn resolve_child_tools_applies_allow_and_deny_rules() {
+        let tools = vec![no_op_tool("read"), no_op_tool("edit"), no_op_tool("bash")];
+        let subagent = SubAgentSpec {
+            name: "code".to_string(),
+            description: "Code worker".to_string(),
+            mode: SubAgentMode::SubAgent,
+            prompt: None,
+            model: None,
+            tools: vec!["read".to_string(), "bash".to_string()],
+            blocked_tools: vec!["bash".to_string()],
+            metadata: None,
+        };
+
+        let filtered = resolve_child_tools(&tools, &subagent);
+        let names = filtered
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read"]);
+    }
+
+    #[test]
+    fn build_child_system_prompt_includes_subagent_profile_prompt() {
+        let subagent = SubAgentSpec {
+            name: "review".to_string(),
+            description: "Review worker".to_string(),
+            mode: SubAgentMode::SubAgent,
+            prompt: Some("You MUST start with REVIEW_STATUS: PASS or FAIL.".to_string()),
+            model: None,
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
+        };
+
+        let prompt = build_child_system_prompt("You are parent.", &subagent);
+        assert!(prompt.contains("<subagent_context>"));
+        assert!(prompt.contains("Review worker"));
+        assert!(prompt.contains("<subagent_profile>"));
+        assert!(prompt.contains("REVIEW_STATUS"));
     }
 }

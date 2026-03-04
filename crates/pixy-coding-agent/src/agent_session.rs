@@ -1140,6 +1140,7 @@ pub fn create_session_from_runtime(
                 parent_session_id: dispatch_parent_session_id.clone(),
                 parent_session_dir: dispatch_parent_session_dir,
                 model: runtime.model.clone(),
+                model_catalog: runtime.model_catalog.clone(),
                 system_prompt: build_system_prompt(
                     custom_system_prompt,
                     cwd,
@@ -1334,7 +1335,10 @@ async fn collect_agent_loop_result(
                             callback(update);
                         }
                     } else if let Message::ToolResult {
-                        tool_name, content, ..
+                        tool_name,
+                        content,
+                        details,
+                        ..
                     } = &message
                     {
                         if renderer.should_render_tool_result_content(tool_name) {
@@ -1349,6 +1353,11 @@ async fn collect_agent_loop_result(
                                         ))
                                     }
                                 }
+                            }
+                            if let Some(line) =
+                                format_task_tool_finish_line(tool_name, details.as_ref())
+                            {
+                                callback(AgentSessionStreamUpdate::ToolLine(line));
                             }
                         }
                     }
@@ -1378,6 +1387,7 @@ pub(crate) fn render_messages_for_streaming(
             Message::ToolResult {
                 tool_name,
                 content,
+                details,
                 is_error,
                 ..
             } => {
@@ -1401,6 +1411,9 @@ pub(crate) fn render_messages_for_streaming(
                         }
                     }
                 }
+                if let Some(line) = format_task_tool_finish_line(tool_name, details.as_ref()) {
+                    updates.push(AgentSessionStreamUpdate::ToolLine(line));
+                }
             }
             Message::User { .. } => {}
         }
@@ -1415,9 +1428,51 @@ pub(crate) fn should_render_tool_result_content(tool_name: &str) -> bool {
 pub(crate) fn format_tool_start_line(tool_name: &str, args: &Value) -> String {
     match tool_name {
         "bash" => format_bash_tool_start_line(args),
+        "task" => format_task_tool_start_line(args),
         "read" | "write" | "edit" => format_path_tool_start_line(tool_name, args),
         _ => format!("• Ran {tool_name}"),
     }
+}
+
+fn format_task_tool_start_line(args: &Value) -> String {
+    let subagent = args
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (subagent, task_id) {
+        (Some(subagent), Some(task_id)) => {
+            format!("• Ran task subagent={subagent} task_id={task_id}")
+        }
+        (Some(subagent), None) => format!("• Ran task subagent={subagent}"),
+        (None, Some(task_id)) => format!("• Ran task task_id={task_id}"),
+        (None, None) => "• Ran task".to_string(),
+    }
+}
+
+fn format_task_tool_finish_line(tool_name: &str, details: Option<&Value>) -> Option<String> {
+    if tool_name != "task" {
+        return None;
+    }
+    let details = details?;
+    let subagent = details
+        .get("resolved_subagent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let duration_ms = details.get("duration_ms").and_then(Value::as_u64)?;
+    let total_seconds = duration_ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    Some(format!(
+        "Subagent {subagent} finished in {minutes} m {seconds} s;"
+    ))
 }
 
 fn format_bash_tool_start_line(args: &Value) -> String {
@@ -1960,14 +2015,15 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::Local;
-    use pixy_ai::{Cost, Message, Model, UserContent};
+    use pixy_ai::{Cost, Message, Model, ToolResultContentBlock, UserContent};
     use serde_json::json;
     use std::collections::HashMap;
 
     use super::{
         build_session_resume_candidate, create_session_from_runtime, format_bash_tool_start_line,
-        normalize_session_candidate_title, resolve_runtime_api_key_for_model, AgentMode,
-        ResolvedRuntime,
+        format_task_tool_finish_line, format_tool_start_line, normalize_session_candidate_title,
+        render_messages_for_streaming, resolve_runtime_api_key_for_model, AgentMode,
+        AgentSessionStreamUpdate, ResolvedRuntime,
     };
     use crate::{
         ResolvedMemoryConfig, ResolvedMemorySearchConfig, ResolvedMultiAgentConfig, SessionManager,
@@ -2019,6 +2075,95 @@ mod tests {
         }));
 
         assert_eq!(line, "• Ran bash -lc 'printf \"hello\"'");
+    }
+
+    #[test]
+    fn format_tool_start_line_includes_subagent_for_task_tool() {
+        let line = format_tool_start_line(
+            "task",
+            &json!({
+                "subagent_type": "review",
+                "task_id": "mission-review"
+            }),
+        );
+
+        assert_eq!(line, "• Ran task subagent=review task_id=mission-review");
+    }
+
+    #[test]
+    fn format_tool_start_line_falls_back_when_task_args_missing() {
+        let line = format_tool_start_line("task", &json!({}));
+        assert_eq!(line, "• Ran task");
+    }
+
+    #[test]
+    fn format_task_tool_finish_line_uses_subagent_and_duration() {
+        let line = format_task_tool_finish_line(
+            "task",
+            Some(&json!({
+                "resolved_subagent": "review",
+                "duration_ms": 65_432
+            })),
+        )
+        .expect("task finish line should format");
+        assert_eq!(line, "Subagent review finished in 1 m 5 s;");
+    }
+
+    #[test]
+    fn render_messages_for_streaming_includes_task_finish_line() {
+        let messages = vec![Message::ToolResult {
+            tool_call_id: "tc-1".to_string(),
+            tool_name: "task".to_string(),
+            content: vec![ToolResultContentBlock::Text {
+                text: "<task_result>\ncompleted\n</task_result>".to_string(),
+                text_signature: None,
+            }],
+            details: Some(json!({
+                "resolved_subagent": "code",
+                "duration_ms": 2_345
+            })),
+            is_error: false,
+            timestamp: 1,
+        }];
+
+        let updates = render_messages_for_streaming(&messages);
+        assert_eq!(
+            updates[0],
+            AgentSessionStreamUpdate::ToolLine("• Ran task".to_string())
+        );
+        assert_eq!(
+            updates[2],
+            AgentSessionStreamUpdate::ToolLine("Subagent code finished in 0 m 2 s;".to_string())
+        );
+    }
+
+    #[test]
+    fn render_messages_for_streaming_includes_task_subagent_trace_block() {
+        let messages = vec![Message::ToolResult {
+            tool_call_id: "tc-2".to_string(),
+            tool_name: "task".to_string(),
+            content: vec![
+                ToolResultContentBlock::Text {
+                    text: "<task_result>\ncompleted\n</task_result>".to_string(),
+                    text_signature: None,
+                },
+                ToolResultContentBlock::Text {
+                    text: "Subagent code | • Ran write /tmp/v2/snake.html".to_string(),
+                    text_signature: None,
+                },
+            ],
+            details: Some(json!({
+                "resolved_subagent": "code",
+                "duration_ms": 2_345
+            })),
+            is_error: false,
+            timestamp: 1,
+        }];
+
+        let updates = render_messages_for_streaming(&messages);
+        assert!(updates.contains(&AgentSessionStreamUpdate::ToolLine(
+            "Subagent code | • Ran write /tmp/v2/snake.html".to_string()
+        )));
     }
 
     #[test]
@@ -2095,6 +2240,11 @@ mod tests {
                     name: "general".to_string(),
                     description: "General helper".to_string(),
                     mode: SubAgentMode::SubAgent,
+                    prompt: None,
+                    model: None,
+                    tools: vec![],
+                    blocked_tools: vec![],
+                    metadata: None,
                 }],
                 plugin_paths: vec![],
                 hooks: vec![],
@@ -2138,11 +2288,21 @@ mod tests {
                         name: "general".to_string(),
                         description: "General helper".to_string(),
                         mode: SubAgentMode::SubAgent,
+                        prompt: None,
+                        model: None,
+                        tools: vec![],
+                        blocked_tools: vec![],
+                        metadata: None,
                     },
                     SubAgentSpec {
                         name: "explore".to_string(),
                         description: "Exploration helper".to_string(),
                         mode: SubAgentMode::SubAgent,
+                        prompt: None,
+                        model: None,
+                        tools: vec![],
+                        blocked_tools: vec![],
+                        metadata: None,
                     },
                 ],
                 plugin_paths: vec![],

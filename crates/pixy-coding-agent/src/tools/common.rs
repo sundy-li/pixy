@@ -159,6 +159,20 @@ pub(super) fn get_required_string(args: &Value, key: &str) -> Result<String, PiA
         .ok_or_else(|| invalid_tool_args(format!("Missing or invalid `{key}`")))
 }
 
+pub(super) fn get_required_string_alias<'a>(
+    args: &Value,
+    keys: &'a [&'a str],
+) -> Result<String, PiAiError> {
+    for key in keys {
+        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+            return Ok(value.to_string());
+        }
+    }
+
+    let primary = keys.first().copied().unwrap_or("value");
+    Err(invalid_tool_args(format!("Missing or invalid `{primary}`")))
+}
+
 pub(super) fn get_optional_usize(args: &Value, key: &str) -> Result<Option<usize>, PiAiError> {
     match args.get(key) {
         None => Ok(None),

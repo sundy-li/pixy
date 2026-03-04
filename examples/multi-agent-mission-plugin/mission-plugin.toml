@@ -1,0 +1,72 @@
+name = "mission-plugin"
+description = "Mission-style orchestrator -> code -> review loop with declarative hooks. Subagents are loaded from ./agents/*.toml"
+
+[policy]
+fallback_subagent = "code"
+
+[[policy.rules]]
+tool = "task"
+subagent = "*"
+effect = "allow"
+
+[[hooks]]
+name = "mission-task-tool-description"
+stage = "before_tool_definition"
+tool_name = "task"
+
+[[hooks.actions]]
+type = "append_field"
+field = "description"
+value = " Mission profile is enabled: the default agent is orchestrator-only and should not implement code directly. Required loop: code -> review -> if REVIEW_STATUS: FAIL then code again, repeat until REVIEW_STATUS: PASS. Use stable task ids per worker role (for example mission-code and mission-review)."
+
+[[hooks]]
+name = "enforce-code-worker-prompt"
+stage = "before_task_dispatch"
+subagent = "code"
+
+[[hooks.actions]]
+type = "append_field"
+field = "input.prompt"
+value = "\n\n<CODE_WORKER_CONTRACT>\nYou are the code worker. Implement requested changes only.\nDo not do final acceptance.\nReturn concise implementation summary with changed files.\n</CODE_WORKER_CONTRACT>"
+
+[[hooks]]
+name = "enforce-review-worker-prompt"
+stage = "before_task_dispatch"
+subagent = "review"
+
+[[hooks.actions]]
+type = "append_field"
+field = "input.prompt"
+value = "\n\n<REVIEW_WORKER_CONTRACT>\nYou are the review worker. Validate correctness, regressions, and missing tests.\nYou MUST start your output with exactly one status line:\nREVIEW_STATUS: PASS\nor\nREVIEW_STATUS: FAIL\nIf FAIL, provide concrete actionable fix items for code worker.\n</REVIEW_WORKER_CONTRACT>"
+
+[[hooks]]
+name = "review-pass-decision-tag"
+stage = "after_task_result"
+subagent = "review"
+prompt_contains = "REVIEW_STATUS: PASS"
+
+[[hooks.actions]]
+type = "append_field"
+field = "output.summary"
+value = "\n\n[mission-decision] pass"
+
+[[hooks]]
+name = "review-fail-decision-tag"
+stage = "after_task_result"
+subagent = "review"
+prompt_contains = "REVIEW_STATUS: FAIL"
+
+[[hooks.actions]]
+type = "append_field"
+field = "output.summary"
+value = "\n\n[mission-decision] retry-code"
+
+[[hooks]]
+name = "code-next-step-hint"
+stage = "after_task_result"
+subagent = "code"
+
+[[hooks.actions]]
+type = "append_field"
+field = "output.summary"
+value = "\n\n[mission-next] run review"

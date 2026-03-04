@@ -14,9 +14,9 @@ use pixy_agent_core::AgentAbortController;
 use pixy_ai::{Message, StopReason, UserContentBlock};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 #[cfg(test)]
 use ratatui::style::Color;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -51,9 +51,9 @@ use terminal::{
 };
 pub use theme::TuiTheme;
 use transcript::{
-    is_thinking_line, is_tool_run_line, normalize_tool_line_for_display, parse_tool_name,
-    render_messages, split_tool_output_lines, visible_transcript_lines, TranscriptLine,
-    TranscriptLineKind,
+    is_thinking_line, is_tool_run_line, normalize_tool_line_for_display, parse_task_subagent,
+    parse_tool_name, render_messages, split_tool_output_lines, visible_transcript_lines,
+    TranscriptLine, TranscriptLineKind,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +161,7 @@ struct TuiApp {
     working_message: String,
     working_tick: usize,
     working_started_at: Option<Instant>,
+    working_elapsed_accumulated: Duration,
     interrupt_hint_label: String,
     dequeue_hint_label: String,
     last_clear_key_at_ms: i64,
@@ -194,6 +195,7 @@ impl TuiApp {
             working_message: String::new(),
             working_tick: 0,
             working_started_at: None,
+            working_elapsed_accumulated: Duration::ZERO,
             interrupt_hint_label: "esc".to_string(),
             dequeue_hint_label: "Alt+Up".to_string(),
             last_clear_key_at_ms: 0,
@@ -591,10 +593,12 @@ impl TuiApp {
     }
 
     fn start_working(&mut self, _message: String) {
+        if !self.is_working {
+            self.working_started_at = Some(Instant::now());
+        }
         self.is_working = true;
-        self.working_message = "Thinking...".to_string();
+        self.working_message = "Working...".to_string();
         self.working_tick = 0;
-        self.working_started_at = Some(Instant::now());
     }
 
     fn bump_working_tick(&mut self) {
@@ -602,16 +606,24 @@ impl TuiApp {
     }
 
     fn stop_working(&mut self) {
+        if let Some(started_at) = self.working_started_at.take() {
+            self.working_elapsed_accumulated = self
+                .working_elapsed_accumulated
+                .saturating_add(started_at.elapsed());
+        }
         self.is_working = false;
         self.working_message.clear();
         self.working_tick = 0;
-        self.working_started_at = None;
     }
 
     fn working_elapsed_secs(&self) -> u64 {
-        self.working_started_at
-            .map(|started_at| started_at.elapsed().as_secs())
-            .unwrap_or(0)
+        let running = self
+            .working_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        self.working_elapsed_accumulated
+            .saturating_add(running)
+            .as_secs()
     }
 
     fn working_elapsed_label(&self) -> String {
@@ -768,12 +780,14 @@ impl TuiApp {
                 };
             }
             StreamUpdate::ToolLine(line) => {
-                if is_tool_run_line(line) {
+                if let Some(subagent) = parse_task_subagent(line) {
+                    self.working_message = format!("Subagent {subagent} is working...");
+                } else if is_tool_run_line(line) {
                     self.working_message = "Invoking tools...".to_string();
                 } else if parse_tool_name(line).is_some() {
                     self.working_message = "Invoking tools...".to_string();
                 } else {
-                    self.working_message = "Thinking...".to_string();
+                    self.working_message = "Working...".to_string();
                 }
             }
         }
@@ -800,7 +814,7 @@ impl TuiApp {
         };
         let prefix = format!("{spinner} ");
         let message = if self.working_message.trim().is_empty() {
-            "Thinking..."
+            "Working..."
         } else {
             self.working_message.as_str()
         };
@@ -2137,10 +2151,7 @@ fn render_ui(frame: &mut Frame, app: &TuiApp, options: &TuiOptions) {
 }
 
 fn is_plan_mode(status_left: &str) -> bool {
-    status_left
-        .trim()
-        .to_ascii_uppercase()
-        .starts_with("PLAN")
+    status_left.trim().to_ascii_uppercase().starts_with("PLAN")
 }
 
 fn resolve_input_box_visual_style(
@@ -2151,10 +2162,8 @@ fn resolve_input_box_visual_style(
         let accent = theme.plan_mode_input_accent_color();
         let input_style = theme.input_style().fg(accent);
         let border_style = Style::default().fg(accent);
-        let title_style = Style::default()
-            .fg(accent)
-            .add_modifier(Modifier::BOLD);
-        let title = Line::from(vec![Span::styled(" Plan ".to_string(), title_style)]);
+        let title_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+        let title = Line::from(vec![Span::styled("─── Plan ".to_string(), title_style)]);
         (input_style, border_style, Some(title))
     } else {
         (theme.input_style(), theme.input_border_style(), None)

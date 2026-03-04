@@ -34,9 +34,9 @@ pub use multi_agent::{
     DeclarativeHookAction, DeclarativeHookSpec, DeclarativeHookStage, DefaultSubAgentRegistry,
     DispatchPolicyConfig, DispatchPolicyDecision, DispatchPolicyRule, LoadedPluginManifest,
     MergedPluginConfig, MultiAgentHook, MultiAgentPluginManifest, MultiAgentPluginRuntime,
-    PluginSubAgentSpec, PolicyRuleEffect, SubAgentMode, SubAgentRegistryBuilder, SubAgentResolver,
-    SubAgentSpec, TaskDispatchResult, TaskDispatcher, TaskDispatcherConfig, TaskToolInput,
-    TaskToolOutput,
+    PluginSubAgentSpec, PolicyRuleEffect, SubAgentMode, SubAgentPromptMetadata,
+    SubAgentPromptTrigger, SubAgentRegistryBuilder, SubAgentResolver, SubAgentSpec,
+    TaskDispatchResult, TaskDispatcher, TaskDispatcherConfig, TaskToolInput, TaskToolOutput,
 };
 pub use runtime_config::{
     LLMRouter, ResolvedMemoryConfig, ResolvedMemorySearchConfig, ResolvedMultiAgentConfig,

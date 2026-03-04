@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use tracing::info;
 
-use super::common::{empty_assistant_message, join_url, shared_http_client};
+use super::common::{debug_provider_event, empty_assistant_message, join_url, shared_http_client};
 use crate::api_registry::{ApiProvider, ApiProviderFuture};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
@@ -110,6 +110,7 @@ pub async fn run_openai_completions(
         })?;
         let mut reader = std::io::Cursor::new(body.into_bytes());
         process_sse_data_events(&mut reader, |data| {
+            debug_provider_event("openai-completions", &data);
             info!("OpenAI completions data: {}", data);
             if data == "[DONE]" {
                 return Ok(true);
@@ -288,23 +289,30 @@ pub async fn run_openai_completions(
                             *name = name_delta.to_string();
                         }
 
-                        let arg_delta = tool_call
+                        let arguments_field = tool_call
                             .get("function")
                             .and_then(Value::as_object)
-                            .and_then(|function| function.get("arguments"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                            .and_then(|function| function.get("arguments"));
 
-                        if !arg_delta.is_empty() {
-                            if let Some(buffer) = tool_arg_buffers.get_mut(&tool_provider_index) {
-                                buffer.push_str(arg_delta);
-                                *arguments = parse_partial_json(buffer);
+                        let mut delta_text = String::new();
+                        if let Some(arg_delta) = arguments_field.and_then(Value::as_str) {
+                            if !arg_delta.is_empty() {
+                                if let Some(buffer) = tool_arg_buffers.get_mut(&tool_provider_index)
+                                {
+                                    buffer.push_str(arg_delta);
+                                    *arguments = parse_partial_json(buffer);
+                                }
+                                delta_text = arg_delta.to_string();
                             }
+                        } else if let Some(arguments_value) = arguments_field {
+                            let parsed = parse_tool_arguments_value(Some(arguments_value));
+                            *arguments = parsed;
+                            delta_text = arguments_value.to_string();
                         }
 
                         stream.push(AssistantMessageEvent::ToolcallDelta {
                             content_index,
-                            delta: arg_delta.to_string(),
+                            delta: delta_text,
                             partial: output.clone(),
                         });
                     }
@@ -676,6 +684,14 @@ fn map_done_reason(reason: StopReason) -> Option<DoneReason> {
 
 fn parse_partial_json(buffer: &str) -> Value {
     serde_json::from_str::<Value>(buffer).unwrap_or_else(|_| Value::Object(Map::new()))
+}
+
+fn parse_tool_arguments_value(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => parse_partial_json(raw),
+        Some(Value::Null) | None => Value::Object(Map::new()),
+        Some(other) => other.clone(),
+    }
 }
 
 fn extract_text_block(content: &[AssistantContentBlock], index: usize) -> String {

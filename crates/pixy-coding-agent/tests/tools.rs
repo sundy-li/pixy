@@ -59,6 +59,85 @@ async fn write_tool_creates_parent_dirs_and_read_tool_supports_offset_limit() {
 }
 
 #[tokio::test]
+async fn write_tool_accepts_file_path_alias() {
+    let dir = tempdir().expect("tempdir");
+    let write_tool = create_write_tool(dir.path());
+
+    write_tool
+        .execute
+        .execute(
+            "call-write-alias".to_string(),
+            json!({
+                "file_path": "alias/file.txt",
+                "content": "hello alias"
+            }),
+        )
+        .await
+        .expect("write should accept file_path alias");
+
+    let written = fs::read_to_string(dir.path().join("alias/file.txt")).expect("read written file");
+    assert_eq!(written, "hello alias");
+}
+
+#[tokio::test]
+async fn write_tool_accepts_filename_aliases() {
+    let dir = tempdir().expect("tempdir");
+    let write_tool = create_write_tool(dir.path());
+
+    write_tool
+        .execute
+        .execute(
+            "call-write-filepath".to_string(),
+            json!({
+                "filepath": "alias/filepath.txt",
+                "content": "hello filepath"
+            }),
+        )
+        .await
+        .expect("write should accept filepath alias");
+    let filepath_written =
+        fs::read_to_string(dir.path().join("alias/filepath.txt")).expect("read filepath file");
+    assert_eq!(filepath_written, "hello filepath");
+
+    write_tool
+        .execute
+        .execute(
+            "call-write-filename".to_string(),
+            json!({
+                "filename": "alias/filename.txt",
+                "content": "hello filename"
+            }),
+        )
+        .await
+        .expect("write should accept filename alias");
+    let filename_written =
+        fs::read_to_string(dir.path().join("alias/filename.txt")).expect("read filename file");
+    assert_eq!(filename_written, "hello filename");
+}
+
+#[tokio::test]
+async fn write_tool_reports_received_keys_when_path_is_missing() {
+    let dir = tempdir().expect("tempdir");
+    let write_tool = create_write_tool(dir.path());
+
+    let error = write_tool
+        .execute
+        .execute(
+            "call-write-missing-path".to_string(),
+            json!({
+                "target": "alias/unknown.txt",
+                "content": "hello"
+            }),
+        )
+        .await
+        .expect_err("write should fail when path aliases are missing");
+
+    assert_eq!(error.code, PiAiErrorCode::ToolArgumentsInvalid);
+    assert!(error.message.contains("received keys"));
+    assert!(error.message.contains("content, target"));
+}
+
+#[tokio::test]
 async fn edit_tool_replaces_unique_match() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("edit.txt"), "before OLD after").expect("seed file");

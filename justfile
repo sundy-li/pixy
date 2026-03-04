@@ -1,3 +1,6 @@
+build:
+	cargo build
+
 dev-cli:
 	cargo run -p pixy-main --bin pixy
 

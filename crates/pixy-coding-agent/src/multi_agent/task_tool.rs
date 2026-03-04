@@ -66,16 +66,46 @@ impl AgentToolExecutor for TaskToolExecutor {
                 "routing_hint_applied".to_string(),
                 json!(dispatched.routing_hint_applied),
             );
+            object.insert("duration_ms".to_string(), json!(dispatched.duration_ms));
+        }
+
+        let mut content = vec![ToolResultContentBlock::Text {
+            text: format!("<task_result>\n{}\n</task_result>", dispatched.summary),
+            text_signature: None,
+        }];
+        if let Some(trace_text) =
+            format_subagent_trace(&dispatched.resolved_subagent, &dispatched.trace_lines)
+        {
+            content.push(ToolResultContentBlock::Text {
+                text: trace_text,
+                text_signature: None,
+            });
         }
 
         Ok(AgentToolResult {
-            content: vec![ToolResultContentBlock::Text {
-                text: format!("<task_result>\n{}\n</task_result>", dispatched.summary),
-                text_signature: None,
-            }],
+            content,
             details,
         })
     }
+}
+
+fn format_subagent_trace(subagent: &str, lines: &[String]) -> Option<String> {
+    let mut rendered = String::new();
+    for line in lines {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        rendered.push_str("Subagent ");
+        rendered.push_str(subagent);
+        rendered.push_str(" | ");
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    if rendered.is_empty() {
+        return None;
+    }
+    Some(rendered.trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -168,6 +198,11 @@ mod tests {
                 name: "general".to_string(),
                 description: "General helper".to_string(),
                 mode: SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             })
             .expect("register general")
             .build();
@@ -183,6 +218,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: dir.path().to_path_buf(),
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 Ok(done_stream("child completed".to_string()))
@@ -218,6 +254,22 @@ mod tests {
         assert_eq!(result.details["summary"], "child completed");
         assert_eq!(result.details["resolved_subagent"], "general");
         assert_eq!(result.details["routing_hint_applied"], false);
+        assert!(result.details["duration_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn format_subagent_trace_prefixes_lines_and_omits_empty_entries() {
+        let trace = super::format_subagent_trace(
+            "code",
+            &[
+                "• Ran write /tmp/v2/snake.html".to_string(),
+                "(no output)".to_string(),
+                String::new(),
+            ],
+        )
+        .expect("trace should render");
+        assert!(trace.contains("Subagent code | • Ran write /tmp/v2/snake.html"));
+        assert!(trace.contains("Subagent code | (no output)"));
     }
 
     #[tokio::test]
@@ -229,6 +281,7 @@ mod tests {
             parent_session_id: "parent-session".to_string(),
             parent_session_dir: dir.path().to_path_buf(),
             model: sample_model(),
+            model_catalog: vec![sample_model()],
             system_prompt: "You are parent".to_string(),
             stream_fn: Arc::new(move |_model, _context, _options| {
                 Ok(done_stream("child completed".to_string()))

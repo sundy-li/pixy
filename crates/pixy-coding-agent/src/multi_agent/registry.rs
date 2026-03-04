@@ -114,6 +114,11 @@ mod tests {
             name: name.to_string(),
             description: format!("{name} helper"),
             mode: SubAgentMode::SubAgent,
+            prompt: None,
+            model: None,
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
         }
     }
 

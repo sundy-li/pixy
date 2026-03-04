@@ -767,6 +767,33 @@ fn visible_transcript_respects_tool_and_thinking_toggles() {
 }
 
 #[test]
+fn visible_transcript_keeps_subagent_lines_even_when_tools_hidden() {
+    let lines = vec![
+        TranscriptLine::new("normal".to_string(), TranscriptLineKind::Normal),
+        TranscriptLine::new(
+            "• Ran task subagent=review task_id=mission-review".to_string(),
+            TranscriptLineKind::Tool,
+        ),
+        TranscriptLine::new(
+            "Subagent review finished in 0 m 3 s;".to_string(),
+            TranscriptLineKind::Tool,
+        ),
+        TranscriptLine::new("• Ran bash -lc 'echo hidden'".to_string(), TranscriptLineKind::Tool),
+    ];
+    let visible =
+        visible_transcript_lines(&lines, &[], 20, 120, false, false, None, 0, TuiTheme::Dark);
+
+    let rendered = visible
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("• Ran task subagent=review task_id=mission-review"));
+    assert!(rendered.contains("Subagent review finished in 0 m 3 s;"));
+    assert!(!rendered.contains("• Ran bash -lc 'echo hidden'"));
+}
+
+#[test]
 fn visible_transcript_appends_working_line() {
     let lines = vec![TranscriptLine::new(
         "normal".to_string(),
@@ -910,7 +937,20 @@ fn tool_output_line_resets_working_message_to_generic_state() {
     assert_eq!(app.working_message, "Invoking tools...");
 
     app.note_working_from_update("pixy", &StreamUpdate::ToolLine("(no output)".to_string()));
-    assert_eq!(app.working_message, "Thinking...");
+    assert_eq!(app.working_message, "Working...");
+}
+
+#[test]
+fn task_tool_line_switches_working_message_to_subagent_status() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.start_working("pixy is working...".to_string());
+
+    app.note_working_from_update(
+        "pixy",
+        &StreamUpdate::ToolLine("• Ran task subagent=review task_id=mission-review".to_string()),
+    );
+
+    assert_eq!(app.working_message, "Subagent review is working...");
 }
 
 #[test]
@@ -942,9 +982,27 @@ fn working_line_uses_single_space_after_spinner_prefix() {
 
     let line = app.working_line().expect("working line should be present");
     assert!(
-        line.text.starts_with("⠋ Thinking..."),
+        line.text.starts_with("⠋ Working..."),
         "spinner prefix should have exactly one space before status text"
     );
+}
+
+#[test]
+fn working_elapsed_label_accumulates_across_multiple_work_cycles() {
+    let mut app = TuiApp::new("ready".to_string(), true, false);
+    app.working_elapsed_accumulated = std::time::Duration::from_secs(70);
+
+    app.start_working("pixy is working...".to_string());
+    app.working_started_at =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+    assert_eq!(app.working_elapsed_label(), "1m 50s");
+
+    app.stop_working();
+    assert_eq!(app.working_elapsed_label(), "1m 50s");
+
+    app.start_working("pixy is working...".to_string());
+    app.working_started_at = Some(std::time::Instant::now());
+    assert_eq!(app.working_elapsed_label(), "1m 50s");
 }
 
 #[test]
@@ -959,7 +1017,7 @@ fn working_line_marquee_highlights_spinner_text_with_dark_theme_colors() {
         .to_line(200, TuiTheme::Dark);
     assert!(
         line0.spans.iter().any(|span| {
-            span.content.contains("Thin")
+            span.content.contains("Work")
                 && span.style.fg == Some(Color::Rgb(224, 175, 104))
                 && span.style.bg == Some(Color::Rgb(26, 27, 38))
         }),
@@ -973,7 +1031,7 @@ fn working_line_marquee_highlights_spinner_text_with_dark_theme_colors() {
         .to_line(200, TuiTheme::Dark);
     assert!(
         line1.spans.iter().any(|span| {
-            span.content.contains("hink")
+            span.content.contains("orki")
                 && span.style.fg == Some(Color::Rgb(224, 175, 104))
                 && span.style.bg == Some(Color::Rgb(26, 27, 38))
         }),
@@ -1000,7 +1058,7 @@ fn working_line_marquee_uses_light_theme_colors() {
     assert!(
         line.spans
             .iter()
-            .any(|span| { span.content.contains("Thin") && span.style.fg == Some(Color::Black) }),
+            .any(|span| { span.content.contains("Work") && span.style.fg == Some(Color::Black) }),
         "highlight text should use light theme highlight color"
     );
     assert!(
@@ -1994,6 +2052,20 @@ fn transcript_module_exposes_tool_helpers() {
         crate::transcript::parse_tool_name("[tool:write:error]"),
         Some("write")
     );
+    assert_eq!(
+        crate::transcript::parse_task_subagent("• Ran task subagent=code task_id=mission-code"),
+        Some("code")
+    );
+    assert_eq!(
+        crate::transcript::parse_subagent_finish("Subagent code finished in 0 m 2 s;"),
+        Some("code")
+    );
+    assert!(crate::transcript::is_subagent_tool_line(
+        "• Ran task subagent=code task_id=mission-code"
+    ));
+    assert!(crate::transcript::is_subagent_tool_line(
+        "Subagent code | • Ran write /tmp/v2/snake.html"
+    ));
 }
 
 #[test]
@@ -2628,6 +2700,7 @@ fn status_bar_shows_working_without_steering_rows() {
     assert!(!line_text(&status.lines[0]).contains("Steering:"));
     assert!(line_text(&status.lines[1]).contains("shift+tab"));
     assert!(!line_text(&status.lines[1]).contains("ctrl+L"));
+    assert!(line_text(&status.lines[2]).contains("[⏱ "));
     assert!(line_text(&status.lines[2]).contains("? for help"));
 }
 

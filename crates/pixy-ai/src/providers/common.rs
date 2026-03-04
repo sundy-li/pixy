@@ -4,6 +4,13 @@ use reqwest::Client;
 
 use crate::types::{AssistantMessage, Cost, Model, StopReason, Usage};
 
+pub(super) fn debug_provider_event(provider: &str, data: &str) {
+    if !provider_debug_enabled() {
+        return;
+    }
+    eprintln!("[pixy-provider-debug:{provider}] {data}");
+}
+
 pub(super) fn empty_assistant_message(model: &Model) -> AssistantMessage {
     AssistantMessage {
         role: "assistant".to_string(),
@@ -70,4 +77,16 @@ pub(super) fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn provider_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIXY_DEBUG_PROVIDER_EVENTS")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
 }

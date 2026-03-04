@@ -362,6 +362,182 @@ async fn agent_loop_continue_reuses_existing_context_messages() {
     assert_eq!(result.len(), 1, "continue should only return new messages");
 }
 
+#[tokio::test]
+async fn agent_loop_auto_continues_when_stop_reason_is_length() {
+    let stream_fn_calls = Arc::new(AtomicUsize::new(0));
+    let stream_fn_calls_in_stream = stream_fn_calls.clone();
+
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            let index = stream_fn_calls_in_stream.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                let truncated_msg = assistant_message(
+                    vec![AssistantContentBlock::Text {
+                        text: "partial".to_string(),
+                        text_signature: None,
+                    }],
+                    StopReason::Length,
+                    1_700_000_000_020,
+                );
+                Ok(done_stream(truncated_msg, DoneReason::Length))
+            } else {
+                let complete_msg = assistant_message(
+                    vec![AssistantContentBlock::Text {
+                        text: "completed".to_string(),
+                        text_signature: None,
+                    }],
+                    StopReason::Stop,
+                    1_700_000_000_030,
+                );
+                Ok(done_stream(complete_msg, DoneReason::Stop))
+            }
+        },
+    );
+
+    let prompts = vec![user_message("write answer", 1_700_000_000_000)];
+    let context = AgentContext {
+        system_prompt: "You are helpful".to_string(),
+        messages: vec![],
+        tools: vec![],
+    };
+
+    let config = AgentLoopConfig {
+        model: sample_model("test-api"),
+        fallback_models: vec![],
+        convert_to_llm: Arc::new(|messages| messages),
+        stream_fn,
+        retry: AgentRetryConfig::default(),
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+    };
+
+    let stream = agent_loop(prompts, context, config, None);
+    let (_events, result) = collect_events_and_result(stream).await;
+
+    assert_eq!(stream_fn_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        result.len(),
+        3,
+        "prompt + truncated assistant + continued assistant"
+    );
+    assert!(
+        matches!(
+            result.last(),
+            Some(Message::Assistant {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ),
+        "final assistant message should complete instead of remaining length-truncated"
+    );
+}
+
+#[tokio::test]
+async fn agent_loop_ignores_tool_calls_when_stop_reason_is_length() {
+    let stream_fn_calls = Arc::new(AtomicUsize::new(0));
+    let stream_fn_calls_in_stream = stream_fn_calls.clone();
+
+    let stream_fn = Arc::new(
+        move |_model: Model, _context: Context, _options: Option<pixy_ai::SimpleStreamOptions>| {
+            let index = stream_fn_calls_in_stream.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                let truncated_msg = assistant_message(
+                    vec![AssistantContentBlock::ToolCall {
+                        id: "call_truncated".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }],
+                    StopReason::Length,
+                    1_700_000_000_020,
+                );
+                Ok(done_stream(truncated_msg, DoneReason::Length))
+            } else {
+                let complete_msg = assistant_message(
+                    vec![AssistantContentBlock::Text {
+                        text: "continued".to_string(),
+                        text_signature: None,
+                    }],
+                    StopReason::Stop,
+                    1_700_000_000_030,
+                );
+                Ok(done_stream(complete_msg, DoneReason::Stop))
+            }
+        },
+    );
+
+    let tool_execution_count = Arc::new(AtomicUsize::new(0));
+    let tool_count_in_executor = tool_execution_count.clone();
+    let write_tool = AgentTool {
+        name: "write".to_string(),
+        label: "write".to_string(),
+        description: "Write file".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+        execute:
+            Arc::new(
+                move |_tool_call_id: String,
+                      _args: Value|
+                      -> Pin<
+                    Box<dyn Future<Output = Result<AgentToolResult, PiAiError>> + Send>,
+                > {
+                    let tool_count_in_executor = tool_count_in_executor.clone();
+                    Box::pin(async move {
+                        tool_count_in_executor.fetch_add(1, Ordering::SeqCst);
+                        Ok(AgentToolResult {
+                            content: vec![ToolResultContentBlock::Text {
+                                text: "unexpected execution".to_string(),
+                                text_signature: None,
+                            }],
+                            details: json!({}),
+                        })
+                    })
+                },
+            ),
+    };
+
+    let prompts = vec![user_message("write file", 1_700_000_000_000)];
+    let context = AgentContext {
+        system_prompt: "You are helpful".to_string(),
+        messages: vec![],
+        tools: vec![write_tool],
+    };
+
+    let config = AgentLoopConfig {
+        model: sample_model("test-api"),
+        fallback_models: vec![],
+        convert_to_llm: Arc::new(|messages| messages),
+        stream_fn,
+        retry: AgentRetryConfig::default(),
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+    };
+
+    let stream = agent_loop(prompts, context, config, None);
+    let (events, result) = collect_events_and_result(stream).await;
+
+    let tool_execution_events = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
+        .count();
+
+    assert_eq!(stream_fn_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tool_execution_count.load(Ordering::SeqCst), 0);
+    assert_eq!(tool_execution_events, 0);
+    assert_eq!(
+        result.len(),
+        3,
+        "result should include prompt + truncated assistant + continued assistant"
+    );
+}
+
 #[test]
 fn try_agent_loop_continue_rejects_empty_context() {
     let context = AgentContext {

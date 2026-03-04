@@ -12,6 +12,8 @@ use crate::types::{
     AgentTool, AgentToolResult, MessageQueueFn,
 };
 
+const MAX_AUTO_CONTINUATIONS_ON_LENGTH: usize = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLoopError {
     EmptyContext,
@@ -145,7 +147,7 @@ impl AgentLoopRunner {
 
                 let assistant_outcome = self.request_assistant_response().await;
                 self.record_assistant_metrics(&assistant_outcome);
-                let assistant_message = assistant_outcome.message;
+                let mut assistant_message = assistant_outcome.message;
 
                 self.new_messages.push(assistant_message.clone());
                 if is_error_or_aborted(&assistant_message) {
@@ -155,6 +157,38 @@ impl AgentLoopRunner {
                     });
                     self.finish();
                     return;
+                }
+
+                let mut auto_continue_count = 0usize;
+                while is_length_truncated(&assistant_message)
+                    && auto_continue_count < MAX_AUTO_CONTINUATIONS_ON_LENGTH
+                {
+                    auto_continue_count = auto_continue_count.saturating_add(1);
+                    debug!(
+                        auto_continue_count,
+                        "assistant response hit length limit; requesting auto-continuation"
+                    );
+
+                    let continuation_outcome = self.request_assistant_response().await;
+                    self.record_assistant_metrics(&continuation_outcome);
+                    assistant_message = continuation_outcome.message;
+                    self.new_messages.push(assistant_message.clone());
+
+                    if is_error_or_aborted(&assistant_message) {
+                        self.stream.push(AgentEvent::TurnEnd {
+                            message: assistant_message,
+                            tool_results: vec![],
+                        });
+                        self.finish();
+                        return;
+                    }
+                }
+
+                if is_length_truncated(&assistant_message) {
+                    warn!(
+                        auto_continue_count = MAX_AUTO_CONTINUATIONS_ON_LENGTH,
+                        "assistant response remained length-truncated after auto-continuation limit"
+                    );
                 }
 
                 let mut tool_results = Vec::new();
@@ -923,22 +957,32 @@ impl<'a> ToolExecutionRunner<'a> {
 
 fn extract_tool_calls(message: &AgentMessage) -> Vec<(String, String, Value)> {
     match message {
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|block| {
-                if let AssistantContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                } = block
-                {
-                    Some((id.clone(), name.clone(), arguments.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect(),
+        Message::Assistant {
+            content,
+            stop_reason,
+            ..
+        } => {
+            if stop_reason != &StopReason::ToolUse {
+                return Vec::new();
+            }
+
+            content
+                .iter()
+                .filter_map(|block| {
+                    if let AssistantContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        ..
+                    } = block
+                    {
+                        Some((id.clone(), name.clone(), arguments.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
         _ => vec![],
     }
 }
@@ -995,6 +1039,16 @@ fn is_error_or_aborted(message: &AgentMessage) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_length_truncated(message: &AgentMessage) -> bool {
+    matches!(
+        message,
+        Message::Assistant {
+            stop_reason: StopReason::Length,
+            ..
+        }
+    )
 }
 
 fn is_aborted(signal: Option<&AgentAbortSignal>) -> bool {

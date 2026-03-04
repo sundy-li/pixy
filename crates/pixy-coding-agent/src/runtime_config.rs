@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pixy_ai::{Cost, Model, DEFAULT_TRANSPORT_RETRY_COUNT};
 use serde::Deserialize;
 
+use crate::multi_agent::resolve_subagent_model_target;
 use crate::{
     load_skills, DeclarativeHookSpec, LoadSkillsOptions, Skill, SkillDiagnostic, SubAgentMode,
-    SubAgentSpec,
+    SubAgentPromptMetadata, SubAgentSpec,
 };
 
 const DEFAULT_PIXY_HOME_DIR_NAME: &str = ".pixy";
@@ -399,6 +400,8 @@ struct PixyTomlMultiAgent {
     #[serde(default)]
     agents: Vec<PixyTomlSubAgent>,
     #[serde(default)]
+    subagents: BTreeMap<String, PixyTomlSubAgent>,
+    #[serde(default)]
     plugins: Vec<PixyTomlMultiAgentPlugin>,
     #[serde(default)]
     hooks: Vec<DeclarativeHookSpec>,
@@ -406,11 +409,24 @@ struct PixyTomlMultiAgent {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PixyTomlSubAgent {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     mode: Option<SubAgentMode>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, alias = "allowed_tools", alias = "allow_tools")]
+    tools: Vec<String>,
+    #[serde(default, alias = "deny_tools")]
+    blocked_tools: Vec<String>,
+    #[serde(default)]
+    metadata: Option<SubAgentPromptMetadata>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -579,22 +595,12 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile, base_dir: &Path) -> A
 
     let mut multi_agent_specs = Vec::new();
     for agent in config.multi_agent.agents {
-        let name = agent.name.trim();
-        if name.is_empty() {
-            continue;
+        if let Some(spec) = parse_pixy_toml_subagent(agent, None) {
+            multi_agent_specs.push(spec);
         }
-        let description = agent
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Configured subagent");
-        let spec = SubAgentSpec {
-            name: name.to_string(),
-            description: description.to_string(),
-            mode: agent.mode.unwrap_or(SubAgentMode::SubAgent),
-        };
-        if spec.validate().is_ok() {
+    }
+    for (name, agent) in config.multi_agent.subagents {
+        if let Some(spec) = parse_pixy_toml_subagent(agent, Some(&name)) {
             multi_agent_specs.push(spec);
         }
     }
@@ -673,6 +679,67 @@ fn convert_pixy_toml_to_local_config(config: PixyTomlFile, base_dir: &Path) -> A
             hooks: hook_specs,
         },
         memory,
+    }
+}
+
+fn parse_pixy_toml_subagent(
+    agent: PixyTomlSubAgent,
+    key_name: Option<&str>,
+) -> Option<SubAgentSpec> {
+    let explicit_name = agent
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let key_name = key_name.map(str::trim).filter(|value| !value.is_empty());
+
+    if let (Some(explicit), Some(from_key)) = (explicit_name, key_name) {
+        if explicit != from_key {
+            eprintln!(
+                "warning: skip invalid subagent config due to name mismatch ('{}' vs '{}')",
+                explicit, from_key
+            );
+            return None;
+        }
+    }
+
+    let Some(name) = explicit_name.or(key_name) else {
+        return None;
+    };
+    let description = agent
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Configured subagent");
+    let model =
+        match resolve_subagent_model_target(agent.provider.as_deref(), agent.model.as_deref()) {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("warning: skip invalid subagent config due to provider/model: {error}");
+                return None;
+            }
+        };
+
+    let spec = SubAgentSpec {
+        name: name.to_string(),
+        description: description.to_string(),
+        mode: agent.mode.unwrap_or(SubAgentMode::SubAgent),
+        prompt: agent
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        model,
+        tools: agent.tools,
+        blocked_tools: agent.blocked_tools,
+        metadata: agent.metadata,
+    };
+    if spec.validate().is_ok() {
+        Some(spec)
+    } else {
+        None
     }
 }
 
@@ -1469,6 +1536,101 @@ weight = 1
         assert_eq!(resolved.multi_agent.agents[0].name, "general");
         assert_eq!(resolved.multi_agent.agents[0].mode, SubAgentMode::SubAgent);
         assert!(resolved.multi_agent.hooks.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_parses_multi_agent_subagents_map() {
+        let content = r#"
+[multi_agent]
+enabled = true
+
+[multi_agent.subagents.code]
+description = "Implementation worker"
+mode = "subagent"
+prompt = "Implement the requested changes."
+model = "openai/gpt-5.3-codex"
+tools = ["read", "edit", "bash"]
+blocked_tools = ["task"]
+
+[multi_agent.subagents.code.metadata]
+category = "specialist"
+prompt_alias = "Code Worker"
+use_when = ["Implementation tasks"]
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.multi_agent.agents.len(), 1);
+        let code = &resolved.multi_agent.agents[0];
+        assert_eq!(code.name, "code");
+        assert_eq!(code.description, "Implementation worker");
+        assert_eq!(
+            code.prompt.as_deref(),
+            Some("Implement the requested changes.")
+        );
+        assert_eq!(code.model.as_deref(), Some("openai/gpt-5.3-codex"));
+        assert_eq!(code.tools, vec!["read", "edit", "bash"]);
+        assert_eq!(code.blocked_tools, vec!["task"]);
+        assert_eq!(
+            code.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.prompt_alias.as_deref()),
+            Some("Code Worker")
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_from_toml_combines_subagent_provider_and_model() {
+        let content = r#"
+[multi_agent]
+enabled = true
+
+[multi_agent.subagents.code]
+description = "Implementation worker"
+mode = "subagent"
+provider = "openai"
+model = "gpt-5.3-codex"
+
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "key"
+model = "gpt-5.3-codex"
+weight = 1
+"#;
+
+        let mut options = RuntimeLoadOptions::default();
+        options.load_skills = false;
+        let resolved = options
+            .resolve_runtime_from_toml_with_seed(Path::new("."), content, 0)
+            .expect("runtime should resolve");
+
+        assert_eq!(resolved.multi_agent.agents.len(), 1);
+        let code = &resolved.multi_agent.agents[0];
+        assert_eq!(code.model.as_deref(), Some("openai/gpt-5.3-codex"));
     }
 
     #[test]

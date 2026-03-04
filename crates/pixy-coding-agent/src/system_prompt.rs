@@ -593,11 +593,21 @@ mod tests {
                 name: "general".to_string(),
                 description: "General helper".to_string(),
                 mode: crate::SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             },
             SubAgentSpec {
                 name: "explore".to_string(),
                 description: "Exploration helper".to_string(),
                 mode: crate::SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             },
         ];
 
@@ -616,6 +626,11 @@ mod tests {
             name: "general".to_string(),
             description: "General helper".to_string(),
             mode: crate::SubAgentMode::SubAgent,
+            prompt: None,
+            model: None,
+            tools: vec![],
+            blocked_tools: vec![],
+            metadata: None,
         }];
 
         append_multi_agent_prompt_section(&mut prompt, &tools, &subagents);

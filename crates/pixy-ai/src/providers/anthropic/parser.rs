@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_json::{json, Map, Value};
 
 use crate::error::{PiAiError, PiAiErrorCode};
+use crate::providers::common::debug_provider_event;
 use crate::types::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, DoneReason, StopReason, Usage,
 };
@@ -57,6 +58,7 @@ pub(super) fn apply_response_body(
     let mut block_states: HashMap<usize, BlockState> = HashMap::new();
 
     for data in events {
+        debug_provider_event("anthropic-messages", &data);
         let event: Value = serde_json::from_str(&data).map_err(|error| {
             PiAiError::new(
                 PiAiErrorCode::ProviderProtocol,
@@ -152,7 +154,12 @@ pub(super) fn apply_response_body(
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                            arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                            arguments: parse_tool_arguments_value(
+                                block
+                                    .get("input")
+                                    .or_else(|| block.get("arguments"))
+                                    .or_else(|| block.get("args")),
+                            ),
                             thought_signature: None,
                         });
                         block_states.insert(
@@ -259,6 +266,39 @@ pub(super) fn apply_response_body(
                                 delta: delta_text,
                                 partial: output.clone(),
                             });
+                        }
+                        (
+                            BlockState::ToolCall {
+                                content_index,
+                                partial_json,
+                            },
+                            _,
+                        ) => {
+                            if let Some(delta_text) = extract_tool_argument_json_fragment(delta) {
+                                partial_json.push_str(&delta_text);
+                                if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                                    output.content.get_mut(*content_index)
+                                {
+                                    *arguments = parse_partial_json(partial_json);
+                                }
+                                stream.push(AssistantMessageEvent::ToolcallDelta {
+                                    content_index: *content_index,
+                                    delta: delta_text,
+                                    partial: output.clone(),
+                                });
+                            } else if let Some(value) = extract_tool_argument_value(delta) {
+                                let parsed = parse_tool_arguments_value(Some(value));
+                                if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                                    output.content.get_mut(*content_index)
+                                {
+                                    *arguments = parsed.clone();
+                                }
+                                stream.push(AssistantMessageEvent::ToolcallDelta {
+                                    content_index: *content_index,
+                                    delta: parsed.to_string(),
+                                    partial: output.clone(),
+                                });
+                            }
                         }
                         (BlockState::Thinking { content_index }, "signature_delta") => {
                             let signature = delta
@@ -527,7 +567,12 @@ fn apply_non_stream_anthropic_response(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                let arguments = parse_tool_arguments_value(
+                    block
+                        .get("input")
+                        .or_else(|| block.get("arguments"))
+                        .or_else(|| block.get("args")),
+                );
                 let content_index = output.content.len();
                 output.content.push(AssistantContentBlock::ToolCall {
                     id: id.clone(),
@@ -591,6 +636,34 @@ fn map_done_reason(reason: StopReason) -> Option<DoneReason> {
 
 fn parse_partial_json(buffer: &str) -> Value {
     serde_json::from_str::<Value>(buffer).unwrap_or_else(|_| Value::Object(Map::new()))
+}
+
+fn parse_tool_arguments_value(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => parse_partial_json(raw),
+        Some(Value::Null) | None => Value::Object(Map::new()),
+        Some(other) => other.clone(),
+    }
+}
+
+fn extract_tool_argument_json_fragment(delta: &Map<String, Value>) -> Option<String> {
+    for key in ["partial_json", "input_json", "arguments", "input", "args"] {
+        if let Some(text) = delta.get(key).and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn extract_tool_argument_value<'a>(delta: &'a Map<String, Value>) -> Option<&'a Value> {
+    for key in ["input", "arguments", "args", "input_json"] {
+        if let Some(value) = delta.get(key) {
+            if !value.is_null() && !value.is_string() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn update_usage_from_anthropic(usage: &mut Usage, value: &Value) {

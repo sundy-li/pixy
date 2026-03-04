@@ -4,7 +4,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read};
 use tracing::info;
 
-use super::common::{empty_assistant_message, join_url, shared_http_client};
+use super::common::{debug_provider_event, empty_assistant_message, join_url, shared_http_client};
 use crate::error::{PiAiError, PiAiErrorCode};
 use crate::types::{
     AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Message,
@@ -138,6 +138,7 @@ fn handle_openai_responses_event(
     tool_block_indices: &mut HashMap<String, usize>,
     tool_arg_buffers: &mut HashMap<String, String>,
 ) -> Result<bool, PiAiError> {
+    debug_provider_event("openai-responses", &data);
     info!("OpenAI responses data: {}", data);
     if data == "[DONE]" {
         return Ok(true);
@@ -198,18 +199,19 @@ fn handle_openai_responses_event(
                         thought_signature: None,
                     });
 
-                    let initial_arguments = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    tool_arg_buffers.insert(tool_key.clone(), initial_arguments.clone());
+                    let initial_arguments = parse_tool_arguments_value(item.get("arguments"));
+                    if let Some(initial_arguments_text) =
+                        item.get("arguments").and_then(Value::as_str)
+                    {
+                        if !initial_arguments_text.is_empty() {
+                            tool_arg_buffers
+                                .insert(tool_key.clone(), initial_arguments_text.to_string());
+                        }
+                    }
                     if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
                         output.content.get_mut(content_index)
                     {
-                        if !initial_arguments.is_empty() {
-                            *arguments = parse_partial_json(&initial_arguments);
-                        }
+                        *arguments = initial_arguments;
                     }
                     tool_block_indices.insert(tool_key, content_index);
                     stream.push(AssistantMessageEvent::ToolcallStart {
@@ -248,40 +250,70 @@ fn handle_openai_responses_event(
             let Some(tool_key) = resolve_tool_key_for_arg_event(&event, tool_block_indices) else {
                 return Ok(false);
             };
-            let Some(delta) = event.get("delta").and_then(Value::as_str) else {
-                return Ok(false);
-            };
             let Some(content_index) = tool_block_indices.get(&tool_key).copied() else {
                 return Ok(false);
             };
-            let buffer = tool_arg_buffers.entry(tool_key).or_default();
-            buffer.push_str(delta);
-            if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
-                output.content.get_mut(content_index)
-            {
-                *arguments = parse_partial_json(buffer);
+
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                let buffer = tool_arg_buffers.entry(tool_key).or_default();
+                buffer.push_str(delta);
+                if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                    output.content.get_mut(content_index)
+                {
+                    *arguments = parse_partial_json(buffer);
+                }
+                stream.push(AssistantMessageEvent::ToolcallDelta {
+                    content_index,
+                    delta: delta.to_string(),
+                    partial: output.clone(),
+                });
+            } else if let Some(delta_value) = event.get("delta") {
+                let parsed = parse_tool_arguments_value(Some(delta_value));
+                if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                    output.content.get_mut(content_index)
+                {
+                    *arguments = parsed.clone();
+                }
+                stream.push(AssistantMessageEvent::ToolcallDelta {
+                    content_index,
+                    delta: parsed.to_string(),
+                    partial: output.clone(),
+                });
+            } else if let Some(arguments_value) = event.get("arguments") {
+                let parsed = parse_tool_arguments_value(Some(arguments_value));
+                if let Some(AssistantContentBlock::ToolCall { arguments, .. }) =
+                    output.content.get_mut(content_index)
+                {
+                    *arguments = parsed.clone();
+                }
+                stream.push(AssistantMessageEvent::ToolcallDelta {
+                    content_index,
+                    delta: parsed.to_string(),
+                    partial: output.clone(),
+                });
+            } else {
+                return Ok(false);
             }
-            stream.push(AssistantMessageEvent::ToolcallDelta {
-                content_index,
-                delta: delta.to_string(),
-                partial: output.clone(),
-            });
         }
         "response.function_call_arguments.done" => {
             let Some(tool_key) = resolve_tool_key_for_arg_event(&event, tool_block_indices) else {
                 return Ok(false);
             };
-            let Some(arguments) = event.get("arguments").and_then(Value::as_str) else {
-                return Ok(false);
-            };
             if let Some(content_index) = tool_block_indices.get(&tool_key).copied() {
-                tool_arg_buffers.insert(tool_key, arguments.to_string());
+                let Some(arguments_value) = event.get("arguments") else {
+                    return Ok(false);
+                };
                 if let Some(AssistantContentBlock::ToolCall {
                     arguments: arg_json,
                     ..
                 }) = output.content.get_mut(content_index)
                 {
-                    *arg_json = parse_partial_json(arguments);
+                    *arg_json = parse_tool_arguments_value(Some(arguments_value));
+                }
+                if let Some(arguments) = arguments_value.as_str() {
+                    tool_arg_buffers.insert(tool_key, arguments.to_string());
+                } else {
+                    tool_arg_buffers.remove(&tool_key);
                 }
             }
         }
@@ -358,10 +390,19 @@ fn handle_openai_responses_event(
                     let parsed_arguments = if let Some(buffer) = tool_arg_buffers.remove(&tool_key)
                     {
                         parse_partial_json(&buffer)
-                    } else if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
-                        parse_partial_json(arguments)
+                    } else if item.contains_key("arguments") {
+                        parse_tool_arguments_value(item.get("arguments"))
                     } else {
-                        Value::Object(Map::new())
+                        output
+                            .content
+                            .get(content_index)
+                            .and_then(|block| match block {
+                                AssistantContentBlock::ToolCall { arguments, .. } => {
+                                    Some(arguments.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| Value::Object(Map::new()))
                     };
 
                     let mut tool_call_json = Value::Null;
@@ -815,6 +856,14 @@ fn map_done_reason(reason: StopReason) -> Option<DoneReason> {
 
 fn parse_partial_json(buffer: &str) -> Value {
     serde_json::from_str::<Value>(buffer).unwrap_or_else(|_| Value::Object(Map::new()))
+}
+
+fn parse_tool_arguments_value(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => parse_partial_json(raw),
+        Some(Value::Null) | None => Value::Object(Map::new()),
+        Some(other) => other.clone(),
+    }
 }
 
 fn update_usage_from_openai_responses(usage: &mut Usage, value: &Value) {

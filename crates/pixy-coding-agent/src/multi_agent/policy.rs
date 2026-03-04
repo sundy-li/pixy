@@ -149,12 +149,22 @@ mod tests {
                 name: "general".to_string(),
                 description: "General helper".to_string(),
                 mode: SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             })
             .expect("register general")
             .register_builtin(SubAgentSpec {
                 name: "explore".to_string(),
                 description: "Explore helper".to_string(),
                 mode: SubAgentMode::SubAgent,
+                prompt: None,
+                model: None,
+                tools: vec![],
+                blocked_tools: vec![],
+                metadata: None,
             })
             .expect("register explore")
             .build()

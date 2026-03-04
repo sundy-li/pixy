@@ -8,8 +8,8 @@ use pixy_ai::PiAiError;
 use serde_json::{json, Value};
 
 use super::common::{
-    format_diff_stat_line, get_required_string, line_change_counts, resolve_to_cwd, text_result,
-    tool_execution_failed,
+    format_diff_stat_line, get_required_string, get_required_string_alias, invalid_tool_args,
+    line_change_counts, resolve_to_cwd, text_result, tool_execution_failed,
 };
 
 pub fn create_write_tool(cwd: impl AsRef<Path>) -> AgentTool {
@@ -49,7 +49,42 @@ impl AgentToolExecutor for WriteToolExecutor {
 }
 
 fn execute_write_tool(cwd: &Path, args: Value) -> Result<AgentToolResult, PiAiError> {
-    let path = get_required_string(&args, "path")?;
+    let path = get_required_string_alias(
+        &args,
+        &[
+            "path",
+            "file_path",
+            "filePath",
+            "filepath",
+            "file",
+            "filename",
+            "file_name",
+            "fileName",
+            "target_path",
+            "targetPath",
+            "output_path",
+            "outputPath",
+            "destination",
+            "dest",
+        ],
+    )
+    .map_err(|_| {
+        let received_keys = args
+            .as_object()
+            .map(|object| {
+                let mut keys = object.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                if keys.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    keys.join(", ")
+                }
+            })
+            .unwrap_or_else(|| "(non-object arguments)".to_string());
+        invalid_tool_args(format!(
+            "Missing or invalid `path` (accepted aliases: path, file_path, filePath, filepath, file, filename, file_name, fileName, target_path, targetPath, output_path, outputPath, destination, dest; received keys: {received_keys})"
+        ))
+    })?;
     let content = get_required_string(&args, "content")?;
     let absolute_path = resolve_to_cwd(cwd, &path);
     let previous_content = match fs::read(&absolute_path) {

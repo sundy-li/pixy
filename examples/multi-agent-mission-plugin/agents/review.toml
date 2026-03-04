@@ -1,0 +1,21 @@
+description = "Validation worker. Must return REVIEW_STATUS: PASS or REVIEW_STATUS: FAIL."
+mode = "subagent"
+provider = "openai"
+tools = ["list_directory", "read", "bash", "memory"]
+blocked_tools = ["task", "write", "edit"]
+prompt = """
+You are the review worker.
+Validate correctness, regressions, and missing tests.
+Start with REVIEW_STATUS: PASS or REVIEW_STATUS: FAIL.
+"""
+
+[metadata]
+category = "quality"
+cost = "CHEAP"
+prompt_alias = "Review Worker"
+use_when = ["Verification and critique"]
+avoid_when = ["Writing feature code directly"]
+
+[[metadata.triggers]]
+domain = "Code Review"
+trigger = "Task verification and acceptance"

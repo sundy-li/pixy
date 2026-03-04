@@ -160,6 +160,7 @@ Notes:
 Manifest schema and examples: [`docs/multi-agent-plugin-manifest.md`](./docs/multi-agent-plugin-manifest.md)
 Runnable config + plugin example: [`examples/multi-agent`](./examples/multi-agent)
 Declarative hooks + routing example: [`examples/multi-agent-hooks`](./examples/multi-agent-hooks)
+Mission-style orchestrator/code/review loop example: [`examples/multi-agent-mission-plugin`](./examples/multi-agent-mission-plugin)
 
 ## Gateway Quick Setup (Telegram / Feishu)
 

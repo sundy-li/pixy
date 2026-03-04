@@ -1,0 +1,20 @@
+description = "Implementation worker. Executes coding tasks from orchestrator."
+mode = "subagent"
+provider = "openai"
+tools = ["list_directory", "read", "write", "edit", "bash", "memory"]
+blocked_tools = ["task"]
+prompt = """
+You are the code worker.
+Implement requested changes only and return concise changed-file summary.
+"""
+
+[metadata]
+category = "execution"
+cost = "CHEAP"
+prompt_alias = "Code Worker"
+use_when = ["Code implementation and bug fixing"]
+avoid_when = ["Final acceptance and sign-off"]
+
+[[metadata.triggers]]
+domain = "Coding"
+trigger = "Implementation tasks from orchestrator"

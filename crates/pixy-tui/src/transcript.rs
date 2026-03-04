@@ -1609,7 +1609,9 @@ pub(crate) fn visible_transcript_lines(
             TranscriptLineKind::Code => true,
             TranscriptLineKind::UserInput => true,
             TranscriptLineKind::Thinking => show_thinking,
-            TranscriptLineKind::Tool => show_tool_results,
+            TranscriptLineKind::Tool => {
+                show_tool_results || is_subagent_tool_line(line.text.as_str())
+            }
             TranscriptLineKind::Working => true,
         })
         .cloned()
@@ -1994,6 +1996,36 @@ pub(crate) fn parse_tool_name(line: &str) -> Option<&str> {
     line.strip_prefix("• Ran ")
         .and_then(|rest| rest.split_whitespace().next())
         .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn parse_task_subagent(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("• Ran task ")?;
+    for token in rest.split_whitespace() {
+        if let Some(subagent) = token.strip_prefix("subagent=") {
+            if !subagent.is_empty() {
+                return Some(subagent);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_subagent_finish(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("Subagent ")?;
+    let (subagent, _tail) = rest.split_once(" finished in ")?;
+    let subagent = subagent.trim();
+    if subagent.is_empty() {
+        return None;
+    }
+    Some(subagent)
+}
+
+pub(crate) fn is_subagent_tool_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    parse_task_subagent(line).is_some()
+        || parse_subagent_finish(line).is_some()
+        || trimmed.starts_with("Subagent ")
+        || trimmed.starts_with("subagent '")
 }
 
 fn parse_legacy_tool_header(line: &str) -> Option<(&str, bool)> {

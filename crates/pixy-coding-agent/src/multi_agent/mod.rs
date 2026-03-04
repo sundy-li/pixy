@@ -31,4 +31,8 @@ pub use policy::{
 pub use registry::{DefaultSubAgentRegistry, SubAgentRegistryBuilder, SubAgentResolver};
 pub use session_store::ChildSessionStore;
 pub use task_tool::create_task_tool;
-pub use types::{SubAgentMode, SubAgentSpec, TaskToolInput, TaskToolOutput};
+pub(crate) use types::resolve_subagent_model_target;
+pub use types::{
+    SubAgentMode, SubAgentPromptMetadata, SubAgentPromptTrigger, SubAgentSpec, TaskToolInput,
+    TaskToolOutput,
+};
