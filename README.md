@@ -189,6 +189,10 @@ Gateway runtime files:
 `gateway.channels` are configured in `~/.pixy/pixy.toml`.
 - Telegram uses polling (`getUpdates`)
 - Feishu uses webhook route: `/webhook/feishu/{channel_name}`
+- Optional per-channel prompt controls:
+  - `system_prompt` injects channel-specific instructions
+  - `override_global_system_prompt = false` (default) appends to global prompt
+  - `override_global_system_prompt = true` replaces global prompt for that channel
 - `/new` in chat resets routed session context
 
 ## Upgrade / Uninstall

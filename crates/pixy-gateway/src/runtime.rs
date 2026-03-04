@@ -20,21 +20,35 @@ use crate::DEFAULT_PROMPT_INTRO;
 
 const NEW_SESSION_COMMAND_REPLY: &str = "Started a new session. Send your next message.";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChannelPromptConfig {
+    system_prompt: Option<String>,
+    override_global_system_prompt: bool,
+}
+
 pub struct SessionRouter {
     cwd: PathBuf,
     session_root: PathBuf,
     model: Model,
     api_key: Option<String>,
+    channel_prompts: HashMap<String, ChannelPromptConfig>,
     sessions: HashMap<String, AgentSession>,
 }
 
 impl SessionRouter {
-    pub fn new(cwd: PathBuf, session_root: PathBuf, model: Model, api_key: Option<String>) -> Self {
+    fn new(
+        cwd: PathBuf,
+        session_root: PathBuf,
+        model: Model,
+        api_key: Option<String>,
+        channel_prompts: HashMap<String, ChannelPromptConfig>,
+    ) -> Self {
         Self {
             cwd,
             session_root,
             model,
             api_key,
+            channel_prompts,
             sessions: HashMap::new(),
         }
     }
@@ -46,11 +60,13 @@ impl SessionRouter {
         text: &str,
     ) -> Result<String, String> {
         let key = session_key(channel_name, user_id);
+        let channel_prompt = self.channel_prompts.get(channel_name);
         if is_new_session_command(text) {
             let session = create_gateway_session(
                 &self.cwd,
                 &self.session_root,
                 channel_name,
+                channel_prompt,
                 user_id,
                 &self.model,
                 self.api_key.clone(),
@@ -65,6 +81,7 @@ impl SessionRouter {
                 &self.cwd,
                 &self.session_root,
                 channel_name,
+                channel_prompt,
                 user_id,
                 &self.model,
                 self.api_key.clone(),
@@ -120,7 +137,8 @@ pub async fn serve_gateway(config: GatewayConfig) -> Result<(), String> {
     ) {
         println!("{line}");
     }
-    let mut router = SessionRouter::new(cwd, session_root, model, api_key);
+    let channel_prompts = collect_channel_prompt_configs(&channels);
+    let mut router = SessionRouter::new(cwd, session_root, model, api_key, channel_prompts);
     let BuiltChannels {
         mut channels,
         feishu_webhook_bindings,
@@ -248,27 +266,60 @@ fn startup_log_lines(
         match channel {
             GatewayChannelConfig::Telegram(config) => {
                 lines.push(format!(
-                    "[gateway] channel telegram name={} poll_interval_ms={} update_limit={} allowed_users={} proxy_configured={}",
+                    "[gateway] channel telegram name={} poll_interval_ms={} update_limit={} allowed_users={} proxy_configured={} system_prompt_configured={} override_global_system_prompt={}",
                     config.name,
                     config.poll_interval.as_millis(),
                     config.update_limit,
                     config.allowed_user_ids.len(),
-                    config.proxy_url.is_some()
+                    config.proxy_url.is_some(),
+                    config.system_prompt.is_some(),
+                    config.override_global_system_prompt
                 ));
             }
             GatewayChannelConfig::Feishu(config) => {
                 lines.push(format!(
-                    "[gateway] channel feishu name={} mode=webhook allowed_users={} poll_interval_ms={} proxy_configured={}",
+                    "[gateway] channel feishu name={} mode=webhook allowed_users={} poll_interval_ms={} proxy_configured={} system_prompt_configured={} override_global_system_prompt={}",
                     config.name,
                     config.allowed_user_ids.len(),
                     config.poll_interval.as_millis(),
-                    config.proxy_url.is_some()
+                    config.proxy_url.is_some(),
+                    config.system_prompt.is_some(),
+                    config.override_global_system_prompt
                 ));
             }
         }
     }
 
     lines
+}
+
+fn collect_channel_prompt_configs(
+    channels: &[GatewayChannelConfig],
+) -> HashMap<String, ChannelPromptConfig> {
+    let mut configs = HashMap::new();
+    for channel in channels {
+        match channel {
+            GatewayChannelConfig::Telegram(config) => {
+                configs.insert(
+                    config.name.clone(),
+                    ChannelPromptConfig {
+                        system_prompt: config.system_prompt.clone(),
+                        override_global_system_prompt: config.override_global_system_prompt,
+                    },
+                );
+            }
+            GatewayChannelConfig::Feishu(config) => {
+                configs.insert(
+                    config.name.clone(),
+                    ChannelPromptConfig {
+                        system_prompt: config.system_prompt.clone(),
+                        override_global_system_prompt: config.override_global_system_prompt,
+                    },
+                );
+            }
+        }
+    }
+    configs
 }
 
 pub fn session_key(channel_name: &str, user_id: &str) -> String {
@@ -319,13 +370,21 @@ fn create_gateway_session(
     cwd: &Path,
     session_root: &Path,
     channel_name: &str,
+    channel_prompt_config: Option<&ChannelPromptConfig>,
     user_id: &str,
     model: &Model,
     api_key: Option<String>,
     reuse_existing: bool,
 ) -> Result<AgentSession, String> {
     let manager = create_session_manager(cwd, session_root, channel_name, user_id, reuse_existing)?;
-    build_session_from_manager(cwd, channel_name, model, api_key, manager)
+    build_session_from_manager(
+        cwd,
+        channel_name,
+        channel_prompt_config,
+        model,
+        api_key,
+        manager,
+    )
 }
 
 fn create_session_manager(
@@ -433,6 +492,7 @@ fn route_file_prefix(channel_name: &str, user_id: &str) -> String {
 fn build_session_from_manager(
     cwd: &Path,
     channel_name: &str,
+    channel_prompt_config: Option<&ChannelPromptConfig>,
     model: &Model,
     api_key: Option<String>,
     manager: SessionManager,
@@ -442,15 +502,38 @@ fn build_session_from_manager(
         manager,
         SessionCreateOptions {
             runtime: gateway_session_runtime_options(model, api_key),
-            custom_system_prompt: Some(gateway_session_prompt(channel_name)),
+            custom_system_prompt: Some(gateway_session_prompt(
+                channel_name,
+                channel_prompt_config.and_then(|config| config.system_prompt.as_deref()),
+                channel_prompt_config.is_some_and(|config| config.override_global_system_prompt),
+            )),
             no_tools: false,
         },
     )?;
     Ok(created.session)
 }
 
-fn gateway_session_prompt(channel_name: &str) -> String {
-    DEFAULT_PROMPT_INTRO.replace("{channel}", channel_name)
+fn gateway_session_prompt(
+    channel_name: &str,
+    channel_system_prompt: Option<&str>,
+    override_global_system_prompt: bool,
+) -> String {
+    let global_prompt = DEFAULT_PROMPT_INTRO.replace("{channel}", channel_name);
+    let Some(channel_prompt) = channel_system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return global_prompt;
+    };
+    let channel_prompt = channel_prompt.replace("{channel}", channel_name);
+    let channel_prompt = channel_prompt.trim();
+    if override_global_system_prompt {
+        return channel_prompt.to_string();
+    }
+
+    format!(
+        "{global_prompt}\n\n<CHANNEL_SYSTEM_PROMPT>\n{channel_prompt}\n</CHANNEL_SYSTEM_PROMPT>"
+    )
 }
 
 fn gateway_session_runtime_options(model: &Model, api_key: Option<String>) -> RuntimeLoadOptions {
@@ -515,9 +598,29 @@ mod tests {
 
     #[test]
     fn gateway_session_prompt_replaces_channel_placeholder() {
-        let prompt = gateway_session_prompt("telegram");
+        let prompt = gateway_session_prompt("telegram", None, false);
         assert!(prompt.contains("help users from telegram"));
         assert!(!prompt.contains("{channel}"));
+    }
+
+    #[test]
+    fn gateway_session_prompt_appends_channel_prompt_by_default() {
+        let prompt = gateway_session_prompt(
+            "telegram",
+            Some("Always answer in concise bullet points for {channel}."),
+            false,
+        );
+        assert!(prompt.contains("help users from telegram"));
+        assert!(prompt.contains("<CHANNEL_SYSTEM_PROMPT>"));
+        assert!(prompt.contains("Always answer in concise bullet points for telegram."));
+    }
+
+    #[test]
+    fn gateway_session_prompt_can_override_global_prompt() {
+        let prompt =
+            gateway_session_prompt("feishu-main", Some("You are feishu specialist."), true);
+        assert!(!prompt.contains("help users from"));
+        assert_eq!(prompt, "You are feishu specialist.");
     }
 
     #[test]
@@ -620,6 +723,8 @@ mod tests {
                     name: "tg-main".to_string(),
                     bot_token: "secret-token".to_string(),
                     proxy_url: Some("socks5://127.0.0.1:7891".to_string()),
+                    system_prompt: None,
+                    override_global_system_prompt: false,
                     poll_interval: Duration::from_millis(1500),
                     update_limit: 50,
                     allowed_user_ids: vec!["10001".to_string(), "10002".to_string()],
@@ -630,6 +735,8 @@ mod tests {
                     app_secret: "secret".to_string(),
                     verification_token: "token".to_string(),
                     proxy_url: None,
+                    system_prompt: None,
+                    override_global_system_prompt: false,
                     poll_interval: Duration::from_millis(100),
                     allowed_user_ids: vec!["ou_1".to_string()],
                 }),
@@ -666,6 +773,8 @@ mod tests {
                 name: "tg-main".to_string(),
                 bot_token: "token".to_string(),
                 proxy_url: None,
+                system_prompt: None,
+                override_global_system_prompt: false,
                 poll_interval: Duration::from_millis(1500),
                 update_limit: 50,
                 allowed_user_ids: vec!["10001".to_string()],
@@ -676,6 +785,8 @@ mod tests {
                 app_secret: "secret".to_string(),
                 verification_token: "token".to_string(),
                 proxy_url: None,
+                system_prompt: None,
+                override_global_system_prompt: false,
                 poll_interval: Duration::from_millis(100),
                 allowed_user_ids: vec!["ou_abc".to_string()],
             }),

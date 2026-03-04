@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use pixy_ai::Model;
-use pixy_coding_agent::RuntimeLoadOptions;
+use pixy_coding_agent::{ResolvedRuntime, RuntimeLoadOptions};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,8 @@ pub struct TelegramChannelConfig {
     pub name: String,
     pub bot_token: String,
     pub proxy_url: Option<String>,
+    pub system_prompt: Option<String>,
+    pub override_global_system_prompt: bool,
     pub poll_interval: Duration,
     pub update_limit: u8,
     pub allowed_user_ids: Vec<String>,
@@ -41,6 +43,8 @@ pub struct FeishuChannelConfig {
     pub app_secret: String,
     pub verification_token: String,
     pub proxy_url: Option<String>,
+    pub system_prompt: Option<String>,
+    pub override_global_system_prompt: bool,
     pub poll_interval: Duration,
     pub allowed_user_ids: Vec<String>,
 }
@@ -83,6 +87,10 @@ struct PixyTomlGatewayChannel {
     verification_token: Option<String>,
     #[serde(default)]
     proxy_url: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    override_global_system_prompt: bool,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -153,7 +161,12 @@ pub fn default_pixy_config_path() -> PathBuf {
 pub fn load_gateway_config(path: &Path) -> Result<GatewayConfig, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|error| format!("read {} failed: {error}", path.display()))?;
-    parse_gateway_config_with_seed(&content, RuntimeLoadOptions::runtime_router_seed())
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    parse_gateway_config_with_seed_and_base_dir(
+        &content,
+        RuntimeLoadOptions::runtime_router_seed(),
+        base_dir,
+    )
 }
 
 pub(crate) fn gateway_runtime_load_options() -> RuntimeLoadOptions {
@@ -165,18 +178,22 @@ pub(crate) fn gateway_runtime_load_options() -> RuntimeLoadOptions {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_gateway_config_with_seed(
     content: &str,
     router_seed: u64,
 ) -> Result<GatewayConfig, String> {
+    parse_gateway_config_with_seed_and_base_dir(content, router_seed, &current_pixy_home_dir())
+}
+
+fn parse_gateway_config_with_seed_and_base_dir(
+    content: &str,
+    router_seed: u64,
+    base_dir: &Path,
+) -> Result<GatewayConfig, String> {
     let parsed: PixyTomlFile =
         toml::from_str(content).map_err(|error| format!("parse pixy.toml failed: {error}"))?;
-    let runtime_options = gateway_runtime_load_options();
-    let runtime = runtime_options.resolve_runtime_from_toml_with_seed(
-        Path::new("."),
-        content,
-        router_seed,
-    )?;
+    let runtime = resolve_gateway_runtime_with_seed(content, router_seed, base_dir)?;
     let channels = resolve_gateway_channels(&parsed.gateway.channels, &parsed.env)?;
     let request_timeout =
         Duration::from_millis(parsed.gateway.request_timeout_ms.unwrap_or(20_000));
@@ -198,6 +215,15 @@ pub(crate) fn parse_gateway_config_with_seed(
         api_key: runtime.api_key,
         channels,
     })
+}
+
+fn resolve_gateway_runtime_with_seed(
+    content: &str,
+    router_seed: u64,
+    base_dir: &Path,
+) -> Result<ResolvedRuntime, String> {
+    let runtime_options = gateway_runtime_load_options();
+    runtime_options.resolve_runtime_from_toml_with_seed(base_dir, content, router_seed)
 }
 
 fn resolve_gateway_channels(
@@ -239,6 +265,10 @@ fn resolve_gateway_channels(
                     .proxy_url
                     .as_deref()
                     .and_then(|value| resolve_config_value(value, env_map));
+                let system_prompt = channel
+                    .system_prompt
+                    .as_deref()
+                    .and_then(|value| resolve_config_value(value, env_map));
                 let allowed_user_ids = normalize_allowed_user_ids(&channel.allowed_user_ids);
                 if allowed_user_ids.is_empty() {
                     return Err(format!(
@@ -257,6 +287,8 @@ fn resolve_gateway_channels(
                     name: channel_name.to_string(),
                     bot_token,
                     proxy_url,
+                    system_prompt,
+                    override_global_system_prompt: channel.override_global_system_prompt,
                     poll_interval: Duration::from_millis(channel.poll_interval_ms.unwrap_or(1_500)),
                     update_limit,
                     allowed_user_ids,
@@ -303,6 +335,10 @@ fn resolve_gateway_channels(
                     .proxy_url
                     .as_deref()
                     .and_then(|value| resolve_config_value(value, env_map));
+                let system_prompt = channel
+                    .system_prompt
+                    .as_deref()
+                    .and_then(|value| resolve_config_value(value, env_map));
                 let allowed_user_ids = normalize_allowed_user_ids(&channel.allowed_user_ids);
                 if allowed_user_ids.is_empty() {
                     return Err(format!(
@@ -316,6 +352,8 @@ fn resolve_gateway_channels(
                     app_secret,
                     verification_token,
                     proxy_url,
+                    system_prompt,
+                    override_global_system_prompt: channel.override_global_system_prompt,
                     poll_interval: Duration::from_millis(channel.poll_interval_ms.unwrap_or(100)),
                     allowed_user_ids,
                 }));
@@ -364,6 +402,7 @@ fn resolve_config_value(value: &str, env_map: &HashMap<String, String>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn gateway_runtime_load_options_enable_skills_by_default() {
@@ -379,6 +418,7 @@ mod tests {
 [env]
 TELEGRAM_BOT_TOKEN = "token-from-env"
 TG_PROXY_URL = "socks5://127.0.0.1:7891"
+TG_SYSTEM_PROMPT = "You are channel assistant for {channel}."
 
 [llm]
 default_provider = "openai"
@@ -403,6 +443,8 @@ kind = "telegram"
 enabled = true
 bot_token = "$TELEGRAM_BOT_TOKEN"
 proxy_url = "$TG_PROXY_URL"
+system_prompt = "$TG_SYSTEM_PROMPT"
+override_global_system_prompt = true
 mode = "polling"
 poll_interval_ms = 1234
 update_limit = 55
@@ -431,6 +473,14 @@ allowed_user_ids = ["10001", "10002"]
         assert_eq!(
             telegram.proxy_url.as_deref(),
             Some("socks5://127.0.0.1:7891")
+        );
+        assert_eq!(
+            telegram.system_prompt.as_deref(),
+            Some("You are channel assistant for {channel}.")
+        );
+        assert!(
+            telegram.override_global_system_prompt,
+            "telegram channel should parse override_global_system_prompt=true"
         );
         assert_eq!(telegram.poll_interval, Duration::from_millis(1234));
         assert_eq!(telegram.update_limit, 55);
@@ -607,6 +657,14 @@ allowed_user_ids = ["ou_abc", "ou_def"]
         assert_eq!(feishu.app_id, "cli_test_app_id");
         assert_eq!(feishu.app_secret, "test-secret");
         assert_eq!(feishu.verification_token, "verify-token");
+        assert_eq!(
+            feishu.system_prompt, None,
+            "system_prompt should default to None"
+        );
+        assert!(
+            !feishu.override_global_system_prompt,
+            "override_global_system_prompt should default to false"
+        );
         assert_eq!(feishu.allowed_user_ids, vec!["ou_abc", "ou_def"]);
     }
 
@@ -683,5 +741,57 @@ allowed_user_ids = ["ou_abc"]
             error.contains("webhook"),
             "error should mention webhook-only requirement"
         );
+    }
+
+    #[test]
+    fn resolve_gateway_runtime_with_seed_resolves_plugin_path_from_config_dir() {
+        let temp = tempdir().expect("tempdir");
+        let plugin_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugins dir");
+        let plugin_path = plugin_dir.join("mission-plugin.toml");
+        std::fs::write(
+            &plugin_path,
+            r#"
+name = "mission"
+version = "0.1.0"
+"#,
+        )
+        .expect("write plugin manifest");
+
+        let content = r#"
+[llm]
+default_provider = "openai"
+
+[[llm.providers]]
+name = "openai"
+kind = "chat"
+provider = "openai"
+api = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key = "literal"
+model = "gpt-5.3-codex"
+weight = 1
+
+[multi_agent]
+enabled = true
+
+[[multi_agent.plugins]]
+path = "plugins/mission-plugin.toml"
+
+[gateway]
+enabled = true
+
+[[gateway.channels]]
+name = "tg-main"
+kind = "telegram"
+enabled = true
+bot_token = "literal"
+mode = "polling"
+allowed_user_ids = ["10001"]
+"#;
+
+        let runtime = resolve_gateway_runtime_with_seed(content, 0, temp.path())
+            .expect("runtime should resolve from config dir");
+        assert_eq!(runtime.multi_agent.plugin_paths, vec![plugin_path]);
     }
 }

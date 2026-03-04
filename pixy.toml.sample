@@ -122,6 +122,13 @@ enabled = true
 bot_token = "$TELEGRAM_BOT_TOKEN"
 # Optional per-channel proxy, supports http/socks5.
 # proxy_url = "socks5://127.0.0.1:7891"
+# Optional per-channel system prompt.
+# - supports {channel} placeholder replacement.
+# - supports $ENV_KEY indirection.
+# system_prompt = "You are the telegram channel assistant for {channel}."
+# When false (default), channel system prompt appends to global prompt.
+# When true, channel system prompt replaces global prompt.
+override_global_system_prompt = false
 mode = "polling"
 poll_interval_ms = 1500
 update_limit = 50
@@ -137,5 +144,8 @@ app_secret = "$FEISHU_APP_SECRET"
 verification_token = "$FEISHU_VERIFICATION_TOKEN"
 # Optional per-channel proxy, supports http/socks5.
 # proxy_url = "http://127.0.0.1:7890"
+# Optional per-channel system prompt.
+# system_prompt = "You are the feishu channel assistant for {channel}."
+override_global_system_prompt = false
 poll_interval_ms = 100
 allowed_user_ids = ["replace-with-feishu-open-id"]
